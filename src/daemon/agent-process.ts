@@ -20,6 +20,8 @@ import {
   MIN_HEALTHY_SECONDS,
 } from './watchdog.js';
 import { readCronState, parseDurationMs, cronExpressionMinIntervalMs } from '../bus/cron-state.js';
+import { evaluateShift } from './shift.js';
+import { logEvent } from '../bus/event.js';
 
 type LogFn = (msg: string) => void;
 
@@ -981,6 +983,33 @@ export class AgentProcess {
 
           this.log(`Gap nudge: ${cronDef.name} silent ${gapMin}min (threshold: ${Math.round(threshold / 60_000)}min)`);
           if (this.pty && this.status === 'running') {
+            // Shift gate (RFC rfc-shift-schedule.md §4)
+            const tz = this.config.timezone || 'America/New_York';
+            const ev = evaluateShift(new Date(), this.config.shift_schedule, tz);
+            const fullCron = this.config.crons?.find(c => c.name === cronDef.name);
+            const emergencyAllowed = fullCron?.emergency_allowed === true;
+
+            let suppressMode: 'no_wake' | 'emergency_only_no_tag' | null = null;
+            if (ev.off_shift_no_wake) suppressMode = 'no_wake';
+            else if (ev.off_shift_emergency_only && !emergencyAllowed) suppressMode = 'emergency_only_no_tag';
+
+            if (suppressMode) {
+              this.log(`Cron-fire suppressed off-shift: ${cronDef.name} (mode=${suppressMode})`);
+              try {
+                const paths = resolvePaths(this.name, this.env.instanceId, this.env.org);
+                logEvent(paths, this.name, this.env.org || '', 'action', 'cron_suppressed_off_shift', 'info', {
+                  agent: this.name,
+                  cron: cronDef.name,
+                  mode: suppressMode,
+                  path: 'gap_nudge',
+                });
+              } catch (err) {
+                this.log(`logEvent failed for cron-suppressed (non-fatal): ${err}`);
+              }
+              gapAlertedAt.set(cronDef.name, now);
+              continue;
+            }
+
             gapAlertedAt.set(cronDef.name, now);
             injectMessage((data) => this.pty?.write(data), nudge);
             // Stagger: wait between nudges so the agent can process each one
@@ -1055,6 +1084,26 @@ export class AgentProcess {
     // Inject the verification prompt
     const cronList = expectedCrons.join(', ');
     const verifyPrompt = `[SYSTEM] Cron verification: your config.json defines these recurring crons: ${cronList}. Run CronList now. If any are missing, restore them from config.json using /loop. This is an automated safety check.`;
+
+    // Shift gate — boot verify is system maintenance, not emergency. Skip unless in_shift.
+    const tz = this.config.timezone || 'America/New_York';
+    const ev = evaluateShift(new Date(), this.config.shift_schedule, tz);
+    if (!ev.in_shift) {
+      const mode = ev.off_shift_no_wake ? 'no_wake' : 'emergency_only_no_tag';
+      this.log(`Boot cron-verify suppressed off-shift (mode=${mode})`);
+      try {
+        const paths = resolvePaths(this.name, this.env.instanceId, this.env.org);
+        logEvent(paths, this.name, this.env.org || '', 'action', 'cron_suppressed_off_shift', 'info', {
+          agent: this.name,
+          cron: 'boot-verify',
+          mode,
+          path: 'boot_verify',
+        });
+      } catch (err) {
+        this.log(`logEvent failed for cron-suppressed (non-fatal): ${err}`);
+      }
+      return;
+    }
 
     this.log(`Injecting cron verification (expecting: ${cronList})`);
     if (this.pty) {

@@ -1,6 +1,10 @@
 // cortextOS Node.js - Core Type Definitions
 // These types match the bash version's JSON formats exactly for backward compatibility
 
+import type { ShiftSchedule } from '../daemon/shift.js';
+
+export type { ShiftSchedule };
+
 export type Priority = 'urgent' | 'high' | 'normal' | 'low';
 
 export const PRIORITY_MAP: Record<Priority, number> = {
@@ -182,6 +186,8 @@ export interface AgentConfig {
   timezone?: string;
   day_mode_start?: string;
   day_mode_end?: string;
+  /** Per-agent shift schedule per RFC rfc-shift-schedule.md §3. When absent, agent is always in_shift (24/7). */
+  shift_schedule?: ShiftSchedule;
   communication_style?: string;
   /**
    * Display name for the business or team operating this agent.
@@ -240,6 +246,9 @@ export interface CronEntry {
   /** "recurring" (default) restores on every session start.
    *  "once" restores only if fire_at is still in the future; deleted after firing. */
   type?: 'recurring' | 'once' | 'disabled';
+  /** When true, this cron is allowed to fire during off_shift_emergency_only windows.
+   *  Has no effect during in_shift (always fires) or off_shift_no_wake (always drops). */
+  emergency_allowed?: boolean;
 }
 
 export interface OrgContext {
