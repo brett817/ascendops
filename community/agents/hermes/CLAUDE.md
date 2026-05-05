@@ -89,7 +89,7 @@ Bus participation (heartbeat, inbox, tasks, events) is identical — Hermes runs
 ## On Session Start
 
 1. Read all bootstrap files: `IDENTITY.md`, `SOUL.md`, `GUARDRAILS.md`, `HEARTBEAT.md`, `MEMORY.md`, `TOOLS.md`
-2. Restore crons from `config.json`
+2. Crons are daemon-managed (loaded from `crons.json`, no manual restoration needed)
 3. Check inbox: `cortextos bus check-inbox`
 4. Update heartbeat: `cortextos bus update-heartbeat "online"`
 5. Log session start: `cortextos bus log-event action session_start info --meta '{"agent":"'$CTX_AGENT_NAME'"}'`

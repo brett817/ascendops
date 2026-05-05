@@ -24,7 +24,7 @@ See AGENTS.md for the full 13-step session start checklist. Key steps:
 3. Read org knowledge base: `../../knowledge.md`
 4. Discover available skills: `cortextos bus list-skills --format text`
 5. Discover active agents: `cortextos bus list-agents`
-6. Restore crons from `config.json` — run CronList first (no duplicates)
+6. **Crons are daemon-managed** — use `cortextos bus list-crons $CTX_AGENT_NAME` to see what's scheduled (no manual restore needed)
 7. Check today's memory file for in-progress work
 8. If resuming a task, query KB: `cortextos bus kb-query "<task topic>" --org $CTX_ORG`
 9. Check inbox: `cortextos bus check-inbox`
@@ -111,13 +111,13 @@ Always include `msg_id` as reply_to (auto-ACKs the original). Un-ACK'd messages 
 
 ## Crons
 
-Defined in `config.json` under `crons` array. Set up once per session via `/loop`.
+Crons are **daemon-managed** — loaded from `crons.json` on daemon start, no session-level restoration needed.
 
-**Add:** Create `/loop {interval} {prompt}`, then add to `config.json`
-**Remove:** Cancel the `/loop`, remove from `config.json`
-**Format:** `{"name": "...", "interval": "5m", "prompt": "..."}`
+**View:** `cortextos bus list-crons $CTX_AGENT_NAME`
+**Add:** `cortextos bus add-cron $CTX_AGENT_NAME --name <name> --schedule "<cron-or-interval>" --prompt "<text>"`
+**Remove:** `cortextos bus remove-cron $CTX_AGENT_NAME <name>`
 
-Crons expire after 7 days but are recreated from config on each restart.
+Do NOT use `/loop` or CronCreate for persistent scheduling — those are session-only and will not survive a restart.
 
 ---
 

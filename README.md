@@ -26,8 +26,12 @@ Boss:   Overnight recap: completed 4 tasks, ran 2 theta-wave
         experiments, drafted 3 content scripts. One item needs
         your approval — email the beta waitlist.
 
-You:    approve
-Boss:   Sent. Email delivered to 47 recipients. Task closed.
+You:     approve
+Boss:    Sent. Email delivered to 47 recipients. Task closed.
+
+You:     Add a cron to check my inbox every morning at 8am.
+Boss:    Done. "morning-inbox" cron set — runs daily at 08:00.
+         Saved to crons.json — survives restarts automatically.
 ```
 
 ---
