@@ -56,7 +56,7 @@ Not built for:
 - 🤖 **Persistent agents** — Claude Code runs 24/7 in PTY sessions, auto-restarting on crash or after 71-hour context rotation.
 - 🔀 **Multi-agent orchestration** — orchestrator, analyst, and specialist agents coordinate via a shared file bus. Tasks, blockers, and approvals flow automatically.
 - 📱 **Telegram + iOS control** — send commands, approve actions, get reports from anywhere.
-- 🌐 **Multi-vendor** — Claude / Codex / Gemini, switchable per agent via the vendor adapter.
+- 🌐 **Multi-runtime** — run agents on `claude-code` (default), OpenAI's `codex-app-server`, or Hermes. All runtimes share the same bus, crons, dashboard, and Telegram integration; pick per-agent.
 - 🪝 **Hook framework** — fire-block-escalate event pipeline for custom routing and telemetry.
 - 🌙 **Autoresearch (theta wave)** — agents run autonomous experiments overnight and surface findings for your morning review.
 - 📊 **Web dashboard** — Next.js UI for tasks, approvals, experiments, and fleet health.
@@ -107,7 +107,30 @@ More setup details in [CONTRIBUTING.md](./CONTRIBUTING.md).
 | `orchestrator` | Your "boss" agent. Coordinates the fleet, runs morning + evening reviews, gates approvals. |
 | `analyst` | System health, metrics, theta-wave autoresearch. |
 | `agent` | General-purpose worker. Base for specialist agents. |
+| `agent-codex` | Codex-runtime worker, scaffolds with `runtime: codex-app-server` and `model: gpt-5-codex` (see `templates/agent-codex/`) |
 | `property-management/agent` | Pre-configured for PropertyMeld + maintenance ops. |
+
+Add a codex agent the same way you add a claude agent:
+
+```bash
+cortextos add-agent reindexer --template agent-codex --org myorg
+# or, equivalently, with the runtime flag on the default template:
+cortextos add-agent reindexer --runtime codex-app-server --org myorg
+```
+
+Codex agents share the same bus, crons, and dashboard surfaces as claude agents — they only differ in which model handles each turn.
+
+### The `runtime` field
+
+Every agent's `config.json` carries an explicit `runtime` field that the daemon dispatches on. Valid values:
+
+| Runtime | Adapter | Default model | Skills location |
+|---|---|---|---|
+| `claude-code` | `ClaudePTY` (default) | claude-sonnet-4-6 | `.claude/skills/<skill>/SKILL.md` |
+| `codex-app-server` | `CodexAppServerPTY` | `gpt-5-codex` | `plugins/cortextos-agent-skills/skills/<skill>/SKILL.md` (linked into `~/.codex/skills/<agent>__<skill>`) |
+| `hermes` | `HermesPTY` (experimental) | model per `config.json` | hermes-specific |
+
+Pass `--runtime <kind>` on `add-agent` to set it at scaffold time, or edit the field in `config.json` and restart the agent. The default is `claude-code`. Today only `--template agent` (and the alias `--template agent-codex`) supports `--runtime codex-app-server` — pairing the codex runtime with `--template orchestrator`/`analyst`/`m2c1-worker`/`hermes` errors with a clean message until codex variants of those templates ship.
 
 ---
 
@@ -116,10 +139,13 @@ More setup details in [CONTRIBUTING.md](./CONTRIBUTING.md).
 ```bash
 cortextos install            # set up state directories
 cortextos init <org>         # create an organization
-cortextos add-agent <name>   # add an agent
+cortextos add-agent <name>   # add an agent (--template, --org, --runtime)
+cortextos enable <name>      # enable agent in daemon
+cortextos ecosystem          # generate PM2 config
 cortextos status             # fleet health
 cortextos doctor             # check prerequisites
-cortextos dashboard          # start web dashboard
+cortextos list-agents        # list agents
+cortextos dashboard          # start web dashboard (--port 3000)
 ```
 
 Run `cortextos --help` for the full CLI surface.

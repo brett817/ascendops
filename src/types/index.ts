@@ -218,12 +218,18 @@ export interface AgentConfig {
   /** Context window % at which to trigger graceful restart (Signal 3). Default: 70. */
   ctx_restart_threshold?: number;
   /**
+   * Fallback context window cap (tokens) for codex-app-server agents when the
+   * server's `thread/tokenUsage/updated` event reports `modelContextWindow=null`.
+   * Defaults to 256000 when unset. Only applied to the codex-app-server runtime.
+   */
+  codex_context_cap?: number;
+  /**
    * Agent runtime. Defaults to 'claude-code' when absent.
    * 'hermes' selects the HermesPTY spawn path (Python persistent REPL,
    * NousResearch/hermes-agent) with Hermes-specific bootstrap, session
    * continuity, and exit handling.
    */
-  runtime?: 'claude-code' | 'hermes';
+  runtime?: 'claude-code' | 'hermes' | 'codex-app-server';
   /**
    * Vendor adapter for the underlying CLI binary. Defaults to 'anthropic'
    * when absent (which spawns the `claude` CLI). MVP supports anthropic only;
