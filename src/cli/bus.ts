@@ -13,6 +13,7 @@ import { createExperiment, runExperiment, evaluateExperiment, listExperiments, g
 import { browseCatalog, installCommunityItem, prepareSubmission, submitCommunityItem } from '../bus/catalog.js';
 import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
 import { createApproval, updateApproval } from '../bus/approval.js';
+import { listActiveThreads, addActiveThread, updateActiveThread, removeActiveThread, clearActiveThreads } from '../bus/active-threads.js';
 import { createReminder, listReminders, ackReminder, pruneReminders } from '../bus/reminders.js';
 import { updateCronFire, parseDurationMs, readCronState } from '../bus/cron-state.js';
 import { addCron, removeCron, readCrons, updateCron as updateCronDef, getCronByName, getExecutionLog } from '../bus/crons.js';
@@ -66,6 +67,16 @@ function checkDeliverableRequirement(taskId: string, frameworkRoot: string, org:
 
 export const busCommand = new Command('bus')
   .description('Bus commands for agent messaging, tasks, and events');
+
+function resolveAgentBusPaths(agentOverride?: string) {
+  const env = resolveEnv();
+  const agentName = agentOverride ?? env.agentName;
+  return {
+    env,
+    agentName,
+    paths: resolvePaths(agentName, env.instanceId, env.org),
+  };
+}
 
 busCommand
   .command('send-message')
@@ -1742,6 +1753,117 @@ busCommand
       console.log(JSON.stringify(approvals, null, 2));
     }
   });
+
+const activeThreadsCommand = new Command('active-threads')
+  .description('Manage per-agent active PropertyMeld thread state for restart-safe handoffs');
+
+activeThreadsCommand
+  .command('list')
+  .option('--agent <name>', 'Override target agent (defaults to $CTX_AGENT_NAME)')
+  .option('--format <fmt>', 'Output format: json or table', 'json')
+  .action((opts: { agent?: string; format?: string }) => {
+    const { paths } = resolveAgentBusPaths(opts.agent);
+    const state = listActiveThreads(paths);
+
+    if (opts.format === 'json') {
+      console.log(JSON.stringify(state, null, 2));
+      return;
+    }
+
+    if (state.threads.length === 0) {
+      console.log('No active threads');
+      return;
+    }
+
+    console.log('MELD ID     INTERNAL ID  STATUS               NEXT TRIGGER           SUBJECT');
+    console.log('----------  -----------  -------------------  ---------------------  -------');
+    for (const thread of state.threads) {
+      const meldId = thread.meld_id.padEnd(10, ' ');
+      const internalId = thread.internal_id.padEnd(11, ' ');
+      const status = thread.status.slice(0, 19).padEnd(19, ' ');
+      const nextTrigger = (thread.next_trigger_at ?? '-').slice(0, 21).padEnd(21, ' ');
+      console.log(`${meldId}  ${internalId}  ${status}  ${nextTrigger}  ${thread.subject}`);
+    }
+  });
+
+activeThreadsCommand
+  .command('add')
+  .requiredOption('--meld-id <id>', 'PropertyMeld ref_id or internal numeric id')
+  .requiredOption('--subject <subject>', 'Thread subject')
+  .requiredOption('--status <status>', 'Short thread status label')
+  .requiredOption('--last-action <action>', 'Most recent action taken')
+  .option('--next-trigger <iso>', 'When to next check or nudge')
+  .option('--notes <notes>', 'Free-form context, multi-line ok')
+  .option('--agent <name>', 'Override target agent (defaults to $CTX_AGENT_NAME)')
+  .action((opts: { meldId: string; subject: string; status: string; lastAction: string; nextTrigger?: string; notes?: string; agent?: string }) => {
+    const { agentName, paths } = resolveAgentBusPaths(opts.agent);
+    const thread = addActiveThread(paths, {
+      meldId: opts.meldId,
+      subject: opts.subject,
+      owner: agentName,
+      status: opts.status,
+      lastAction: opts.lastAction,
+      nextTriggerAt: opts.nextTrigger,
+      notes: opts.notes,
+    });
+    console.log(JSON.stringify(thread, null, 2));
+  });
+
+activeThreadsCommand
+  .command('update')
+  .argument('<meld-id>', 'PropertyMeld ref_id or internal numeric id already tracked in the state file')
+  .option('--status <status>', 'Updated status label')
+  .option('--last-action <action>', 'Updated last action text')
+  .option('--next-trigger <iso>', 'Updated next trigger timestamp')
+  .option('--notes <notes>', 'Updated notes text')
+  .option('--agent <name>', 'Override target agent (defaults to $CTX_AGENT_NAME)')
+  .action((meldId: string, opts: { status?: string; lastAction?: string; nextTrigger?: string; notes?: string; agent?: string }) => {
+    if (
+      opts.status === undefined &&
+      opts.lastAction === undefined &&
+      opts.nextTrigger === undefined &&
+      opts.notes === undefined
+    ) {
+      console.error('active-threads update requires at least one field to change');
+      process.exit(1);
+    }
+
+    const { paths } = resolveAgentBusPaths(opts.agent);
+    const thread = updateActiveThread(paths, meldId, {
+      status: opts.status,
+      lastAction: opts.lastAction,
+      nextTriggerAt: opts.nextTrigger,
+      notes: opts.notes,
+    });
+    console.log(JSON.stringify(thread, null, 2));
+  });
+
+activeThreadsCommand
+  .command('remove')
+  .argument('<meld-id>', 'PropertyMeld ref_id or internal numeric id')
+  .option('--agent <name>', 'Override target agent (defaults to $CTX_AGENT_NAME)')
+  .action((meldId: string, opts: { agent?: string }) => {
+    const { paths } = resolveAgentBusPaths(opts.agent);
+    const removed = removeActiveThread(paths, meldId);
+    console.log(JSON.stringify(removed, null, 2));
+  });
+
+activeThreadsCommand
+  .command('clear')
+  .requiredOption('--confirm', 'Required safety flag')
+  .option('--agent <name>', 'Override target agent (defaults to $CTX_AGENT_NAME)')
+  .action((opts: { confirm?: boolean; agent?: string }) => {
+    if (!opts.confirm) {
+      console.error('active-threads clear requires --confirm');
+      process.exit(1);
+    }
+
+    const { paths } = resolveAgentBusPaths(opts.agent);
+    const removed = clearActiveThreads(paths);
+    console.log(`Cleared ${removed} active thread(s)`);
+  });
+
+busCommand.addCommand(activeThreadsCommand);
 
 // ---------------------------------------------------------------------------
 // Reminder commands — persistent cron state that survives hard-restarts (#69)

@@ -6,6 +6,7 @@ export { createTask, updateTask, completeTask, listTasks } from './task.js';
 export { logEvent } from './event.js';
 export { updateHeartbeat, readAllHeartbeats } from './heartbeat.js';
 export { createApproval, updateApproval, listPendingApprovals } from './approval.js';
+export { listActiveThreads, addActiveThread, updateActiveThread, removeActiveThread, clearActiveThreads } from './active-threads.js';
 export {
   selfRestart,
   autoCommit,
