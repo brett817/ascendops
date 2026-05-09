@@ -196,18 +196,31 @@ export function resolveMeldIdsFromListOutput(rawMeldId: string, stdout: string):
 }
 
 function resolveFromPmList(rawMeldId: string): ResolvedMeldIds | null {
+  // Single-meld lookup: `pm work-orders get <ref_id>` — pm CLI 0.1.0+ resolves
+  // ref_id internally and returns one meld. Avoids ENOBUFS from listing 500
+  // melds (each ~1.5kb of JSON × 500 blows past execFileSync default 1MB cap).
   let stdout: string;
   try {
     stdout = childProcess.execFileSync(
       'pm',
-      ['work-orders', 'list', '--limit', '500', '--json'],
-      { encoding: 'utf-8' },
+      ['work-orders', 'get', rawMeldId, '--json'],
+      { encoding: 'utf-8', maxBuffer: 4 * 1024 * 1024 },
     );
   } catch {
     return null;
   }
 
-  return resolveMeldIdsFromListOutput(rawMeldId, stdout);
+  try {
+    const meld = JSON.parse(stdout) as Record<string, unknown>;
+    const ref = meld.reference_id ?? meld.referenceId ?? meld.ref_id ?? meld.refId;
+    const internal = meld.id ?? meld.internal_id ?? meld.internalId ?? meld.meld_id ?? meld.meldId;
+    if (typeof internal !== 'string' && typeof internal !== 'number') return null;
+    const internalId = String(internal);
+    const refId = typeof ref === 'string' && ref.length > 0 ? ref : internalId;
+    return { meldId: refId, internalId };
+  } catch {
+    return null;
+  }
 }
 
 export function resolveMeldIds(rawMeldId: string): ResolvedMeldIds {
