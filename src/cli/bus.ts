@@ -14,6 +14,7 @@ import { browseCatalog, installCommunityItem, prepareSubmission, submitCommunity
 import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
 import { createApproval, updateApproval } from '../bus/approval.js';
 import { listActiveThreads, addActiveThread, updateActiveThread, removeActiveThread, clearActiveThreads } from '../bus/active-threads.js';
+import { listVendorDocPatterns, vendorDocPattern } from '../bus/vendor-patterns.js';
 import { createReminder, listReminders, ackReminder, pruneReminders } from '../bus/reminders.js';
 import { updateCronFire, parseDurationMs, readCronState } from '../bus/cron-state.js';
 import { addCron, removeCron, readCrons, updateCron as updateCronDef, getCronByName, getExecutionLog } from '../bus/crons.js';
@@ -1864,6 +1865,63 @@ activeThreadsCommand
   });
 
 busCommand.addCommand(activeThreadsCommand);
+
+const vendorPatternsCommand = new Command('vendor-patterns')
+  .description('Look up vendor-specific documentation and closeout behavior');
+
+vendorPatternsCommand
+  .command('list')
+  .option('--format <fmt>', 'Output format: json or table', 'table')
+  .action((opts: { format?: string }) => {
+    const patterns = listVendorDocPatterns();
+
+    if (opts.format === 'json') {
+      console.log(JSON.stringify(patterns, null, 2));
+      return;
+    }
+
+    if (patterns.length === 0) {
+      console.log('No vendor doc patterns');
+      return;
+    }
+
+    console.log('VENDOR NAME   PHOTOS        NOTES             CLOSEOUT LAG  NOTES');
+    console.log('------------  ------------  ----------------  ------------  -----');
+    for (const pattern of patterns) {
+      const vendorName = pattern.vendor_name.padEnd(12, ' ');
+      const photos = pattern.photos.padEnd(12, ' ');
+      const notes = pattern.notes.padEnd(16, ' ');
+      const closeoutLag = String(pattern.closeout_lag_minutes).padEnd(12, ' ');
+      console.log(`${vendorName}  ${photos}  ${notes}  ${closeoutLag}  ${pattern.notes_text}`);
+    }
+  });
+
+vendorPatternsCommand
+  .command('lookup')
+  .argument('<vendor_name>', 'Vendor name or alias')
+  .option('--json', 'Emit raw JSON instead of formatted text')
+  .action((vendorName: string, opts: { json?: boolean }) => {
+    const pattern = vendorDocPattern(vendorName);
+    if (!pattern) {
+      const payload = { error: `no pattern for ${vendorName}` };
+      console.error(JSON.stringify(payload));
+      process.exit(1);
+    }
+
+    if (opts.json) {
+      console.log(JSON.stringify(pattern, null, 2));
+      return;
+    }
+
+    console.log(`Vendor: ${pattern.vendor_name}`);
+    console.log(`Aliases: ${pattern.aliases.join(', ')}`);
+    console.log(`Photos: ${pattern.photos}`);
+    console.log(`Notes: ${pattern.notes}`);
+    console.log(`Closeout lag (minutes): ${pattern.closeout_lag_minutes}`);
+    console.log(`Rule: ${pattern.notes_text}`);
+  });
+
+busCommand.addCommand(vendorPatternsCommand);
 
 // ---------------------------------------------------------------------------
 // Reminder commands — persistent cron state that survives hard-restarts (#69)
