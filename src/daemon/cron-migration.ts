@@ -448,8 +448,14 @@ export function migrateAllAgents(
 
     let agentNames: string[] = [];
     try {
+      // Match the daemon's discoverAgents() filter: skip _shared/, hidden
+      // dirs, and any directory without a config.json. Without these guards
+      // cron-migration would write crons.json + .crons-migrated markers for
+      // dirs that the daemon would never actually spawn (Zone C M4).
       agentNames = fsReaddir(agentsBase, { withFileTypes: true })
         .filter((d) => d.isDirectory())
+        .filter((d) => !d.name.startsWith('_') && !d.name.startsWith('.'))
+        .filter((d) => fsExists(join(agentsBase, d.name, 'config.json')))
         .map((d) => d.name);
     } catch {
       continue;

@@ -211,9 +211,16 @@ export class AgentProcess {
 
       this.notifyStatusChange();
     } catch (err) {
+      // Surface startup failures to the caller. Previously this catch only
+      // logged + flipped status to 'crashed' and returned silently, so
+      // AgentManager.startAgent() couldn't tell apart a successful spawn
+      // from a dead one and would proceed to wire crons / fast-checker /
+      // Telegram pollers against a process that never reached running.
+      // Throwing here lets startAgent abort the secondary wiring.
       this.log(`Failed to start: ${err}`);
       this.status = 'crashed';
       this.notifyStatusChange();
+      throw err instanceof Error ? err : new Error(String(err));
     }
   }
 
@@ -889,7 +896,13 @@ export class AgentProcess {
   }
 
   private resetCrashCountIfNewDay(today: string): void {
-    const crashFile = join(this.env.ctxRoot, 'logs', this.name, '.crash_count_today');
+    // Canonical crash-count location is state/<agent>/.crash_count_today —
+    // matches hook-crash-alert.ts so daemon halt logic and operator alerts
+    // read/write the same counter. Previous logs/<agent>/ path produced
+    // divergent counts where the hook's reset/fetch had no effect on the
+    // daemon's halt threshold and vice versa (Zone C M1 / Zone A M3).
+    const stateDir = join(this.env.ctxRoot, 'state', this.name);
+    const crashFile = join(stateDir, '.crash_count_today');
     try {
       if (existsSync(crashFile)) {
         const content = readFileSync(crashFile, 'utf-8').trim();
@@ -900,7 +913,7 @@ export class AgentProcess {
           this.crashCount = 1;
         }
       }
-      ensureDir(join(this.env.ctxRoot, 'logs', this.name));
+      ensureDir(stateDir);
       writeFileSync(crashFile, `${today}:${this.crashCount}`, 'utf-8');
     } catch { /* ignore */ }
   }

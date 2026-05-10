@@ -54,15 +54,18 @@ export class AgentManager {
     // (`cortextos enable`/`disable`) and the dashboard. Without this read, those
     // commands have no effect across daemon restarts — the daemon would
     // re-discover and re-start any agent dir on disk regardless of user intent.
-    const instanceEnabled = this.readInstanceEnableList();
-
+    //
+    // Zone C H4: re-read the registry per-iteration. Boot does serial spawns
+    // and any IPC during boot can rewrite enabled-agents.json mid-pass. A
+    // single up-front snapshot would let a just-disabled agent still start
+    // (and a just-enabled agent stay dark) until the next daemon restart.
     for (const { name, dir, org, config } of agentDirs) {
       // Per-agent config.json `enabled: false` (existing behavior, unchanged)
       if (config.enabled === false) {
         console.log(`[agent-manager] Skipping disabled agent: ${name} (per-agent config.json)`);
         continue;
       }
-      // Instance-level enabled-agents.json `enabled: false` (BUG-028 fix)
+      const instanceEnabled = this.readInstanceEnableList();
       const entry = instanceEnabled[name];
       if (entry && entry.enabled === false) {
         console.log(`[agent-manager] Skipping disabled agent: ${name} (enabled-agents.json)`);
@@ -70,7 +73,15 @@ export class AgentManager {
       }
       // BUG-043 fix: pass the per-agent org so startAgent can use it instead
       // of falling back to `this.org` (the daemon's startup org).
-      await this.startAgent(name, dir, config, org);
+      // Catch per-agent failures so one broken agent doesn't abort the whole
+      // boot. AgentProcess.start now re-throws on spawn failure (Zone C H2),
+      // and startAgent re-throws after cleanup; we log + continue here so
+      // the rest of the fleet still comes online.
+      try {
+        await this.startAgent(name, dir, config, org);
+      } catch (err) {
+        console.error(`[agent-manager] Failed to start ${name}: ${err}`);
+      }
     }
   }
 
@@ -85,8 +96,16 @@ export class AgentManager {
     if (!existsSync(enabledFile)) return {};
     try {
       return JSON.parse(readFileSync(enabledFile, 'utf-8'));
-    } catch {
-      return {}; // corrupt or unreadable — fall through to default-enabled
+    } catch (err) {
+      // Falling back to {} default-enables every on-disk agent dir, which
+      // can resurrect explicitly-disabled agents after a partial / corrupt
+      // write to enabled-agents.json. Surface this loudly so an operator
+      // notices instead of silently re-spawning the fleet.
+      console.error(
+        `[agent-manager] CRITICAL: enabled-agents.json failed to parse (${err instanceof Error ? err.message : String(err)}). ` +
+          `Falling back to default-enabled. Repair the file or restore a backup; otherwise explicitly disabled agents will start.`,
+      );
+      return {};
     }
   }
 
@@ -314,10 +333,44 @@ export class AgentManager {
       prevStatusForReset = status.status;
     });
 
-    this.agents.set(name, { process: agentProcess, checker });
+    const entry = { process: agentProcess, checker };
+    this.agents.set(name, entry);
 
-    // Start agent
-    await agentProcess.start();
+    // Start agent. If start() throws, AgentProcess has already flipped status
+    // to 'crashed' (it now re-throws so callers can react). Tear down the
+    // map entry before re-throwing so we don't leave a half-registered
+    // zombie that blocks future startAgent() retries.
+    try {
+      await agentProcess.start();
+    } catch (err) {
+      // Only delete if we are still the canonical entry — a concurrent
+      // stop+start could have replaced the map entry while we were awaiting.
+      if (this.agents.get(name) === entry) {
+        this.agents.delete(name);
+      }
+      throw err;
+    }
+
+    // H3 (Zone C): stop-during-start race. If `cortextos stop X` lands while
+    // we were awaiting `start()`, the entry was replaced or removed; do not
+    // wire secondary resources against a process the operator already asked
+    // to kill. Identity check on the map entry is the cheapest generation
+    // token — sufficient because each startAgent call mints a fresh entry.
+    if (this.agents.get(name) !== entry) {
+      log(`agent ${name} entry was replaced/removed mid-start — aborting secondary wiring`);
+      return;
+    }
+
+    // Belt-and-suspenders: if start() resolved but status didn't reach
+    // 'running' (e.g. an exit fired during spawn — see codex exec-per-turn
+    // race in agent-process.ts), abort secondary wiring. The crashed
+    // process will be auto-recovered through handleExit; we just don't
+    // want to wire crons/fast-checker/Telegram against it in this turn.
+    const startedStatus = agentProcess.getStatus().status;
+    if (startedStatus !== 'running') {
+      log(`agent ${name} did not reach running (status=${startedStatus}) — skipping cron+checker+telegram wiring this cycle`);
+      return;
+    }
 
     // Subtask 2.2: Auto-migrate crons from config.json → crons.json before
     // starting the scheduler, so the scheduler always has a populated crons.json
