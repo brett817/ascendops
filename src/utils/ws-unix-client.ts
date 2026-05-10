@@ -24,6 +24,7 @@ export interface JsonRpcResponse<T = unknown> {
 
 type JsonRpcMessage = JsonRpcRequest | JsonRpcNotification | JsonRpcResponse;
 type MessageHandler = (message: JsonRpcMessage) => void;
+type DisconnectHandler = (err: Error) => void;
 
 interface PendingRequest {
   resolve: (message: JsonRpcResponse) => void;
@@ -60,6 +61,7 @@ export class WsUnixJsonRpcClient {
   private nextId = 1;
   private pending = new Map<number | string, PendingRequest>();
   private handlers: MessageHandler[] = [];
+  private disconnectHandlers: DisconnectHandler[] = [];
   private readonly endpoint: RpcClientEndpoint;
 
   constructor(endpoint: string | RpcClientEndpoint) {
@@ -115,10 +117,9 @@ export class WsUnixJsonRpcClient {
 
     this.socket = socket;
     socket.on('data', (chunk) => this.parseFrames(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
-    socket.on('error', (err) => this.rejectAll(err));
+    socket.on('error', (err) => this.handleDisconnect(err));
     socket.on('close', () => {
-      this.rejectAll(new Error('WebSocket Unix socket closed'));
-      this.socket = null;
+      this.handleDisconnect(new Error('WebSocket Unix socket closed'));
     });
 
     if (leftover.length > 0) {
@@ -128,7 +129,6 @@ export class WsUnixJsonRpcClient {
 
   close(): void {
     const socket = this.socket;
-    this.socket = null;
     if (socket && !socket.destroyed) {
       try {
         socket.end(this.encodeFrame('', 0x8));
@@ -136,13 +136,20 @@ export class WsUnixJsonRpcClient {
         socket.destroy();
       }
     }
-    this.rejectAll(new Error('WebSocket Unix socket closed'));
+    this.handleDisconnect(new Error('WebSocket Unix socket closed'));
   }
 
   onMessage(handler: MessageHandler): () => void {
     this.handlers.push(handler);
     return () => {
       this.handlers = this.handlers.filter((h) => h !== handler);
+    };
+  }
+
+  onDisconnect(handler: DisconnectHandler): () => void {
+    this.disconnectHandlers.push(handler);
+    return () => {
+      this.disconnectHandlers = this.disconnectHandlers.filter((h) => h !== handler);
     };
   }
 
@@ -294,7 +301,7 @@ export class WsUnixJsonRpcClient {
       if (opcode === 0x1) {
         this.parseTextPayload(payload.toString('utf-8'));
       } else if (opcode === 0x8) {
-        this.close();
+        this.handleDisconnect(new Error('WebSocket Unix socket closed'));
         return;
       }
     }
@@ -340,5 +347,18 @@ export class WsUnixJsonRpcClient {
       pending.reject(err);
     }
     this.pending.clear();
+  }
+
+  private handleDisconnect(err: Error): void {
+    const socket = this.socket;
+    if (!socket) return;
+    this.socket = null;
+    if (socket && !socket.destroyed) {
+      socket.destroy();
+    }
+    this.rejectAll(err);
+    for (const handler of this.disconnectHandlers) {
+      handler(err);
+    }
   }
 }

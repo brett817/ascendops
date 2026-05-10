@@ -109,6 +109,10 @@ export class CodexAppServerPTY {
   private _spawnFn: SpawnFn | null = null;
   private _appServerPty: IPty | null = null;
   private _rpc: WsUnixJsonRpcClient | null = null;
+  private _rpcMessageUnsubscribe: (() => void) | null = null;
+  private _rpcDisconnectUnsubscribe: (() => void) | null = null;
+  private _pidPollTimer: ReturnType<typeof setInterval> | null = null;
+  private _exitFinalized = false;
   private _onExitHandler: ((exitCode: number, signal?: number) => void) | null = null;
   private _outputBuffer: OutputBuffer;
   private _env: CtxEnv;
@@ -146,6 +150,7 @@ export class CodexAppServerPTY {
     }
 
     ensureDir(this._stateDir);
+    this._exitFinalized = false;
     this._alive = true;
 
     try {
@@ -185,24 +190,15 @@ export class CodexAppServerPTY {
   }
 
   kill(): void {
-    this._alive = false;
-    this._turnQueue = [];
-    this.rejectTurnCompletion(new Error('Codex app-server stopped'));
-    if (this._rpc) {
-      this._rpc.close();
-      this._rpc = null;
-    }
-    if (this._appServerPty) {
+    const pty = this._appServerPty;
+    this.finalizeExit(0, undefined, 'kill');
+    if (pty) {
       try {
-        this._appServerPty.kill();
+        pty.kill();
       } catch {
         // Ignore shutdown errors.
       }
-      this._appServerPty = null;
     }
-    this.removeSocket();
-    this._onExitHandler?.(0, undefined);
-    this._onExitHandler = null;
   }
 
   isAlive(): boolean {
@@ -224,6 +220,54 @@ export class CodexAppServerPTY {
   setTelegramHandle(api: TelegramAPI, chatId: string): void {
     this._telegramApi = api;
     this._chatId = chatId;
+  }
+
+  private finalizeExit(exitCode: number, signal?: number, reason?: string): void {
+    if (this._exitFinalized) return;
+    this._exitFinalized = true;
+    this._alive = false;
+    this._executing = false;
+    this._writeBuffer = '';
+    this._turnQueue = [];
+    this.rejectTurnCompletion(new Error(reason ? `Codex app-server stopped: ${reason}` : 'Codex app-server stopped'));
+    this.stopPidPoll();
+    this._rpcMessageUnsubscribe?.();
+    this._rpcMessageUnsubscribe = null;
+    this._rpcDisconnectUnsubscribe?.();
+    this._rpcDisconnectUnsubscribe = null;
+    if (this._rpc) {
+      this._rpc.close();
+      this._rpc = null;
+    }
+    this._appServerPty = null;
+    this._rpcEndpoint = null;
+    this.removeSocket();
+    const onExit = this._onExitHandler;
+    this._onExitHandler = null;
+    onExit?.(exitCode, signal);
+  }
+
+  private startPidPoll(pid: number): void {
+    this.stopPidPoll();
+    if (!(pid > 0)) return;
+    this._pidPollTimer = setInterval(() => {
+      if (!this._alive || this._exitFinalized) return;
+      let alive = true;
+      try {
+        process.kill(pid, 0);
+      } catch (err) {
+        alive = (err as NodeJS.ErrnoException).code === 'EPERM';
+      }
+      if (!alive) {
+        this.finalizeExit(1, undefined, `pid ${pid} no longer exists`);
+      }
+    }, 30000);
+  }
+
+  private stopPidPoll(): void {
+    if (!this._pidPollTimer) return;
+    clearInterval(this._pidPollTimer);
+    this._pidPollTimer = null;
   }
 
   private async handleInput(content: string): Promise<void> {
@@ -459,6 +503,7 @@ export class CodexAppServerPTY {
       });
 
       this._appServerPty = pty;
+      this.startPidPoll(pty.pid);
       pty.onData((data) => {
         this._outputBuffer.push(data);
         if (data.includes('Error:')) {
@@ -467,10 +512,7 @@ export class CodexAppServerPTY {
       });
       pty.onExit(({ exitCode, signal }) => {
         if (this._appServerPty !== pty) return;
-        this._appServerPty = null;
-        this._alive = false;
-        this.rejectTurnCompletion(new Error('Codex app-server exited'));
-        this._onExitHandler?.(exitCode, signal);
+        this.finalizeExit(exitCode, signal, 'pty exit');
       });
 
       this.waitForPort(port).then(resolve, reject);
@@ -506,7 +548,10 @@ export class CodexAppServerPTY {
     // older constructor flow).
     const endpoint = this._rpcEndpoint ?? { socketPath: this._socketPath };
     this._rpc = new WsUnixJsonRpcClient(endpoint);
-    this._rpc.onMessage((message) => this.handleRpcMessage(message));
+    this._rpcMessageUnsubscribe = this._rpc.onMessage((message) => this.handleRpcMessage(message));
+    this._rpcDisconnectUnsubscribe = this._rpc.onDisconnect((err) => {
+      this.finalizeExit(1, undefined, err.message || 'rpc disconnect');
+    });
     await this._rpc.connect();
   }
 
@@ -950,6 +995,15 @@ export class CodexAppServerPTY {
   }
 
   private cleanupSpawnAttempt(): void {
+    this.stopPidPoll();
+    this._rpcMessageUnsubscribe?.();
+    this._rpcMessageUnsubscribe = null;
+    this._rpcDisconnectUnsubscribe?.();
+    this._rpcDisconnectUnsubscribe = null;
+    if (this._rpc) {
+      this._rpc.close();
+      this._rpc = null;
+    }
     const pty = this._appServerPty;
     this._appServerPty = null;
     if (pty) {
@@ -959,6 +1013,7 @@ export class CodexAppServerPTY {
         // Ignore failed attempt cleanup errors.
       }
     }
+    this._rpcEndpoint = null;
     this.removeSocket();
   }
 

@@ -1,5 +1,21 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
+let spawnedPtyExitHandler: ((event: { exitCode: number; signal?: number }) => void) | null = null;
+let spawnedPtyDataHandler: ((data: string) => void) | null = null;
+const spawnedPty = {
+  pid: 88,
+  write: vi.fn(),
+  onData: vi.fn().mockImplementation((handler: (data: string) => void) => {
+    spawnedPtyDataHandler = handler;
+    return { dispose: vi.fn() };
+  }),
+  onExit: vi.fn().mockImplementation((handler: (event: { exitCode: number; signal?: number }) => void) => {
+    spawnedPtyExitHandler = handler;
+    return { dispose: vi.fn() };
+  }),
+  kill: vi.fn(),
+};
+
 const fsMocks = {
   existsSync: vi.fn().mockReturnValue(false),
   readFileSync: vi.fn(),
@@ -28,14 +44,49 @@ vi.mock('../../../src/utils/atomic.js', () => ({
 }));
 
 vi.mock('node-pty', () => ({
-  spawn: vi.fn().mockReturnValue({
-    pid: 88,
-    write: vi.fn(),
-    onData: vi.fn(),
-    onExit: vi.fn(),
-    kill: vi.fn(),
-  }),
+  spawn: vi.fn().mockReturnValue(spawnedPty),
 }));
+
+vi.mock('net', async () => {
+  const actual = await vi.importActual<typeof import('net')>('net');
+  return {
+    ...actual,
+    createServer: vi.fn().mockImplementation(() => ({
+      unref: vi.fn(),
+      once: vi.fn(),
+      listen: vi.fn().mockImplementation((_port: number, _host: string, cb: () => void) => {
+        cb();
+      }),
+      address: vi.fn().mockReturnValue({ port: 43123 }),
+      close: vi.fn().mockImplementation((cb?: () => void) => {
+        cb?.();
+      }),
+    })),
+    createConnection: vi.fn().mockImplementation(() => {
+      const handlers = new Map<string, Array<(...args: unknown[]) => void>>();
+      const conn = {
+        once: vi.fn().mockImplementation((event: string, handler: (...args: unknown[]) => void) => {
+          const list = handlers.get(event) ?? [];
+          list.push(handler);
+          handlers.set(event, list);
+          if (event === 'connect') {
+            queueMicrotask(() => handler());
+          }
+          return conn;
+        }),
+        on: vi.fn().mockImplementation((event: string, handler: (...args: unknown[]) => void) => {
+          const list = handlers.get(event) ?? [];
+          list.push(handler);
+          handlers.set(event, list);
+          return conn;
+        }),
+        off: vi.fn().mockReturnThis(),
+        destroy: vi.fn(),
+      };
+      return conn;
+    }),
+  };
+});
 
 const requestMock = vi.fn();
 const notifyMock = vi.fn();
@@ -43,6 +94,7 @@ const closeMock = vi.fn();
 const respondErrorMock = vi.fn();
 const logEventMock = vi.fn();
 let messageHandler: ((message: unknown) => void) | null = null;
+let disconnectHandler: ((err: Error) => void) | null = null;
 
 vi.mock('../../../src/utils/ws-unix-client.js', () => ({
   WsUnixJsonRpcClient: vi.fn().mockImplementation(function WsUnixJsonRpcClient() {
@@ -53,6 +105,10 @@ vi.mock('../../../src/utils/ws-unix-client.js', () => ({
       respondError: respondErrorMock,
       onMessage: vi.fn().mockImplementation((handler: (message: unknown) => void) => {
         messageHandler = handler;
+        return vi.fn();
+      }),
+      onDisconnect: vi.fn().mockImplementation((handler: (err: Error) => void) => {
+        disconnectHandler = handler;
         return vi.fn();
       }),
       request: requestMock,
@@ -89,6 +145,13 @@ beforeEach(() => {
   logEventMock.mockReset();
   atomicWriteSyncMock.mockReset();
   messageHandler = null;
+  disconnectHandler = null;
+  spawnedPtyExitHandler = null;
+  spawnedPtyDataHandler = null;
+  spawnedPty.write.mockReset();
+  spawnedPty.onData.mockClear();
+  spawnedPty.onExit.mockClear();
+  spawnedPty.kill.mockReset();
 });
 
 describe('CodexAppServerPTY socket path policy', () => {
@@ -113,6 +176,32 @@ describe('CodexAppServerPTY socket path policy', () => {
       expect.stringContaining('"fallback": true'),
       'utf-8',
     );
+  });
+});
+
+describe('CodexAppServerPTY lifecycle', () => {
+  it('finalizes once on RPC disconnect even if PTY exit arrives later', async () => {
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    const onExit = vi.fn();
+    pty.onExit(onExit);
+    (pty as unknown as { _alive: boolean })._alive = true;
+    (pty as unknown as { _appServerPty: typeof spawnedPty })._appServerPty = spawnedPty;
+
+    await (pty as unknown as { connectRpc(): Promise<void> }).connectRpc();
+
+    expect(disconnectHandler).not.toBeNull();
+    expect((pty as unknown as { _alive: boolean })._alive).toBe(true);
+
+    disconnectHandler!(new Error('socket closed'));
+
+    expect((pty as unknown as { _alive: boolean })._alive).toBe(false);
+    expect(pty.isAlive()).toBe(false);
+    expect(onExit).toHaveBeenCalledTimes(1);
+
+    (pty as unknown as { finalizeExit(exitCode: number, signal?: number, reason?: string): void })
+      .finalizeExit(137, 9, 'late pty exit');
+
+    expect(onExit).toHaveBeenCalledTimes(1);
   });
 });
 
