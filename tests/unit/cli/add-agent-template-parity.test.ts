@@ -36,9 +36,9 @@ function listSkillDirs(root: string): string[] {
     .sort();
 }
 
-// AscendOps-fork divergence: our `templates/agent/.claude/skills/` ships 8
+// AscendOps-fork divergence: our `templates/agent/.claude/skills/` ships 7
 // org-specific skills not yet ported to the codex template:
-// delegation-matrix, framework-upstream-auto-update, graphify, monday,
+// delegation-matrix, framework-upstream-auto-update, monday,
 // obsidian-log, officecli, opencli, propertymeld. Mirroring into the codex
 // template is a separate ship (#369 follow-up). Until then, exclude these
 // from parity checks so the upstream invariant still applies to the canonical
@@ -46,7 +46,6 @@ function listSkillDirs(root: string): string[] {
 const ASCENDOPS_FORK_ONLY_SKILLS = new Set([
   'delegation-matrix',
   'framework-upstream-auto-update',
-  'graphify',
   'monday',
   'obsidian-log',
   'officecli',
