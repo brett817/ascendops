@@ -15,7 +15,9 @@ const mockPty = {
   spawn: vi.fn().mockResolvedValue(undefined),
   kill: vi.fn(),
   write: vi.fn(),
-  getPid: vi.fn().mockReturnValue(99999),
+  // process.pid keeps getStatus()'s OS-liveness probe (process.kill(pid, 0))
+  // happy in tests; the probe was added to catch silent-PTY-death in prod.
+  getPid: vi.fn().mockReturnValue(process.pid),
   isAlive: vi.fn().mockReturnValue(true),
   getOutputBuffer: vi.fn(() => mockOutputBuffer),
   onExit: vi.fn().mockImplementation((cb: (exitCode: number, signal?: number) => void) => {

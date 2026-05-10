@@ -398,9 +398,45 @@ export class AgentProcess {
    * Get current agent status.
    */
   getStatus(): AgentStatus {
+    // Liveness reconciliation: if cached status is 'running' but the
+    // underlying OS process is gone, surface 'crashed' instead. This catches
+    // silent-PTY-death paths where the codex-cli child exited but the
+    // PTY-layer onExit event never fired (observed 2026-05-10: codie went
+    // silent at 18:40 UTC, codex process disappeared from ps, this.pty +
+    // _alive stayed true, `cortextos status` reported stale 'running pid'
+    // until daemon restart).
+    //
+    // We probe the actual OS pid with signal 0 instead of trusting
+    // pty.isAlive() — _alive is a JS field that flips on the onExit event,
+    // which is exactly the event that fails to fire in the silent-death
+    // case. Signal 0 is the canonical "does this pid exist" check on POSIX.
+    //
+    // Important: do NOT downgrade when this.pty is null. handleExit() nulls
+    // this.pty in shutdown / daemon-stop / stop-requested paths where the
+    // existing semantics keep status === 'running' on purpose (the PTY is
+    // going to be respawned on the next start() and dashboards should not
+    // flap to 'crashed' in that window). Only act when we have a pid we
+    // can probe and the probe fails.
+    let reportedStatus = this.status;
+    if (reportedStatus === 'running' && this.pty) {
+      const pid = this.pty.getPid();
+      if (pid && pid > 0) {
+        let alive = true;
+        try {
+          process.kill(pid, 0);
+        } catch (err) {
+          // EPERM = process exists but we lack permission; treat as alive
+          // ESRCH = no such process — actually dead
+          alive = (err as NodeJS.ErrnoException).code === 'EPERM';
+        }
+        if (!alive) {
+          reportedStatus = 'crashed';
+        }
+      }
+    }
     return {
       name: this.name,
-      status: this.status,
+      status: reportedStatus,
       pid: this.pty?.getPid() || undefined,
       uptime: this.sessionStart
         ? Math.floor((Date.now() - this.sessionStart.getTime()) / 1000)

@@ -7,7 +7,12 @@ const mockPty = {
   spawn: vi.fn().mockResolvedValue(undefined),
   kill: vi.fn(),
   write: vi.fn(),
-  getPid: vi.fn().mockReturnValue(12345),
+  // Use the test runner's own pid as a stand-in for the agent's PTY pid so
+  // the daemon's OS-liveness probe in getStatus() (process.kill(pid, 0))
+  // succeeds — that probe was added to catch silent-PTY-death state cache
+  // divergence. The probe is also gated on this.pty existing, so the
+  // shutdown-handler tests that null out this.pty are unaffected.
+  getPid: vi.fn().mockReturnValue(process.pid),
   isAlive: vi.fn().mockReturnValue(true),
   // Default: no rate-limit signature in output (safe for all existing tests)
   getOutputBuffer: vi.fn().mockReturnValue({ hasRateLimitSignature: () => false }),
