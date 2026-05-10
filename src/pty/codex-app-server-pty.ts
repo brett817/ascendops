@@ -440,10 +440,15 @@ export class CodexAppServerPTY {
     }
 
     return new Promise<void>((resolve, reject) => {
+      // Note: PR-#369 originally passed `--enable goals` to opt into the
+      // goal-tracking feature, but codex-cli 0.118.0 reports
+      // `Error: Unknown feature flag: goals` because this feature is not yet
+      // present in the local codex build. Drop the flag for compatibility;
+      // /goal RPC calls degrade to a clean error if codex doesn't expose
+      // them. Re-enable once codex-cli ships goal support.
       const spawnFn = this._spawnFn!;
       const pty = spawnFn('codex', [
         'app-server',
-        '--enable', 'goals',
         '--listen', listenArg,
       ], {
         name: 'xterm-256color',
