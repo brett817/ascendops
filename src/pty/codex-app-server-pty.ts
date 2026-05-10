@@ -2,6 +2,7 @@ import { appendFileSync, existsSync, readFileSync, unlinkSync, writeFileSync } f
 import { join } from 'path';
 import { homedir } from 'os';
 import { randomBytes } from 'crypto';
+import { createServer, createConnection } from 'net';
 import type { AgentConfig, CtxEnv } from '../types/index.js';
 import { OutputBuffer } from './output-buffer.js';
 import type { TelegramAPI } from '../telegram/api.js';
@@ -35,7 +36,9 @@ interface ThreadState {
 }
 
 interface SocketPointer {
-  socketPath: string;
+  socketPath?: string;
+  host?: string;
+  port?: number;
   fallback: boolean;
   reason?: string;
   updatedAt: string;
@@ -115,6 +118,7 @@ export class CodexAppServerPTY {
   private _socketPath: string;
   private _socketListenArg: string;
   private _socketCwd: string;
+  private _rpcEndpoint: { host: string; port: number } | { socketPath: string } | null = null;
   private _threadStatePath: string;
   private _socketPointerPath: string;
   private _threadId: string | null = null;
@@ -408,18 +412,39 @@ export class CodexAppServerPTY {
     throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
   }
 
-  private startAppServer(): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      if (!this._spawnFn) {
-        const nodePty = require('node-pty');
-        this._spawnFn = nodePty.spawn;
-      }
+  private async startAppServer(): Promise<void> {
+    if (!this._spawnFn) {
+      const nodePty = require('node-pty');
+      this._spawnFn = nodePty.spawn;
+    }
 
+    // codex-cli 0.118.0 dropped `unix://` --listen support. Allocate a free
+    // ephemeral TCP port on loopback and spawn with `--listen ws://127.0.0.1:<port>`.
+    // The WebSocket frame parsing in WsUnixJsonRpcClient is transport-agnostic;
+    // only the connect path differs.
+    const port = await allocateFreePort();
+    const listenArg = `ws://127.0.0.1:${port}`;
+    this._socketListenArg = listenArg;
+    this._rpcEndpoint = { host: '127.0.0.1', port };
+    try {
+      const pointer: SocketPointer = {
+        host: '127.0.0.1',
+        port,
+        fallback: false,
+        updatedAt: new Date().toISOString(),
+      };
+      ensureDir(this._stateDir);
+      writeFileSync(this._socketPointerPath, `${JSON.stringify(pointer, null, 2)}\n`, 'utf-8');
+    } catch {
+      // Non-fatal — pointer is informational.
+    }
+
+    return new Promise<void>((resolve, reject) => {
       const spawnFn = this._spawnFn!;
       const pty = spawnFn('codex', [
         'app-server',
         '--enable', 'goals',
-        '--listen', this._socketListenArg,
+        '--listen', listenArg,
       ], {
         name: 'xterm-256color',
         cols: 200,
@@ -443,8 +468,22 @@ export class CodexAppServerPTY {
         this._onExitHandler?.(exitCode, signal);
       });
 
-      this.waitForSocket().then(resolve, reject);
+      this.waitForPort(port).then(resolve, reject);
     });
+  }
+
+  private async waitForPort(port: number, timeoutMs = 10000): Promise<void> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const ok = await new Promise<boolean>((res) => {
+        const probe = createConnection({ host: '127.0.0.1', port });
+        probe.once('connect', () => { probe.destroy(); res(true); });
+        probe.once('error', () => { probe.destroy(); res(false); });
+      });
+      if (ok) return;
+      await sleep(100);
+    }
+    throw new Error(`Timed out waiting for app-server port: 127.0.0.1:${port}`);
   }
 
   private async waitForSocket(timeoutMs = 10000): Promise<void> {
@@ -457,7 +496,11 @@ export class CodexAppServerPTY {
   }
 
   private async connectRpc(): Promise<void> {
-    this._rpc = new WsUnixJsonRpcClient(this._socketPath);
+    // Prefer the TCP endpoint allocated in startAppServer(). Fall back to the
+    // legacy unix-socket path if no endpoint was set (e.g. tests using the
+    // older constructor flow).
+    const endpoint = this._rpcEndpoint ?? { socketPath: this._socketPath };
+    this._rpc = new WsUnixJsonRpcClient(endpoint);
     this._rpc.onMessage((message) => this.handleRpcMessage(message));
     await this._rpc.connect();
   }
@@ -992,4 +1035,30 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Ask the kernel for an unused TCP port on loopback.
+ *
+ * `createServer().listen(0)` lets the OS pick a free ephemeral port; we read it
+ * back from the bound address, then close the server so codex app-server can
+ * claim it. There is a small TOCTOU window between close and codex bind, but
+ * collisions are vanishingly rare on loopback ephemeral ports — and a fresh
+ * spawn attempt will reallocate via the existing retry loop if it does happen.
+ */
+function allocateFreePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = createServer();
+    server.unref();
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const addr = server.address();
+      if (typeof addr === 'object' && addr && 'port' in addr) {
+        const port = addr.port;
+        server.close(() => resolve(port));
+      } else {
+        server.close(() => reject(new Error('Failed to allocate ephemeral port')));
+      }
+    });
+  });
 }

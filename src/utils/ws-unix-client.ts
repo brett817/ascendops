@@ -32,12 +32,27 @@ interface PendingRequest {
 }
 
 /**
- * Minimal WebSocket-over-Unix JSON-RPC client.
+ * Endpoint variants for the WebSocket-framed JSON-RPC client.
  *
- * Codex app-server's `unix://` transport is WebSocket-framed. The JSON-RPC
- * payloads inside text frames are newline-delimited, matching the stdio
- * transport after the WebSocket layer is removed. This helper intentionally
- * uses Node built-ins only so the app-server adapter adds no runtime deps.
+ * `socketPath`: connect over a Unix domain socket (codex app-server <0.118
+ *   `unix://` transport). Kept for backward compatibility.
+ * `host` + `port`: connect over TCP loopback (codex app-server >=0.118
+ *   `ws://IP:PORT` transport — the unix-socket scheme was dropped).
+ *
+ * The WebSocket handshake and frame parsing layers above the raw socket are
+ * transport-agnostic, so only the connect step branches.
+ */
+export type RpcClientEndpoint = { socketPath: string } | { host: string; port: number };
+
+/**
+ * Minimal WebSocket-over-socket JSON-RPC client.
+ *
+ * Codex app-server's WebSocket transport is the same on Unix sockets and TCP
+ * loopback once the connection is established — same handshake, same frame
+ * format, same newline-delimited JSON payloads. This helper picks the right
+ * `createConnection` form based on the endpoint variant, then applies the
+ * standard WS handshake and frame parsing using only Node built-ins (no
+ * additional runtime deps).
  */
 export class WsUnixJsonRpcClient {
   private socket: Socket | null = null;
@@ -45,13 +60,18 @@ export class WsUnixJsonRpcClient {
   private nextId = 1;
   private pending = new Map<number | string, PendingRequest>();
   private handlers: MessageHandler[] = [];
+  private readonly endpoint: RpcClientEndpoint;
 
-  constructor(private readonly socketPath: string) {}
+  constructor(endpoint: string | RpcClientEndpoint) {
+    this.endpoint = typeof endpoint === 'string' ? { socketPath: endpoint } : endpoint;
+  }
 
   async connect(): Promise<void> {
     if (this.socket) return;
 
-    const socket = createConnection(this.socketPath);
+    const socket = 'socketPath' in this.endpoint
+      ? createConnection(this.endpoint.socketPath)
+      : createConnection({ host: this.endpoint.host, port: this.endpoint.port });
     await new Promise<void>((resolve, reject) => {
       socket.once('connect', resolve);
       socket.once('error', reject);
