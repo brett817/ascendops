@@ -99,9 +99,18 @@ export class WsUnixJsonRpcClient {
     const expected = createHash('sha1')
       .update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
       .digest('base64');
-    if (accept && accept !== expected) {
+    // The Sec-WebSocket-Accept header is REQUIRED per RFC 6455 §4.1. The
+    // previous `if (accept && ...)` short-circuited when the header was
+    // absent, accepting the 101 anyway. A peer that returns 101 without
+    // the accept token (or the wrong one) is not actually doing the WS
+    // handshake — refuse the connection (Zone A H3).
+    if (!accept || accept !== expected) {
       socket.destroy();
-      throw new Error('WebSocket handshake failed: Sec-WebSocket-Accept mismatch');
+      throw new Error(
+        accept
+          ? 'WebSocket handshake failed: Sec-WebSocket-Accept mismatch'
+          : 'WebSocket handshake failed: Sec-WebSocket-Accept header missing',
+      );
     }
 
     this.socket = socket;
@@ -177,26 +186,49 @@ export class WsUnixJsonRpcClient {
     this.socket.write(this.encodeFrame(`${JSON.stringify(message)}\n`));
   }
 
-  private readHandshake(socket: Socket): Promise<{ header: string; leftover: Buffer }> {
+  private readHandshake(socket: Socket, timeoutMs = 5000): Promise<{ header: string; leftover: Buffer }> {
     return new Promise((resolve, reject) => {
       let buffer = Buffer.alloc(0);
+      // A peer that accepts the TCP connection but never speaks the HTTP
+      // upgrade response would have wedged this method indefinitely before.
+      // Time out after `timeoutMs` so the caller's retry loop can recover
+      // (Zone A H3).
+      const timer = setTimeout(() => {
+        socket.off('data', onData);
+        socket.off('error', onError);
+        socket.off('close', onClose);
+        socket.off('end', onClose);
+        reject(new Error(`WebSocket handshake timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      const settle = () => {
+        clearTimeout(timer);
+        socket.off('data', onData);
+        socket.off('error', onError);
+        socket.off('close', onClose);
+        socket.off('end', onClose);
+      };
+      const onClose = () => {
+        settle();
+        reject(new Error('WebSocket handshake socket closed before response'));
+      };
       const onData = (chunk: Buffer) => {
         buffer = Buffer.concat([buffer, chunk]);
         const end = buffer.indexOf('\r\n\r\n');
         if (end === -1) return;
-        socket.off('data', onData);
-        socket.off('error', onError);
+        settle();
         resolve({
           header: buffer.subarray(0, end).toString('utf-8'),
           leftover: buffer.subarray(end + 4),
         });
       };
       const onError = (err: Error) => {
-        socket.off('data', onData);
+        settle();
         reject(err);
       };
       socket.on('data', onData);
       socket.once('error', onError);
+      socket.once('close', onClose);
+      socket.once('end', onClose);
     });
   }
 
