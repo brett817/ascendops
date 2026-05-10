@@ -18,6 +18,27 @@ import { registerBuiltInHandlers } from '../bus/hook-handlers/index.js';
 
 type LogFn = (msg: string) => void;
 
+type AskStateQuestion = {
+  question: string;
+  header: string;
+  options: string[];
+  multiSelect?: boolean;
+};
+
+type AskState = {
+  total_questions: number;
+  current_question: number;
+  questions: AskStateQuestion[];
+  multi_select_chosen?: number[];
+};
+
+type ContextStatus = {
+  written_at: string;
+  used_percentage: number;
+  exceeds_200k_tokens: boolean;
+  session_id?: string;
+};
+
 /**
  * Fast message checker for a single agent.
  * Replaces fast-checker.sh: polls Telegram and inbox, injects into PTY.
@@ -129,6 +150,88 @@ export class FastChecker {
   // process.env which is set by the daemon when it spawns each agent's
   // fast-checker context. Falls back to inert dispatcher if env is missing.
   private hookOrg: string | null = null;
+
+  private isPlainObject(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+  }
+
+  private logCriticalValidationError(filePath: string, detail: string): void {
+    console.error(`[fast-checker] CRITICAL: ${filePath} ${detail}`);
+  }
+
+  private validateAskState(raw: unknown, filePath: string): AskState | null {
+    if (!this.isPlainObject(raw)) {
+      this.logCriticalValidationError(filePath, 'invalid top-level shape: expected object');
+      return null;
+    }
+    if (typeof raw.total_questions !== 'number') {
+      this.logCriticalValidationError(filePath, 'invalid total_questions: expected number');
+      return null;
+    }
+    if (typeof raw.current_question !== 'number') {
+      this.logCriticalValidationError(filePath, 'invalid current_question: expected number');
+      return null;
+    }
+    if (!Array.isArray(raw.questions)) {
+      this.logCriticalValidationError(filePath, 'invalid questions: expected array');
+      return null;
+    }
+    for (let i = 0; i < raw.questions.length; i++) {
+      const question = raw.questions[i];
+      if (!this.isPlainObject(question)) {
+        this.logCriticalValidationError(filePath, `invalid questions[${i}]: expected object`);
+        return null;
+      }
+      if (typeof question.question !== 'string') {
+        this.logCriticalValidationError(filePath, `invalid questions[${i}].question: expected string`);
+        return null;
+      }
+      if ('header' in question && typeof question.header !== 'string') {
+        this.logCriticalValidationError(filePath, `invalid questions[${i}].header: expected string when present`);
+        return null;
+      }
+      if (!Array.isArray(question.options) || question.options.some(option => typeof option !== 'string')) {
+        this.logCriticalValidationError(filePath, `invalid questions[${i}].options: expected array of strings`);
+        return null;
+      }
+      if ('multiSelect' in question && typeof question.multiSelect !== 'boolean') {
+        this.logCriticalValidationError(filePath, `invalid questions[${i}].multiSelect: expected boolean when present`);
+        return null;
+      }
+    }
+    if (
+      'multi_select_chosen' in raw &&
+      (!Array.isArray(raw.multi_select_chosen) || raw.multi_select_chosen.some(index => typeof index !== 'number'))
+    ) {
+      this.logCriticalValidationError(filePath, 'invalid multi_select_chosen: expected array of numbers when present');
+      return null;
+    }
+    return raw as AskState;
+  }
+
+  private validateContextStatus(raw: unknown, filePath: string): ContextStatus | null {
+    if (!this.isPlainObject(raw)) {
+      this.logCriticalValidationError(filePath, 'invalid top-level shape: expected object');
+      return null;
+    }
+    if (typeof raw.written_at !== 'string') {
+      this.logCriticalValidationError(filePath, 'invalid written_at: expected string');
+      return null;
+    }
+    if (typeof raw.used_percentage !== 'number') {
+      this.logCriticalValidationError(filePath, 'invalid used_percentage: expected number');
+      return null;
+    }
+    if (typeof raw.exceeds_200k_tokens !== 'boolean') {
+      this.logCriticalValidationError(filePath, 'invalid exceeds_200k_tokens: expected boolean');
+      return null;
+    }
+    if ('session_id' in raw && typeof raw.session_id !== 'string') {
+      this.logCriticalValidationError(filePath, 'invalid session_id: expected string when present');
+      return null;
+    }
+    return raw as ContextStatus;
+  }
 
   constructor(
     agent: AgentProcess,
@@ -1457,7 +1560,8 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       const askStatePath = join(this.paths.stateDir, 'ask-state.json');
       if (existsSync(askStatePath)) {
         try {
-          const state = JSON.parse(readFileSync(askStatePath, 'utf-8'));
+          const state = this.validateAskState(JSON.parse(readFileSync(askStatePath, 'utf-8')), askStatePath);
+          if (!state) return;
           const totalQ = state.total_questions || 1;
           const nextQ = qIdx + 1;
           if (nextQ < totalQ) {
@@ -1489,7 +1593,11 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       const askStatePath = join(this.paths.stateDir, 'ask-state.json');
       if (existsSync(askStatePath)) {
         try {
-          const state = JSON.parse(readFileSync(askStatePath, 'utf-8'));
+          const state = this.validateAskState(JSON.parse(readFileSync(askStatePath, 'utf-8')), askStatePath);
+          if (!state) {
+            this.log(`AskUserQuestion: invalid ask-state, ignoring toggle for Q${qIdx}`);
+            return;
+          }
           if (!state.multi_select_chosen) state.multi_select_chosen = [];
 
           const idx = state.multi_select_chosen.indexOf(oIdx);
@@ -1543,7 +1651,8 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       const askStatePath = join(this.paths.stateDir, 'ask-state.json');
       if (existsSync(askStatePath)) {
         try {
-          const state = JSON.parse(readFileSync(askStatePath, 'utf-8'));
+          const state = this.validateAskState(JSON.parse(readFileSync(askStatePath, 'utf-8')), askStatePath);
+          if (!state) return;
           const chosenIndices: number[] = [...(state.multi_select_chosen || [])].sort((a, b) => a - b);
           const question = state.questions?.[qIdx];
           const totalOpts = question?.options?.length || 4;
@@ -1616,7 +1725,8 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     }
 
     try {
-      const state = JSON.parse(readFileSync(askStatePath, 'utf-8'));
+      const state = this.validateAskState(JSON.parse(readFileSync(askStatePath, 'utf-8')), askStatePath);
+      if (!state) return;
       const totalQ = state.total_questions || 1;
       const question = state.questions?.[questionIdx];
       if (!question) {
@@ -1749,16 +1859,17 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     let exceeds200k = false;
     try {
       const raw = readFileSync(statusPath, 'utf-8');
-      const data = JSON.parse(raw);
+      const data = this.validateContextStatus(JSON.parse(raw), statusPath);
+      if (!data) return;
       const age = now - new Date(data.written_at || 0).getTime();
       if (age > 10 * 60_000) return; // stale file — skip
-      pct = typeof data.used_percentage === 'number' ? data.used_percentage : null;
-      exceeds200k = Boolean(data.exceeds_200k_tokens);
+      pct = data.used_percentage;
+      exceeds200k = data.exceeds_200k_tokens;
 
       // Detect new session: if session_id changed, clear stale per-session ctx state.
       // This handles the case where the agent self-restarts (voluntary handoff) and the
       // 5-min deadline timer would otherwise fire on the fresh low-context session.
-      const incomingSessionId = typeof data.session_id === 'string' ? data.session_id : null;
+      const incomingSessionId = data.session_id ?? null;
       if (incomingSessionId && incomingSessionId !== this.ctxLastSessionId) {
         if (this.ctxLastSessionId !== null) {
           this.ctxHandoffFiredAt = 0;
