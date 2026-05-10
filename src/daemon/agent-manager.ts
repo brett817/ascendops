@@ -95,7 +95,19 @@ export class AgentManager {
     const enabledFile = join(this.ctxRoot, 'config', 'enabled-agents.json');
     if (!existsSync(enabledFile)) return {};
     try {
-      return JSON.parse(readFileSync(enabledFile, 'utf-8'));
+      const raw = JSON.parse(readFileSync(enabledFile, 'utf-8'));
+      if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+        // Wrong-shaped JSON (e.g. an array, a number, null) is just as
+        // dangerous as unparseable: every `instanceEnabled[name]` lookup
+        // returns undefined and the registry effectively disappears. Treat
+        // shape mismatch like a parse failure (Zone D H3).
+        console.error(
+          `[agent-manager] CRITICAL: enabled-agents.json parsed but not an object (${Array.isArray(raw) ? 'array' : typeof raw}). ` +
+            `Falling back to default-enabled. Repair the file or restore a backup.`,
+        );
+        return {};
+      }
+      return raw as Record<string, { enabled?: boolean; org?: string; status?: string }>;
     } catch (err) {
       // Falling back to {} default-enables every on-disk agent dir, which
       // can resurrect explicitly-disabled agents after a partial / corrupt
@@ -321,13 +333,20 @@ export class AgentManager {
       if (telegramApi && chatId) {
         const tgApi = telegramApi;
         const tgChatId = chatId;
+        // Log Telegram delivery failures instead of silently swallowing them
+        // — these alerts are the operator's only out-of-band signal during a
+        // crash loop, so a dropped send must at least leave a daemon-log
+        // trace (Zone D M1).
+        const logSendFail = (kind: string) => (err: unknown) => {
+          log(`Telegram ${kind} alert for ${name} failed: ${err instanceof Error ? err.message : String(err)}`);
+        };
         if (status.status === 'crashed') {
           const crashNum = status.crashCount ?? '?';
-          tgApi.sendMessage(tgChatId, `Agent ${name} crashed (crash #${crashNum}) — auto-restarting`).catch(() => {});
+          tgApi.sendMessage(tgChatId, `Agent ${name} crashed (crash #${crashNum}) — auto-restarting`).catch(logSendFail('crash'));
         } else if (status.status === 'halted') {
-          tgApi.sendMessage(tgChatId, `Agent ${name} HALTED — exceeded crash limit. Restart manually with: cortextos start ${name}`).catch(() => {});
+          tgApi.sendMessage(tgChatId, `Agent ${name} HALTED — exceeded crash limit. Restart manually with: cortextos start ${name}`).catch(logSendFail('halt'));
         } else if (status.status === 'running' && prevStatusForReset === 'crashed') {
-          tgApi.sendMessage(tgChatId, `Agent ${name} recovered and is back online`).catch(() => {});
+          tgApi.sendMessage(tgChatId, `Agent ${name} recovered and is back online`).catch(logSendFail('recovery'));
         }
       }
       prevStatusForReset = status.status;

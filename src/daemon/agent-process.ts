@@ -276,8 +276,11 @@ export class AgentProcess {
           pty.write('/exit\r\n');
           await sleep(5000);
         }
-      } catch {
-        // Ignore write errors during shutdown
+      } catch (err) {
+        // A failed Ctrl-C / /exit write means the graceful shutdown sequence
+        // didn't actually complete; we'll fall through to pty.kill() below.
+        // Log it so an operator at least sees that the kill path was forced.
+        this.log(`shutdown write failed (falling through to kill): ${err instanceof Error ? err.message : String(err)}`);
       }
       // BUG-032 follow-up: only kill the PTY if the process is still alive.
       // After /exit + 5s wait, the child has usually exited cleanly. Calling
