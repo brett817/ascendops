@@ -994,6 +994,12 @@ export class AgentManager {
       try {
         const dirs = readdirSync(agentsBase, { withFileTypes: true })
           .filter(d => d.isDirectory())
+          // Skip non-agent reserved dirs: leading `_` (e.g. _shared/ shared-utility)
+          // and leading `.` (hidden / VCS / OS metadata). Treating these as agents
+          // makes the daemon spawn a Claude session with no .env, which then falls
+          // through to operator-cred discovery and sends Telegram from a phantom
+          // agent identity (see _shared rogue-spawn incident 2026-05-10).
+          .filter(d => !d.name.startsWith('_') && !d.name.startsWith('.'))
           .map(d => d.name);
 
         for (const name of dirs) {

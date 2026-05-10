@@ -126,7 +126,13 @@ function getOperatorChatCreds(frameworkRoot: string): { chatId: string; botToken
     for (const org of orgs) {
       const agentsRoot = join(orgsRoot, org.name, 'agents');
       if (!existsSync(agentsRoot)) continue;
-      const agents = readdirSync(agentsRoot, { withFileTypes: true }).filter(d => d.isDirectory());
+      const agents = readdirSync(agentsRoot, { withFileTypes: true })
+        .filter(d => d.isDirectory())
+        // Match agent-manager.ts discoverAgents() filter: skip _shared/ and
+        // hidden dirs so operator-cred fallback never inherits creds from
+        // a non-agent directory. Belt-and-suspenders against the same
+        // _shared rogue-spawn class of bug.
+        .filter(d => !d.name.startsWith('_') && !d.name.startsWith('.'));
       for (const a of agents) {
         const envFile = join(agentsRoot, a.name, '.env');
         if (!existsSync(envFile)) continue;
