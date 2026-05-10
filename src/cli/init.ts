@@ -21,6 +21,48 @@ export const initCommand = new Command('init')
       console.log('  Existing files will NOT be overwritten. Only missing files will be created.\n');
     }
 
+    // Multi-org tripwire — surfaces a deferred architectural item when a 2nd
+    // tenant onboards. The path helpers in src/utils/paths.ts currently
+    // flatten agent identity to bare name across state/logs/inbox/cron paths,
+    // so two orgs with the same agent name (e.g. both running an "alex"
+    // agent) collide on those paths. The fix is mechanical (org-scope every
+    // path key) but was deferred while the install was single-org. When a
+    // second org enters the picture, this is the moment to revisit it
+    // BEFORE spawning agents that will share namespaces with another tenant.
+    try {
+      const orgsParent = join(projectRoot, 'orgs');
+      const existingOrgs = existsSync(orgsParent)
+        ? readdirSync(orgsParent, { withFileTypes: true })
+            .filter(d => d.isDirectory())
+            .filter(d => !d.name.startsWith('_') && !d.name.startsWith('.'))
+            .map(d => d.name)
+        : [];
+      const willBeSecondOrg = !existingOrgs.includes(orgName) && existingOrgs.length >= 1;
+      if (willBeSecondOrg) {
+        console.log('');
+        console.log('  ============================================================');
+        console.log('  MULTI-ORG TRIPWIRE — review before adding agents');
+        console.log('  ============================================================');
+        console.log(`  This will be the 2nd organization in this install`);
+        console.log(`  (existing: ${existingOrgs.join(', ')}; new: ${orgName}).`);
+        console.log('');
+        console.log('  Known issue: src/utils/paths.ts flattens agent identity');
+        console.log('  to bare name across state/logs/inbox/cron paths. If both');
+        console.log('  orgs run an agent with the same name they will collide on');
+        console.log('  those paths. The fix is mechanical (org-scope each path)');
+        console.log('  but was deferred while the install was single-org.');
+        console.log('');
+        console.log('  Resolve before adding agents to the new org:');
+        console.log('    1. Fix paths.ts to org-scope state/logs/inbox/cron, OR');
+        console.log('    2. Confirm no agent-name collisions across orgs (and');
+        console.log('       agree to keep it that way).');
+        console.log('');
+        console.log('  Tracked at: Zone C H1 in collie/memory/2026-05-10.md');
+        console.log('  ============================================================');
+        console.log('');
+      }
+    } catch { /* tripwire is informational; never block init on its own failure */ }
+
     console.log(`\nInitializing cortextOS organization: ${orgName}`);
     console.log(`  Instance: ${instanceId}`);
     console.log(`  State: ${ctxRoot}`);
