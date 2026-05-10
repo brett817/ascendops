@@ -311,6 +311,15 @@ export class AgentProcess {
    * the marker on next start and boots fresh.
    */
   async hardRestartSelf(reason: string): Promise<void> {
+    // HALTED is terminal for automated restarts. Without this guard, the
+    // fast-checker can keep triggering hard-restarts after the crash limit
+    // is hit (observed 2026-05-10: restarts.log climbed past max_crashes
+    // because watchdog signals fired regardless of halt state). User-initiated
+    // restarts should clear status first via `cortextos start <name>`.
+    if (this.status === 'halted' || this.status === 'stopped') {
+      this.log(`Refusing hard-restart in status=${this.status}: ${reason}`);
+      return;
+    }
     try {
       const stateDir = join(this.env.ctxRoot, 'state', this.name);
       ensureDir(stateDir);
@@ -341,6 +350,10 @@ export class AgentProcess {
    * conversation directory still has .jsonl files (shouldContinue() is true).
    */
   async sessionRefresh(): Promise<void> {
+    if (this.status === 'halted' || this.status === 'stopped') {
+      this.log(`Refusing session refresh in status=${this.status}`);
+      return;
+    }
     this.log('Session refresh (--continue restart)');
     await this.stop();
     await this.start();

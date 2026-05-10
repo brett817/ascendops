@@ -155,12 +155,23 @@ export const importAgentCommand = new Command('import-agent')
     // Register in enabled-agents.json
     const ctxRoot = join(homedir(), '.cortextos', options.instance);
     const enabledPath = join(ctxRoot, 'config', 'enabled-agents.json');
+    // Refuse to write the registry if the existing file is corrupt — silently
+    // falling back to {} would wipe every other agent's enable/disable/org
+    // metadata on the subsequent write. Surface the parse error instead and
+    // require operator triage (back up + repair / regenerate the registry).
     let enabledAgents: Record<string, any> = {};
-    try {
-      if (existsSync(enabledPath)) {
+    if (existsSync(enabledPath)) {
+      try {
         enabledAgents = JSON.parse(readFileSync(enabledPath, 'utf-8'));
+      } catch (err) {
+        throw new Error(
+          `Refusing to import agent "${agentName}": existing registry at ` +
+            `${enabledPath} is not valid JSON (${(err as Error).message}). ` +
+            `Back it up + repair (or remove if intentionally regenerating) ` +
+            `and re-run import-agent.`,
+        );
       }
-    } catch { /* start fresh */ }
+    }
     enabledAgents[agentName] = { enabled: true, status: 'configured', org };
     mkdirSync(join(ctxRoot, 'config'), { recursive: true });
     writeFileSync(enabledPath, JSON.stringify(enabledAgents, null, 2) + '\n', 'utf-8');
