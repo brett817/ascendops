@@ -704,18 +704,24 @@ export class AgentProcess {
     const onboardedPath = join(stateDir, '.onboarded');
     const onboardingPath = join(this.env.agentDir, 'ONBOARDING.md');
     const heartbeatPath = join(stateDir, 'heartbeat.json');
+    const identityPath = join(this.env.agentDir, 'IDENTITY.md');
+    const memoryPath = join(this.env.agentDir, 'MEMORY.md');
+    let isOnboarded = existsSync(onboardedPath);
     let onboardingAppend = '';
 
-    // If agent has a heartbeat but no .onboarded marker, they completed onboarding but
-    // forgot to write the marker. Auto-write it so they don't re-onboard next restart.
-    if (!existsSync(onboardedPath) && existsSync(heartbeatPath)) {
+    // Belt-and-suspenders onboarding recovery: if the marker is missing but the
+    // agent either has a heartbeat OR clearly non-template bootstrap content,
+    // retro-write `.onboarded` so a restart does not force setup again.
+    if (!isOnboarded && (
+      existsSync(heartbeatPath) || this.hasCompletedBootstrapContent(identityPath, memoryPath)
+    )) {
       try {
-        const { writeFileSync } = require('fs');
         writeFileSync(onboardedPath, '', 'utf-8');
+        isOnboarded = true;
       } catch { /* ignore */ }
     }
 
-    if (!existsSync(onboardedPath) && existsSync(onboardingPath)) {
+    if (!isOnboarded && existsSync(onboardingPath)) {
       onboardingAppend = ' IMPORTANT: This is your FIRST BOOT. Before doing anything else, read ONBOARDING.md and complete the onboarding protocol.';
     }
 
@@ -737,6 +743,31 @@ export class AgentProcess {
       ? ''
       : ' Send a Telegram message to the user saying you are back online.';
     return `You are starting a new session. Current UTC time: ${nowUtc}. Read AGENTS.md and all bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock}${handoffBlock}${handoffUxOverride}${onlineMessage}${onboardingAppend}${recoveryBlock}${rateLimitBlock}`;
+  }
+
+  private hasCompletedBootstrapContent(identityPath: string, memoryPath: string): boolean {
+    if (!existsSync(identityPath) || !existsSync(memoryPath)) return false;
+
+    try {
+      const identity = readFileSync(identityPath, 'utf-8');
+      const memory = readFileSync(memoryPath, 'utf-8');
+
+      const nameMatch = identity.match(/^## Name\s+([\s\S]*?)(?:\n## |\s*$)/m);
+      const roleMatch = identity.match(/^## Role\s+([\s\S]*?)(?:\n## |\s*$)/m);
+      const nameValue = nameMatch?.[1]?.trim() ?? '';
+      const roleValue = roleMatch?.[1]?.trim() ?? '';
+
+      const hasIdentityContent = Boolean(
+        nameValue &&
+        roleValue &&
+        !nameValue.includes('<!--') &&
+        !roleValue.includes('<!--'),
+      );
+      const hasMemoryContent = memory.length > 80 && !memory.includes('<!--');
+      return hasIdentityContent && hasMemoryContent;
+    } catch {
+      return false;
+    }
   }
 
   private buildContinuePrompt(recoveryNote: string | null): string {

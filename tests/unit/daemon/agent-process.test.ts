@@ -259,6 +259,86 @@ describe('AgentProcess - BUG-011 fix (stop awaits PTY exit)', () => {
   });
 });
 
+describe('AgentProcess onboarding fallback', () => {
+  it('retro-writes .onboarded when bootstrap files have real content', () => {
+    fsMocks.existsSync.mockImplementation((p: any) => {
+      const path = String(p);
+      if (path.endsWith('/state/alice/.onboarded')) return false;
+      if (path.endsWith('/state/alice/heartbeat.json')) return false;
+      if (path.endsWith('/orgs/acme/agents/alice/ONBOARDING.md')) return true;
+      if (path.endsWith('/orgs/acme/agents/alice/IDENTITY.md')) return true;
+      if (path.endsWith('/orgs/acme/agents/alice/MEMORY.md')) return true;
+      return false;
+    });
+    fsMocks.readFileSync.mockImplementation((p: any) => {
+      const path = String(p);
+      if (path.endsWith('/orgs/acme/agents/alice/IDENTITY.md')) {
+        return `# Agent Identity
+
+## Name
+alice
+
+## Role
+Research specialist for the team.
+`;
+      }
+      if (path.endsWith('/orgs/acme/agents/alice/MEMORY.md')) {
+        return '# Long-Term Memory\n\nThis agent has already been configured with substantial operating context and learned patterns that go well beyond the shipped template.\n';
+      }
+      return '';
+    });
+
+    const ap = new AgentProcess('alice', mockEnv, {});
+    const prompt = (ap as any).buildStartupPrompt(null) as string;
+
+    expect(fsMocks.writeFileSync).toHaveBeenCalledWith(
+      '/tmp/test-ctx/state/alice/.onboarded',
+      '',
+      'utf-8',
+    );
+    expect(prompt).not.toContain('IMPORTANT: This is your FIRST BOOT');
+  });
+
+  it('keeps first-boot onboarding when bootstrap files still look templated', () => {
+    fsMocks.existsSync.mockImplementation((p: any) => {
+      const path = String(p);
+      if (path.endsWith('/state/alice/.onboarded')) return false;
+      if (path.endsWith('/state/alice/heartbeat.json')) return false;
+      if (path.endsWith('/orgs/acme/agents/alice/ONBOARDING.md')) return true;
+      if (path.endsWith('/orgs/acme/agents/alice/IDENTITY.md')) return true;
+      if (path.endsWith('/orgs/acme/agents/alice/MEMORY.md')) return true;
+      return false;
+    });
+    fsMocks.readFileSync.mockImplementation((p: any) => {
+      const path = String(p);
+      if (path.endsWith('/orgs/acme/agents/alice/IDENTITY.md')) {
+        return `# Agent Identity
+
+## Name
+<!-- Agent name (set during onboarding) -->
+
+## Role
+<!-- What this agent does -->
+`;
+      }
+      if (path.endsWith('/orgs/acme/agents/alice/MEMORY.md')) {
+        return '# Long-Term Memory\n\n<!-- Patterns, learnings, successful approaches, and failures discovered over time. -->\n';
+      }
+      return '';
+    });
+
+    const ap = new AgentProcess('alice', mockEnv, {});
+    const prompt = (ap as any).buildStartupPrompt(null) as string;
+
+    expect(fsMocks.writeFileSync).not.toHaveBeenCalledWith(
+      '/tmp/test-ctx/state/alice/.onboarded',
+      '',
+      'utf-8',
+    );
+    expect(prompt).toContain('IMPORTANT: This is your FIRST BOOT');
+  });
+});
+
 describe('AgentProcess - BUG-048 fix (session timer re-reads config)', () => {
   it('fires sessionRefresh when config on disk still matches original short duration', async () => {
     const refreshSpy = vi.fn().mockResolvedValue(undefined);
