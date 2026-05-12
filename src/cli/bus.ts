@@ -16,6 +16,7 @@ import { createApproval, updateApproval } from '../bus/approval.js';
 import { listActiveThreads, addActiveThread, updateActiveThread, removeActiveThread, clearActiveThreads } from '../bus/active-threads.js';
 import { listVendorDocPatterns, vendorDocPattern } from '../bus/vendor-patterns.js';
 import { createReminder, listReminders, ackReminder, pruneReminders } from '../bus/reminders.js';
+import { sendSms } from '../bus/send-sms.js';
 import { updateCronFire, parseDurationMs, readCronState } from '../bus/cron-state.js';
 import { addCron, removeCron, readCrons, updateCron as updateCronDef, getCronByName, getExecutionLog } from '../bus/crons.js';
 import { nextFireFromCron } from '../daemon/cron-scheduler.js';
@@ -994,6 +995,37 @@ busCommand
       console.log(`Slack message sent to ${channel}`);
     } catch (err) {
       console.error(`Failed to send Slack message: ${err}`);
+      process.exit(1);
+    }
+  });
+
+busCommand
+  .command('send-sms')
+  .description('Send an outbound SMS via Telnyx. Safe-by-default: preview only unless --send-real and --approved-by are both set.')
+  .argument('<to-e164>', 'Recipient phone number in E.164 format, e.g. +16145551212')
+  .argument('<text>', 'SMS body text')
+  .option('--send-real', 'Actually send the SMS. Requires --approved-by <approval_id>.', false)
+  .option('--approved-by <approval-id>', 'Approved external-comms approval id required for live sends')
+  .action(async (toE164: string, text: string, opts: { sendReal?: boolean; approvedBy?: string }) => {
+    const env = resolveEnv();
+    const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+
+    try {
+      const result = await sendSms(paths, toE164, text, opts);
+      if (result.mode === 'dry-run') {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+
+      logEvent(paths, env.agentName, env.org, 'action', 'sms_sent', 'info', {
+        to: toE164,
+        from: result.from,
+        approval_id: result.approvalId,
+        preview: text.length > 120 ? text.slice(0, 120) + '…' : text,
+      });
+      console.log(JSON.stringify(result, null, 2));
+    } catch (err: any) {
+      console.error(`Failed to send SMS: ${err.message || err}`);
       process.exit(1);
     }
   });
