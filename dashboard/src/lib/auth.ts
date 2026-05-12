@@ -134,7 +134,18 @@ export async function seedAdminUser(): Promise<void> {
   // Only validate when we actually need the password (seeding or syncing).
   const password = process.env.ADMIN_PASSWORD;
   if (!password) {
-    throw new Error('ADMIN_PASSWORD environment variable is required but not set.');
+    throw new Error(
+      'ADMIN_PASSWORD environment variable is required but not set. ' +
+      'Run /onboarding in Claude Code to generate real credentials, ' +
+      'or set ADMIN_PASSWORD in dashboard/.env.local manually.'
+    );
+  }
+  if (password === 'changeme') {
+    throw new Error(
+      'ADMIN_PASSWORD is set to the literal placeholder "changeme" from ' +
+      'dashboard/.env.example. This is not a valid credential. Run /onboarding ' +
+      'in Claude Code, which generates a real password automatically.'
+    );
   }
   const KNOWN_DEFAULTS = ['cortextos', 'password', 'admin', 'changeme'];
   if (process.env.NODE_ENV === 'production' && KNOWN_DEFAULTS.includes(password)) {
