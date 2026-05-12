@@ -7,7 +7,7 @@
  * Local test:  node install.mjs
  */
 
-import { execSync, spawnSync } from 'child_process';
+import { execSync, spawnSync, spawn } from 'child_process';
 import { existsSync, mkdirSync, writeFileSync, readdirSync, statSync, chmodSync, lstatSync, readlinkSync, symlinkSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { homedir, platform } from 'os';
@@ -616,6 +616,8 @@ console.log('');
 console.log(`${G}${BOLD}AscendOps installed successfully!${R}`);
 console.log('');
 
+const onboardingLaunchCommand = `cd ${JSON.stringify(INSTALL_DIR)} && claude /onboarding`;
+
 if (!commandExists('claude')) {
   console.log(`${Y}  IMPORTANT: Install and authenticate Claude Code before continuing:${R}`);
   console.log(`    npm install -g @anthropic-ai/claude-code`);
@@ -623,18 +625,27 @@ if (!commandExists('claude')) {
   console.log('');
 }
 
-console.log(`${BOLD}Next steps:${R}`);
+console.log(`${BOLD}Next step — copy-paste this single command:${R}`);
 console.log('');
-console.log(`  1. Open ${BOLD}${INSTALL_DIR}${R} in Claude Code:`);
-if (IS_WINDOWS) {
-  console.log(`     ${Y}claude "${INSTALL_DIR}"${R}`);
-} else {
-  console.log(`     ${Y}claude ${INSTALL_DIR}${R}`);
+console.log(`  ${Y}${onboardingLaunchCommand}${R}`);
+console.log('');
+console.log('This opens Claude Code with the /onboarding wizard already running.');
+console.log('');
+
+if (commandExists('claude') && process.stdin.isTTY && process.stdout.isTTY) {
+  console.log('Launching Claude Code and starting /onboarding...');
+  console.log('');
+
+  const claudeProc = spawn('claude', ['/onboarding'], {
+    cwd: INSTALL_DIR,
+    stdio: 'inherit',
+  });
+
+  claudeProc.on('error', () => {
+    warn('Could not auto-launch Claude Code. Use the copy-paste command above.');
+  });
+
+  claudeProc.on('exit', (code) => {
+    process.exit(code ?? 0);
+  });
 }
-console.log('');
-console.log(`  2. In Claude Code, run:`);
-console.log(`     ${Y}/onboarding${R}`);
-console.log('');
-console.log('  That\'s it. The /onboarding command walks you through everything:');
-console.log('  org setup, agent creation, Telegram bots, dashboard, and more.');
-console.log('');
