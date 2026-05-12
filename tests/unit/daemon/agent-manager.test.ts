@@ -446,3 +446,80 @@ describe('AgentManager.reloadCrons - silent-success bug fix (iter 7)', () => {
     expect((am as any).cronSchedulers.has('ghost')).toBe(false);
   });
 });
+
+describe('AgentManager.evaluateCronShiftSuppression - wake_on_fire bypass', () => {
+  // Regression target: pm-colocated-detect was registered to fire at 11:15 UTC
+  // (07:15 ET) but the daemon silently suppressed the fire because the agent's
+  // shift_schedule placed that hour off-shift. Per-cron wake_on_fire bypasses
+  // the gate for crons whose downstream consumers need a same-time output file
+  // every day regardless of shift state.
+
+  // shift_schedule that makes 04:00 UTC off-shift under tz=UTC: weekdays 09:00-17:00.
+  // Outside the window → off_shift_no_wake (empty allowlist).
+  const offShiftSchedule = {
+    weekly: {
+      mon: { start: '09:00', end: '17:00' },
+      tue: { start: '09:00', end: '17:00' },
+      wed: { start: '09:00', end: '17:00' },
+      thu: { start: '09:00', end: '17:00' },
+      fri: { start: '09:00', end: '17:00' },
+      sat: 'off' as const,
+      sun: 'off' as const,
+    },
+  };
+
+  const baseCron = {
+    name: 'test-cron',
+    prompt: 'do thing',
+    schedule: '15 11 * * *',
+    enabled: true,
+    created_at: '2026-05-12T00:00:00.000Z',
+  };
+
+  function makeManager(shift_schedule: any): any {
+    // Use a UTC timezone so 11:00 UTC test time maps directly to 11:00 wall-clock
+    // — independent of the daemon host's local timezone.
+    const am = new AgentManager('test-instance', '/tmp/x', '/tmp/x', 'acme');
+    const fakeProcess = { config: { shift_schedule, timezone: 'UTC' } } as any;
+    (am as any).agents.set('alice', { process: fakeProcess, checker: {} });
+    return am;
+  }
+
+  beforeEach(() => {
+    // Pin "now" to a weekday at 04:00 UTC — off-shift under the 09:00-17:00 UTC
+    // schedule, regardless of where this test runs.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-05-12T04:00:00Z')); // Tuesday 04:00 UTC
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('returns suppression when off-shift and cron has no wake_on_fire flag', () => {
+    const am = makeManager(offShiftSchedule);
+    const result = (am as any).evaluateCronShiftSuppression('alice', baseCron);
+    expect(result).toEqual({ mode: 'no_wake' });
+  });
+
+  it('returns null (fire proceeds) when off-shift and cron sets wake_on_fire: true', () => {
+    const am = makeManager(offShiftSchedule);
+    const cron = { ...baseCron, wake_on_fire: true };
+    const result = (am as any).evaluateCronShiftSuppression('alice', cron);
+    expect(result).toBeNull();
+  });
+
+  it('returns null when wake_on_fire is false but agent is on-shift', () => {
+    // 10:00 UTC Tuesday is inside the 09:00-17:00 window.
+    vi.setSystemTime(new Date('2026-05-12T10:00:00Z'));
+    const am = makeManager(offShiftSchedule);
+    const result = (am as any).evaluateCronShiftSuppression('alice', baseCron);
+    expect(result).toBeNull();
+  });
+
+  it('returns null when agent has no shift_schedule configured', () => {
+    const am = makeManager(undefined);
+    const result = (am as any).evaluateCronShiftSuppression('alice', baseCron);
+    expect(result).toBeNull();
+  });
+});

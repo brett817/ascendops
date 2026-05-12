@@ -964,31 +964,23 @@ export class AgentManager {
 
       // Shift gate (RFC orgs/ascendops/docs/rfc-shift-schedule.md §4).
       // When the agent is off-shift, drop the cron fire silently and emit a
-      // cron_suppressed_off_shift event for telemetry. Backwards compat: agents
-      // without shift_schedule evaluate as in_shift always.
-      const agentEntry = this.agents.get(agentName);
-      const agentConfig = agentEntry?.process['config'] as AgentConfig | undefined;
-      if (agentConfig) {
-        const tz = agentConfig.timezone || 'America/New_York';
-        const ev = evaluateShift(new Date(), agentConfig.shift_schedule, tz);
-        let suppressMode: 'no_wake' | 'emergency_only_no_tag' | null = null;
-        if (ev.off_shift_no_wake) suppressMode = 'no_wake';
-        else if (ev.off_shift_emergency_only) suppressMode = 'emergency_only_no_tag';
-        if (suppressMode) {
-          console.log(`[daemon] cron suppressed off-shift for ${agentName}: ${cron.name} (mode=${suppressMode})`);
-          try {
-            const paths = resolvePaths(agentName, this.instanceId, this.org);
-            logEvent(paths, agentName, this.org || '', 'action', 'cron_suppressed_off_shift', 'info', {
-              agent: agentName,
-              cron: cron.name,
-              mode: suppressMode,
-              path: 'daemon_cron_fire',
-            });
-          } catch (err) {
-            console.log(`[daemon] logEvent failed for cron-suppressed (non-fatal): ${err}`);
-          }
-          return;
+      // cron_suppressed_off_shift event for telemetry. Crons with
+      // wake_on_fire=true bypass this gate (see CronDefinition.wake_on_fire).
+      const suppression = this.evaluateCronShiftSuppression(agentName, cron);
+      if (suppression) {
+        console.log(`[daemon] cron suppressed off-shift for ${agentName}: ${cron.name} (mode=${suppression.mode})`);
+        try {
+          const paths = resolvePaths(agentName, this.instanceId, this.org);
+          logEvent(paths, agentName, this.org || '', 'action', 'cron_suppressed_off_shift', 'info', {
+            agent: agentName,
+            cron: cron.name,
+            mode: suppression.mode,
+            path: 'daemon_cron_fire',
+          });
+        } catch (err) {
+          console.log(`[daemon] logEvent failed for cron-suppressed (non-fatal): ${err}`);
         }
+        return;
       }
 
       // Salt with the fire timestamp so MessageDedup (which hashes the last 100
@@ -1014,6 +1006,34 @@ export class AgentManager {
 
     const count = scheduler.getNextFireTimes().length;
     console.log(`[daemon] Loaded ${count} external cron(s) for agent "${agentName}" from crons.json`);
+  }
+
+  /**
+   * Evaluate whether a cron fire should be suppressed by the agent's shift gate.
+   *
+   * Returns `null` to allow the fire, or an object describing the suppression
+   * mode to drop it. Crons with `wake_on_fire: true` always return `null` —
+   * they bypass the shift gate entirely. Agents without a `shift_schedule`
+   * configured evaluate as in-shift always (returns `null`).
+   *
+   * Visible on the instance (not exported) so unit tests can drive it directly
+   * without spinning up a real CronScheduler.
+   */
+  private evaluateCronShiftSuppression(
+    agentName: string,
+    cron: CronDefinition
+  ): { mode: 'no_wake' | 'emergency_only_no_tag' } | null {
+    if (cron.wake_on_fire) return null;
+
+    const agentEntry = this.agents.get(agentName);
+    const agentConfig = agentEntry?.process['config'] as AgentConfig | undefined;
+    if (!agentConfig) return null;
+
+    const tz = agentConfig.timezone || 'America/New_York';
+    const ev = evaluateShift(new Date(), agentConfig.shift_schedule, tz);
+    if (ev.off_shift_no_wake) return { mode: 'no_wake' };
+    if (ev.off_shift_emergency_only) return { mode: 'emergency_only_no_tag' };
+    return null;
   }
 
   /**

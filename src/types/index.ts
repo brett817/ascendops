@@ -442,6 +442,20 @@ export interface CronDefinition {
    * @default false (manual fire is allowed by default — opt-out model)
    */
   manualFireDisabled?: boolean;
+
+  /**
+   * When true, this cron bypasses the daemon's off-shift suppression gate
+   * and fires even when the agent's shift_schedule evaluates to no_wake
+   * or emergency_only. Use sparingly — for crons that must run on a fixed
+   * wall-clock schedule regardless of agent shift state (e.g. detectors
+   * whose downstream consumers expect a same-time output file every day).
+   *
+   * The suppression telemetry event `cron_suppressed_off_shift` is NOT
+   * emitted when this flag is set — the fire proceeds normally.
+   *
+   * @default false (off-shift suppression applies — opt-out model)
+   */
+  wake_on_fire?: boolean;
 }
 
 // ---------------------------------------------------------------------------
