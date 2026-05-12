@@ -27,7 +27,7 @@
 import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync } from 'fs';
 import { dirname, join } from 'path';
 import type { CronDefinition, CronEntry } from '../types/index.js';
-import { readCrons, writeCrons } from '../bus/crons.js';
+import { readCrons, writeCrons, withCronLock } from '../bus/crons.js';
 import { CRONS_DIRECTORY } from '../bus/crons-schema.js';
 import { scanAgentDir } from '../utils/cron-teaching-scanner.js';
 
@@ -156,7 +156,17 @@ function runTeachingCheck(args: TeachingCheckArgs): void {
  * Convert a single CronEntry (config.json format) to a CronDefinition (crons.json format).
  *
  * Returns null with a reason string when the entry cannot be converted (e.g. one-shot crons).
+ *
+ * Exported alias used by {@link reloadCronsForAgent} so reload + migrate share
+ * the same conversion semantics. Keeps shape-rule changes in one place.
  */
+export function convertConfigEntryToDefinition(
+  entry: CronEntry,
+  agentName: string,
+): { cron: CronDefinition } | { skip: string } {
+  return convertEntry(entry, agentName);
+}
+
 function convertEntry(
   entry: CronEntry,
   agentName: string,
@@ -482,4 +492,189 @@ export function migrateAllAgents(
   );
 
   return { processed: results.length, totalCronsMigrated, results };
+}
+
+// ---------------------------------------------------------------------------
+// reload-crons — merge-aware re-sync of config.json → crons.json
+//
+// Unlike migrateCronsForAgent + force (which wipes runtime fields),
+// reloadCronsForAgent preserves runtime fields (last_fired_at, fire_count,
+// created_at, last_fire_attempted_at) for crons whose name already exists in
+// the state crons.json. Config-side fields (prompt, schedule, enabled,
+// description) authoritatively overwrite state.
+//
+// Default behavior tolerates orphans (crons present in state but not config).
+// Pass --prune to drop orphans. All destructive ops require explicit opt-in
+// per the cron-source-of-truth contract.
+//
+// Architecture doc: docs/architecture/cron-source-of-truth.md
+// ---------------------------------------------------------------------------
+
+/**
+ * Fields that config.json AUTHORITATIVELY OVERWRITES on a matched entry.
+ * Everything else on the existing state entry (runtime fields + operator-set
+ * metadata + future schema additions) is preserved by default.
+ *
+ * Inversion fix per Codex review P2 (PR #17 surface, fix lands on #16):
+ * earlier shape rebuilt from convertEntry output and copied only 4 named
+ * runtime fields back, silently dropping operator-set `description` (from
+ * `bus add-cron --desc`) and any state-only fields not yet in the schema.
+ *
+ * New shape: start from existing state, overwrite only these fields with
+ * the config-side values. New crons (no existing state) take the full
+ * converted CronDefinition unchanged.
+ */
+const CONFIG_AUTHORITATIVE_FIELDS = [
+  'prompt',
+  'schedule',
+  'enabled',
+] as const;
+
+export interface ReloadOptions {
+  /** Drop crons present in state but not in config.json. Default false (orphans tolerated). */
+  prune?: boolean;
+  /** Custom logger (defaults to console.log). */
+  log?: (msg: string) => void;
+}
+
+export interface ReloadResult {
+  agentName: string;
+  added: string[];
+  updated: string[];
+  unchanged: string[];
+  kept_orphan: string[];
+  pruned_orphan: string[];
+  skipped: { name: string; reason: string }[];
+  total_state_crons: number;
+  /** Set when reload could not complete (missing config, parse failure, etc.).
+   *  CLI exits non-zero when this is populated; --json mode emits it so callers
+   *  can distinguish silent success from silent failure (Codex P2 finding). */
+  error?: string;
+}
+
+/**
+ * Reload an agent's crons from its config.json into state crons.json,
+ * preserving runtime fields on matching entries. See module-level docs.
+ *
+ * @param agentName        - Agent identifier (validated by caller).
+ * @param configJsonPath   - Absolute path to the agent's config.json.
+ * @param options          - {@link ReloadOptions}.
+ */
+export function reloadCronsForAgent(
+  agentName: string,
+  configJsonPath: string,
+  options: ReloadOptions = {},
+): ReloadResult {
+  const log = options.log ?? ((msg: string) => console.log(msg));
+  const prune = options.prune ?? false;
+
+  const result: ReloadResult = {
+    agentName,
+    added: [],
+    updated: [],
+    unchanged: [],
+    kept_orphan: [],
+    pruned_orphan: [],
+    skipped: [],
+    total_state_crons: 0,
+  };
+
+  // 1. Read config.json crons[] (before acquiring lock — pure read)
+  let configCrons: CronEntry[] = [];
+  if (!existsSync(configJsonPath)) {
+    const msg = `No config.json found for "${agentName}" at ${configJsonPath} — reload no-op`;
+    log(msg);
+    result.error = msg;
+    return result;
+  }
+  try {
+    const configRaw = readFileSync(configJsonPath, 'utf-8');
+    const config = JSON.parse(configRaw);
+    configCrons = Array.isArray(config?.crons) ? config.crons : [];
+  } catch (err) {
+    const msg =
+      `failed to parse config.json for "${agentName}": ` +
+      `${err instanceof Error ? err.message : String(err)}`;
+    log(`ERROR: ${msg} — reload aborted`);
+    result.error = msg;
+    return result;
+  }
+
+  // 2-5. Serialize the read-modify-write cycle under the agent cron lock to
+  // prevent races with `addCron` / `updateCron` / `removeCron` writers (Codex P1).
+  withCronLock(agentName, () => {
+    // 2. Read existing state crons.json (may be empty if first-ever sync)
+    const existingState = readCrons(agentName);
+    const existingByName = new Map(existingState.map(c => [c.name, c]));
+
+    // 3. Build merged crons array: for each config entry, convert + merge runtime fields
+    const mergedByName = new Map<string, CronDefinition>();
+    for (const configEntry of configCrons) {
+      const conv = convertEntry(configEntry, agentName);
+      if ('skip' in conv) {
+        result.skipped.push({ name: configEntry.name, reason: conv.skip });
+        continue;
+      }
+      const newDef = conv.cron;
+      const existing = existingByName.get(newDef.name);
+      if (existing) {
+        // Merge inversion: start from existing state (preserves runtime fields,
+        // operator-set metadata, and any state-only fields not yet in the
+        // schema), then overwrite ONLY the config-authoritative fields.
+        // Description is handled separately — preserve operator-set description
+        // when config does not provide one. Double-cast for TS2352.
+        const merged: CronDefinition = { ...existing };
+        for (const field of CONFIG_AUTHORITATIVE_FIELDS) {
+          (merged as unknown as Record<string, unknown>)[field] = newDef[field];
+        }
+        if (newDef.description !== undefined) {
+          merged.description = newDef.description;
+        }
+
+        mergedByName.set(newDef.name, merged);
+
+        // Track add vs update vs unchanged using config-authoritative fields
+        // (description compared only when config provides one).
+        const definitionChanged =
+          existing.prompt !== newDef.prompt ||
+          existing.schedule !== newDef.schedule ||
+          existing.enabled !== newDef.enabled ||
+          (newDef.description !== undefined && existing.description !== newDef.description);
+        if (definitionChanged) {
+          result.updated.push(newDef.name);
+        } else {
+          result.unchanged.push(newDef.name);
+        }
+      } else {
+        // New cron — no existing state to preserve
+        mergedByName.set(newDef.name, newDef);
+        result.added.push(newDef.name);
+      }
+    }
+
+    // 4. Handle orphans (in state but not in config)
+    for (const existing of existingState) {
+      if (mergedByName.has(existing.name)) continue;
+      if (prune) {
+        result.pruned_orphan.push(existing.name);
+      } else {
+        mergedByName.set(existing.name, existing);
+        result.kept_orphan.push(existing.name);
+      }
+    }
+
+    // 5. Atomic write back to crons.json (inside the lock)
+    const merged = Array.from(mergedByName.values());
+    writeCrons(agentName, merged);
+    result.total_state_crons = merged.length;
+  });
+
+  log(
+    `Reload complete for "${agentName}": ${result.added.length} added, ${result.updated.length} updated, ` +
+      `${result.unchanged.length} unchanged, ${result.kept_orphan.length} orphan kept, ` +
+      `${result.pruned_orphan.length} orphan pruned, ${result.skipped.length} skipped, ` +
+      `total ${result.total_state_crons}`,
+  );
+
+  return result;
 }

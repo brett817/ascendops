@@ -2484,6 +2484,83 @@ busCommand
   });
 
 // ---------------------------------------------------------------------------
+// reload-crons — merge-aware re-sync from config.json into crons.json
+//
+// Unlike migrate-crons --force (which wipes runtime fields), reload-crons
+// preserves runtime fields (last_fired_at, fire_count, created_at,
+// last_fire_attempted_at) for crons whose name already exists in state.
+// Config-side fields (prompt, schedule, enabled, description) overwrite.
+//
+// Default tolerates orphans (state-only crons). Pass --prune to drop them.
+// Sends a reload-crons IPC signal to the daemon after writing so the
+// scheduler invalidates its in-memory cache without waiting for the next tick.
+//
+// Architecture: docs/architecture/cron-source-of-truth.md
+// ---------------------------------------------------------------------------
+
+busCommand
+  .command('reload-crons')
+  .description('Re-sync config.json → crons.json without wiping runtime state (preserves fire_count, last_fired_at). Default keeps orphans; --prune drops them.')
+  .argument('<agent>', 'Agent name to reload')
+  .option('--prune', 'Drop crons present in state but absent from config.json (destructive — opt-in)')
+  .option('--json', 'Emit JSON result instead of human-readable summary')
+  .action(async (agentArg: string, opts: { prune?: boolean; json?: boolean }) => {
+    try { validateAgentName(agentArg); } catch (err) { console.error(String(err)); process.exit(1); }
+
+    const { reloadCronsForAgent } = await import('../daemon/cron-migration.js');
+    const env = resolveEnv();
+    const frameworkRoot = env.frameworkRoot || process.cwd();
+
+    // Resolve config.json path via filesystem scan (same logic as migrate-crons)
+    const { existsSync: fsExists, readdirSync: fsReaddir } = require('fs') as typeof import('fs');
+    const orgsDir = join(frameworkRoot, 'orgs');
+    let configPath: string | undefined;
+    if (fsExists(orgsDir)) {
+      try {
+        for (const org of fsReaddir(orgsDir, { withFileTypes: true }).filter(d => d.isDirectory()).map(d => d.name)) {
+          const candidate = join(orgsDir, org, 'agents', agentArg, 'config.json');
+          if (fsExists(candidate)) { configPath = candidate; break; }
+        }
+      } catch { /* ignore scan errors */ }
+    }
+
+    if (!configPath) {
+      console.error(`Error: agent '${agentArg}' not found in framework. Check orgs/*/agents/ directory.`);
+      process.exit(1);
+    }
+
+    // --json mode silences the human log but the result.error field still
+    // surfaces failures (Codex P2 finding). Non-json mode logs as it goes.
+    const log = opts.json ? () => { /* silent */ } : (msg: string) => console.log(msg);
+    const result = reloadCronsForAgent(agentArg, configPath, { prune: opts.prune ?? false, log });
+
+    // Signal daemon to invalidate its cron cache (best-effort; daemon will pick
+    // up file change on next 30s tick if IPC fails). Skip when reload errored
+    // — no point signaling reload of state we did not change.
+    if (!result.error) {
+      await signalCronReload(agentArg, env.instanceId);
+    }
+
+    if (opts.json) {
+      console.log(JSON.stringify(result, null, 2));
+    } else {
+      if (result.error) {
+        console.error(`reload-crons failed: ${result.error}`);
+      }
+      if (result.added.length) console.log(`  added (${result.added.length}): ${result.added.join(', ')}`);
+      if (result.updated.length) console.log(`  updated (${result.updated.length}): ${result.updated.join(', ')}`);
+      if (result.unchanged.length) console.log(`  unchanged (${result.unchanged.length}): ${result.unchanged.join(', ')}`);
+      if (result.kept_orphan.length) console.log(`  kept orphan (${result.kept_orphan.length}): ${result.kept_orphan.join(', ')}`);
+      if (result.pruned_orphan.length) console.log(`  pruned orphan (${result.pruned_orphan.length}): ${result.pruned_orphan.join(', ')}`);
+      if (result.skipped.length) console.log(`  skipped (${result.skipped.length}): ${result.skipped.map(s => `${s.name} (${s.reason})`).join('; ')}`);
+    }
+
+    if (result.error) {
+      process.exit(1);
+    }
+  });
+
+// ---------------------------------------------------------------------------
 // upgrade-cron-teaching — Subtask 2.4: scan agent workspace for stale
 // CronCreate / /loop / config.json cron-registration teaching that predates
 // the external-persistent-crons migration.  Scan-only by default; --apply

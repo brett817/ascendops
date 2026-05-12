@@ -60,6 +60,19 @@ function lockDirFor(agentName: string): string {
   return dir;
 }
 
+/**
+ * Run `fn` while holding the agent's cron file lock — exposed so callers
+ * that perform their own read-merge-write cycle (e.g. `reloadCronsForAgent`)
+ * can serialize against `addCron` / `updateCron` / `removeCron` writers.
+ *
+ * Identical semantics to the internal `withFileLockSync(lockDirFor(...))`
+ * pattern used by the writers above. Pass a function whose body performs
+ * the read + merge + writeCrons call as one atomic unit.
+ */
+export function withCronLock<T>(agentName: string, fn: () => T): T {
+  return withFileLockSync(lockDirFor(agentName), fn);
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
