@@ -11,8 +11,12 @@
 import { test, expect } from '@playwright/test';
 
 const DASHBOARD_URL = process.env.DASHBOARD_URL || 'http://localhost:3001';
-const ADMIN_USER = process.env.ADMIN_USERNAME || 'admin';
-const ADMIN_PASS = process.env.ADMIN_PASSWORD || 'cortextos';
+const ADMIN_USER = process.env.ADMIN_USERNAME;
+const ADMIN_PASS = process.env.ADMIN_PASSWORD;
+
+if (!ADMIN_USER || !ADMIN_PASS) {
+  throw new Error('ADMIN_USERNAME and ADMIN_PASSWORD must be set for Playwright dashboard auth tests.');
+}
 
 test.describe('Dashboard Auth (24.2, 24.4)', () => {
   test('24.2 - Wrong password returns 401 / shows error', async ({ page }) => {
