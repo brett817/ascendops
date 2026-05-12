@@ -233,4 +233,49 @@ describe('cross-PR cron pipeline: reload-crons + daemon refresh', () => {
     logSpy.mockRestore();
     errSpy.mockRestore();
   });
+
+  it('propagates wake_on_fire flag from config.json to state crons.json on reload, and toggles cleanly', async () => {
+    // Operator opts a cron into the shift-gate bypass via config.json.
+    // bus reload-crons must (a) carry the flag through to state on first sync,
+    // and (b) treat wake_on_fire as config-authoritative so flipping the value
+    // in config.json propagates on the next reload.
+
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    mockIpcSend.mockResolvedValue({ success: true, data: 'mocked' });
+
+    // 1. Initial reload — flag set true in config.
+    writeAgentConfig([
+      {
+        name: 'shift-bypass-cron',
+        cron: '15 7 * * 1-5',
+        prompt: 'Run every weekday morning regardless of shift.',
+        type: 'recurring',
+        wake_on_fire: true,
+      },
+    ]);
+    await busCommand.parseAsync(['node', 'bus', 'reload-crons', AGENT, '--json']);
+    let state = readStateCrons();
+    expect(state).toHaveLength(1);
+    expect(state[0].name).toBe('shift-bypass-cron');
+    expect(state[0].wake_on_fire).toBe(true);
+
+    // 2. Operator removes the flag in config — second reload must clear it
+    //    in state (proves wake_on_fire is in CONFIG_AUTHORITATIVE_FIELDS).
+    writeAgentConfig([
+      {
+        name: 'shift-bypass-cron',
+        cron: '15 7 * * 1-5',
+        prompt: 'Run every weekday morning regardless of shift.',
+        type: 'recurring',
+      },
+    ]);
+    await busCommand.parseAsync(['node', 'bus', 'reload-crons', AGENT, '--json']);
+    state = readStateCrons();
+    expect(state).toHaveLength(1);
+    expect(state[0].wake_on_fire).toBeFalsy();
+
+    logSpy.mockRestore();
+    errSpy.mockRestore();
+  });
 });

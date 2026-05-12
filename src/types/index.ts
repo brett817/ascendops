@@ -255,6 +255,9 @@ export interface CronEntry {
   /** When true, this cron is allowed to fire during off_shift_emergency_only windows.
    *  Has no effect during in_shift (always fires) or off_shift_no_wake (always drops). */
   emergency_allowed?: boolean;
+  /** When true, this cron bypasses the daemon's off-shift suppression gate entirely
+   *  (see CronDefinition.wake_on_fire). Propagated to crons.json by bus reload-crons. */
+  wake_on_fire?: boolean;
 }
 
 // ---------------------------------------------------------------------------
