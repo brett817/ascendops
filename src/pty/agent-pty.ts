@@ -202,7 +202,32 @@ export class AgentPTY {
    * Default delegates to the configured vendor adapter (anthropic by default).
    */
   protected getBinaryName(): string {
-    return loadAdapter(this.config.vendor).binary;
+    const adapterBinary = loadAdapter(this.config.vendor).binary;
+    const isClaudeAdapter = adapterBinary === 'claude' || adapterBinary === 'claude.cmd';
+    if (platform() !== 'win32' || !isClaudeAdapter) {
+      return adapterBinary;
+    }
+
+    // Newer Windows Claude Code installs can ship only claude.exe with no
+    // claude.cmd shim. Probe PATH and prefer .exe when present.
+    //
+    // Loop order: outer = PATH dirs, inner = extensions. This preserves
+    // Windows command-resolution precedence (directory order first,
+    // PATHEXT order within each directory). The inverted form would return
+    // a later-PATH .exe over an earlier-PATH .cmd shim, which can launch
+    // the wrong binary on installs that intentionally use a .cmd wrapper.
+    const pathDirs = (process.env.PATH || '').split(';').filter(Boolean);
+    for (const dir of pathDirs) {
+      for (const ext of ['.exe', '.cmd']) {
+        if (existsSync(join(dir, `claude${ext}`))) {
+          return `claude${ext}`;
+        }
+      }
+    }
+
+    // Fall back to the legacy wrapper name so the missing-file surface remains
+    // recognizable if neither binary is on PATH.
+    return 'claude.cmd';
   }
 
   /**
@@ -277,7 +302,12 @@ export class AgentPTY {
     const keepVars = [
       'PATH', 'HOME', 'USER', 'SHELL', 'TERM', 'LANG', 'LC_ALL',
       'TMPDIR', 'TEMP', 'TMP', 'ANTHROPIC_API_KEY', 'CLAUDE_API_KEY',
-      'NODE_PATH', 'COMSPEC', 'SystemRoot', 'USERPROFILE',
+      'NODE_PATH', 'COMSPEC', 'USERPROFILE',
+      // Windows path-expansion essentials.
+      'SystemDrive', 'SystemRoot', 'windir',
+      'APPDATA', 'LOCALAPPDATA', 'ProgramData', 'ALLUSERSPROFILE',
+      'ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432',
+      'HOMEDRIVE', 'HOMEPATH', 'PUBLIC',
     ];
     for (const key of keepVars) {
       if (process.env[key]) {

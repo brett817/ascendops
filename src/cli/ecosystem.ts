@@ -84,18 +84,24 @@ export const ecosystemCommand = new Command('ecosystem')
     // via `pm2 startup`/`pm2 save`. The dashboard PM2 entry is only added
     // if dashboard/package.json exists (to keep the generator working in
     // minimal/test installs).
+    const isWindows = process.platform === 'win32';
+    const nextBin = join(dashboardDir, 'node_modules', 'next', 'dist', 'bin', 'next');
+    const dashboardScript = isWindows && existsSync(nextBin) ? nextBin : 'npm';
+    const dashboardArgs = isWindows && existsSync(nextBin) ? 'dev' : 'run dev';
+
     const dashboardAppBlock = hasDashboard
       ? `,
     {
       name: 'cortextos-dashboard',
-      script: 'npm',
-      args: 'run dev',
+      script: ${JSON.stringify(dashboardScript)},
+      args: ${JSON.stringify(dashboardArgs)},
       cwd: ${JSON.stringify(dashboardDir)},
       env: {
         PORT: process.env.PORT || '3000',
       },
       // Dashboard reads its real config from dashboard/.env.local — populated
       // by /onboarding Phase 7. PM2 just supervises the npm process.
+      windowsHide: true,
       max_restarts: 50,
       restart_delay: 15000,
       autorestart: true,

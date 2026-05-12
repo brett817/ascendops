@@ -64,3 +64,6 @@ graphify-out/
 # Weekly tool-update generated logs
 logs/weekly-tool-update/*.md
 !logs/weekly-tool-update/.gitkeep
+
+# Local vendor research checkout — not runtime load-bearing
+vendor/everything-claude-code/
