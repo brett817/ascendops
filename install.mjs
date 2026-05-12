@@ -114,6 +114,52 @@ function linkVendoredClaudeMarketplace(marketplaceName) {
   }
 }
 
+function installRtkAndIcm() {
+  log('Checking rtk + icm (token optimization + memory MCP)...');
+
+  const hasRtk = commandExists('rtk');
+  const hasIcm = commandExists('icm');
+  if (hasRtk && hasIcm) {
+    ok(`rtk ${run('rtk --version')}`);
+    ok(`icm ${run('icm --version')}`);
+    return;
+  }
+
+  if (IS_WINDOWS) {
+    warn('rtk + icm are not auto-installed on Windows. Install them manually if you want token optimization and ICM memory tooling.');
+    return;
+  }
+
+  if (!commandExists('brew')) {
+    if (IS_MAC) {
+      warn('rtk + icm require Homebrew on macOS. Install manually with: brew tap rtk-ai/tap && brew install rtk icm');
+    } else if (IS_LINUX) {
+      warn('rtk + icm require Linuxbrew on Linux for version parity. Install manually with: brew tap rtk-ai/tap && brew install rtk icm');
+    }
+    return;
+  }
+
+  try {
+    runVisible('brew tap rtk-ai/tap');
+    runVisible('brew install rtk icm');
+  } catch {
+    warn('rtk + icm install failed via brew. Install manually with: brew tap rtk-ai/tap && brew install rtk icm');
+    return;
+  }
+
+  if (commandExists('rtk')) {
+    ok(`rtk ${run('rtk --version')}`);
+  } else {
+    warn('rtk did not appear on PATH after brew install');
+  }
+
+  if (commandExists('icm')) {
+    ok(`icm ${run('icm --version')}`);
+  } else {
+    warn('icm did not appear on PATH after brew install');
+  }
+}
+
 console.log('');
 console.log(`${BOLD}AscendOps installer${R}`);
 console.log('Persistent 24/7 Claude Code agents with Telegram control');
@@ -377,6 +423,8 @@ if (!commandExists('jq')) {
 } else {
   ok(`jq ${run('jq --version')}`);
 }
+
+installRtkAndIcm();
 
 // ─── 6. Windows: WSL check ────────────────────────────────────────────────────
 
