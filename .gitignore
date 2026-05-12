@@ -60,3 +60,7 @@ AGENTS.md
 dashboard/screenshots/
 dashboard/test-*.py
 graphify-out/
+
+# Weekly tool-update generated logs
+logs/weekly-tool-update/*.md
+!logs/weekly-tool-update/.gitkeep
