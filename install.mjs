@@ -310,22 +310,26 @@ if (commandExists('claude')) {
       authenticated = true;
     }
   } catch {
-    // claude auth status failed — check env var as fallback
-    if (process.env.ANTHROPIC_API_KEY) {
-      authenticated = true;
-    }
+    // fall through to env var fallback below
+  }
+
+  if (!authenticated && process.env.ANTHROPIC_API_KEY) {
+    authenticated = true;
   }
 
   if (!authenticated) {
     console.log('');
-    console.log(`${Y}  ! Claude Code authentication required before agents can start.${R}`);
+    console.log(`${RED}${BOLD}ERROR: Claude Code is not authenticated.${R}`);
     console.log('');
-    console.log(`    ${BOLD}Run this now to authenticate:${R}`);
-    console.log(`    ${Y}  claude login${R}`);
+    console.log('Run this command, then re-run the AscendOps installer:');
     console.log('');
-    console.log('    You can complete authentication after this installer finishes.');
-    console.log('    Agents will not start until you run: claude login');
+    console.log(`  ${Y}claude login${R}`);
     console.log('');
+    console.log('If you do not use Claude login, set ANTHROPIC_API_KEY first, then re-run the installer:');
+    console.log('');
+    console.log(`  ${Y}export ANTHROPIC_API_KEY=sk-ant-your-key${R}`);
+    console.log('');
+    process.exit(1);
   } else {
     ok('Claude Code authenticated');
   }
