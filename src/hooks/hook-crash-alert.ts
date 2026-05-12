@@ -331,6 +331,7 @@ async function main(): Promise<void> {
       });
     } catch { /* ignore send failures */ }
   }
+
 }
 
 main().catch(() => process.exit(0));
