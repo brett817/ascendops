@@ -19,7 +19,10 @@ orgs/
 
 # Secrets
 .env
+.env.*
 !.env.example
+!**/.env.example
+secrets.env
 templates/*/.env
 .cortextos-env
 
