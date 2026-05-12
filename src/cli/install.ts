@@ -60,6 +60,7 @@ export const installCommand = new Command('install')
   .action(async (options: { instance: string }) => {
     const instanceId = options.instance;
     const ctxRoot = join(homedir(), '.cortextos', instanceId);
+    const frameworkRoot = process.env.CORTEXTOS_DIR || process.cwd();
 
     console.log('\ncortextOS Installation\n');
 
@@ -153,7 +154,7 @@ export const installCommand = new Command('install')
 
     // Fix node-pty spawn-helper permissions (npm doesn't reliably preserve executable bits on prebuilds)
     if (!IS_WINDOWS) {
-      const fixed = fixSpawnHelper(process.cwd());
+      const fixed = fixSpawnHelper(frameworkRoot);
       if (fixed) {
         console.log('  ✓ node-pty: spawn-helper permissions fixed');
       }
@@ -231,8 +232,8 @@ export const installCommand = new Command('install')
     }
 
     // Python venv for Knowledge Base
-    const kbVenvDir = join(process.cwd(), 'knowledge-base', 'venv');
-    const kbReqs = join(process.cwd(), 'knowledge-base', 'scripts', 'requirements.txt');
+    const kbVenvDir = join(frameworkRoot, 'knowledge-base', 'venv');
+    const kbReqs = join(frameworkRoot, 'knowledge-base', 'scripts', 'requirements.txt');
     const python3Cmd = IS_WINDOWS ? 'python' : 'python3';
     if (commandExists(python3Cmd)) {
       if (!existsSync(kbVenvDir)) {
@@ -345,7 +346,7 @@ export const installCommand = new Command('install')
         `ADMIN_USERNAME=admin`,
         `ADMIN_PASSWORD=${adminPassword}`,
         `CTX_ROOT=${ctxRoot}`,
-        `CTX_FRAMEWORK_ROOT=${process.cwd()}`,
+        `CTX_FRAMEWORK_ROOT=${frameworkRoot}`,
         '',
       ].join('\n'),
       'utf-8',
@@ -356,8 +357,8 @@ export const installCommand = new Command('install')
     // Register cortextos CLI globally so agent PTY sessions can find it
     console.log('Registering cortextos CLI globally...');
     const linkResult = IS_WINDOWS
-      ? spawnSync('npm link', { stdio: 'pipe', cwd: process.cwd(), timeout: 30000, shell: true })
-      : spawnSync('npm', ['link'], { stdio: 'pipe', cwd: process.cwd(), timeout: 30000 });
+      ? spawnSync('npm link', { stdio: 'pipe', cwd: frameworkRoot, timeout: 30000, shell: true })
+      : spawnSync('npm', ['link'], { stdio: 'pipe', cwd: frameworkRoot, timeout: 30000 });
     if (linkResult.status === 0) {
       console.log('  ✓ cortextos registered globally (npm link)');
     } else {

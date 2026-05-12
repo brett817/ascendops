@@ -12,7 +12,11 @@ export const initCommand = new Command('init')
   .action(async (orgName: string, options: { instance: string }) => {
     const instanceId = options.instance;
     const ctxRoot = join(homedir(), '.cortextos', instanceId);
-    const projectRoot = process.cwd();
+    const projectRoot =
+      process.env.CORTEXTOS_DIR ||
+      process.env.CTX_FRAMEWORK_ROOT ||
+      process.env.CTX_PROJECT_ROOT ||
+      process.cwd();
 
     // Check if org already exists
     const orgDir = join(projectRoot, 'orgs', orgName);

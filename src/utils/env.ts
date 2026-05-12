@@ -33,6 +33,7 @@ export function resolveEnv(overrides?: Partial<CtxEnv>): CtxEnv {
 
   const frameworkRoot =
     overrides?.frameworkRoot ||
+    process.env.CORTEXTOS_DIR ||
     process.env.CTX_FRAMEWORK_ROOT ||
     envFile.CTX_FRAMEWORK_ROOT ||
     '';
@@ -51,6 +52,7 @@ export function resolveEnv(overrides?: Partial<CtxEnv>): CtxEnv {
 
   const projectRoot =
     overrides?.projectRoot ||
+    process.env.CORTEXTOS_DIR ||
     process.env.CTX_PROJECT_ROOT ||
     envFile.CTX_PROJECT_ROOT ||
     '';

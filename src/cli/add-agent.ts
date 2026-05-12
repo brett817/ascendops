@@ -50,7 +50,11 @@ export const addAgentCommand = new Command('add-agent')
       process.exit(1);
     }
 
-    const projectRoot = process.env.CTX_FRAMEWORK_ROOT || process.env.CTX_PROJECT_ROOT || process.cwd();
+    const projectRoot =
+      process.env.CORTEXTOS_DIR ||
+      process.env.CTX_FRAMEWORK_ROOT ||
+      process.env.CTX_PROJECT_ROOT ||
+      process.cwd();
 
     // Auto-detect org if not specified
     let org = options.org;
