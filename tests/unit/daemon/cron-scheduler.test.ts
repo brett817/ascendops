@@ -405,6 +405,38 @@ describe('CronScheduler', () => {
     expect(afterReload!.nextFireAt).toBe(beforeReload!.nextFireAt);
   });
 
+  it('uses the latest cron prompt from crons.json at fire time without reload()', async () => {
+    mockReadCrons.mockReturnValue([
+      makeCron({ name: 'prompt-refresh', schedule: '1m', prompt: 'old prompt' }),
+    ]);
+    scheduler.start();
+
+    mockReadCrons.mockReturnValue([
+      makeCron({ name: 'prompt-refresh', schedule: '1m', prompt: 'new prompt' }),
+    ]);
+
+    await vi.advanceTimersByTimeAsync(60_000 + TICK);
+
+    expect(fired).toHaveLength(1);
+    expect(fired[0].name).toBe('prompt-refresh');
+    expect(fired[0].prompt).toBe('new prompt');
+  });
+
+  it('skips a cached fire when the cron has been removed before it becomes due', async () => {
+    mockReadCrons.mockReturnValue([
+      makeCron({ name: 'removed-before-fire', schedule: '1m', prompt: 'stale prompt' }),
+    ]);
+    scheduler.start();
+
+    mockReadCrons.mockReturnValue([]);
+
+    await vi.advanceTimersByTimeAsync(60_000 + TICK);
+
+    expect(fired).toHaveLength(0);
+    expect(scheduler.getNextFireTimes()).toEqual([]);
+    expect(logs.some(l => l.includes('no current definition found in crons.json'))).toBe(true);
+  });
+
   it('reload() recomputes nextFireAt for a modified schedule', async () => {
     mockReadCrons.mockReturnValue([makeCron({ name: 'changing', schedule: '6h' })]);
     scheduler.start();

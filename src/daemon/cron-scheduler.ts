@@ -452,6 +452,39 @@ export class CronScheduler {
     }
   }
 
+  private refreshDefinitionAtFire(name: string, fallback: CronDefinition): CronDefinition | null {
+    try {
+      const { crons, corrupt } = readCronsWithStatus(this.agentName);
+      const latest = crons.find(def => def.name === name);
+      if (corrupt) {
+        this.logger(
+          `[cron-scheduler] WARNING: failed to refresh cron "${name}" from crons.json — ` +
+          `retaining cached definition for this fire because the cron file is corrupt`
+        );
+        return fallback;
+      }
+      if (latest === undefined) {
+        this.logger(
+          `[cron-scheduler] skipping cached cron "${name}" — no current definition found in crons.json`
+        );
+        return null;
+      }
+      if (!latest.enabled) {
+        this.logger(
+          `[cron-scheduler] skipping cached cron "${name}" — cron is now disabled in crons.json`
+        );
+        return null;
+      }
+      return latest;
+    } catch (err) {
+      this.logger(
+        `[cron-scheduler] WARNING: failed to refresh cron "${name}" from crons.json — ` +
+        `${err instanceof Error ? err.message : String(err)}. Using cached definition for this fire.`
+      );
+      return fallback;
+    }
+  }
+
   private async tick(): Promise<void> {
     const now = Date.now();
 
@@ -467,7 +500,15 @@ export class CronScheduler {
       }
 
       sc.firing = true;
-      const cron = sc.definition;
+      const refreshed = this.refreshDefinitionAtFire(name, sc.definition);
+      if (refreshed === null) {
+        sc.firing = false;
+        this.scheduled.delete(name);
+        continue;
+      }
+
+      const cron = refreshed;
+      sc.definition = cron;
       this.logger(`[cron-scheduler] firing cron "${name}" (was due ${new Date(sc.nextFireAt).toISOString()})`);
 
       // Persist last_fire_attempted_at to disk BEFORE awaiting the dispatch.
