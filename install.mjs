@@ -8,7 +8,7 @@
  */
 
 import { execSync, spawnSync } from 'child_process';
-import { existsSync, mkdirSync, writeFileSync, readdirSync, statSync, chmodSync } from 'fs';
+import { existsSync, mkdirSync, writeFileSync, readdirSync, statSync, chmodSync, lstatSync, readlinkSync, symlinkSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { homedir, platform } from 'os';
 
@@ -69,6 +69,48 @@ function tryInstall(label, installFn) {
   } catch {
     warn(`Could not auto-install ${label} — see manual instructions above`);
     return false;
+  }
+}
+
+function linkVendoredClaudeMarketplace(marketplaceName) {
+  const claudePluginsRoot = join(homedir(), '.claude', 'plugins', 'marketplaces');
+  const src = join(INSTALL_DIR, 'vendor', 'claude-plugins', marketplaceName);
+  const dest = join(claudePluginsRoot, marketplaceName);
+
+  if (!existsSync(src)) {
+    warn(`Vendored Claude marketplace missing: ${marketplaceName}`);
+    return;
+  }
+
+  mkdirSync(claudePluginsRoot, { recursive: true });
+
+  try {
+    const stat = lstatSync(dest);
+    if (stat.isSymbolicLink()) {
+      const currentTarget = readlinkSync(dest);
+      if (currentTarget === src) {
+        ok(`Claude marketplace already linked: ${marketplaceName}`);
+        return;
+      }
+
+      unlinkSync(dest);
+      ok(`Re-linking stale Claude marketplace: ${marketplaceName}`);
+    } else {
+      warn(`Claude marketplace path already exists and is not a symlink: ${dest}`);
+      return;
+    }
+  } catch (err) {
+    if (err?.code !== 'ENOENT') {
+      warn(`Could not inspect existing Claude marketplace path: ${dest}`);
+      return;
+    }
+  }
+
+  try {
+    symlinkSync(src, dest, IS_WINDOWS ? 'junction' : 'dir');
+    ok(`Linked Claude marketplace: ${marketplaceName}`);
+  } catch {
+    warn(`Could not link Claude marketplace: ${marketplaceName}`);
   }
 }
 
@@ -509,6 +551,11 @@ try {
   runVisible('node dist/cli.js install', { cwd: INSTALL_DIR });
 } catch {
   warn('cortextos install had warnings — see above');
+}
+
+log('Linking bundled Claude plugins...');
+for (const marketplace of ['caveman', 'thedotmack']) {
+  linkVendoredClaudeMarketplace(marketplace);
 }
 
 // ─── Done ─────────────────────────────────────────────────────────────────────

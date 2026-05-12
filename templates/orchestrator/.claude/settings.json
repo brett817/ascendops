@@ -91,5 +91,9 @@
         ]
       }
     ]
+  },
+  "enabledPlugins": {
+    "claude-mem@thedotmack": true,
+    "caveman@caveman": true
   }
 }
