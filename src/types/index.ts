@@ -238,6 +238,13 @@ export interface AgentConfig {
    * uses its own override path in HermesPTY.
    */
   vendor?: 'anthropic' | 'openai' | 'google';
+  /**
+   * Whether this agent runs a Telegram poller. Defaults to true when absent
+   * (preserves existing behaviour). Set to false on specialist agents that
+   * should not own a Telegram bot — only the designated orchestrator agent
+   * should poll.
+   */
+  telegram_polling?: boolean;
 }
 
 export interface CronEntry {

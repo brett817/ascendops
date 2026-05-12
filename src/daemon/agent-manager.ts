@@ -11,7 +11,7 @@ import { TelegramAPI } from '../telegram/api.js';
 import { TelegramPoller } from '../telegram/poller.js';
 import { resolvePaths } from '../utils/paths.js';
 import { resolveEnv } from '../utils/env.js';
-import { logInboundMessage, cacheLastSent, logOutboundMessage, buildRecentHistory } from '../telegram/logging.js';
+import { recordInboundTelegram, cacheLastSent, logOutboundMessage, buildRecentHistory } from '../telegram/logging.js';
 import { collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
 import { stripControlChars } from '../utils/validate.js';
 import { processMediaMessage } from '../telegram/media.js';
@@ -421,8 +421,10 @@ export class AgentManager {
       }).catch(() => { /* non-fatal */ });
     }
 
-    // Start Telegram poller if credentials are available
-    if (telegramApi && chatId) {
+    // Start Telegram poller if credentials are available and not explicitly disabled.
+    // Set telegram_polling: false on specialist agents that should register
+    // slash commands but should not own inbound Telegram polling.
+    if (telegramApi && chatId && config.telegram_polling !== false) {
       const stateDir = join(this.ctxRoot, 'state', name);
       const poller = new TelegramPoller(telegramApi, stateDir);
 
@@ -442,15 +444,8 @@ export class AgentManager {
         const effectiveChatId = msgChatId ?? chatId ?? '';
         const stateDir = join(this.ctxRoot, 'state', name);
 
-        // Log inbound message to JSONL
-        logInboundMessage(this.ctxRoot, name, {
-          message_id: msg.message_id,
-          from: msg.from?.id,
-          from_name: from,
-          chat_id: msgChatId,
-          text: stripControlChars(msg.text || msg.caption || ''),
-          timestamp: new Date().toISOString(),
-        });
+        // Persist inbound JSONL and emit telegram_received for dashboards/experiments.
+        recordInboundTelegram(paths, this.ctxRoot, name, resolvedOrg, from, msg, log);
 
         // Check for media messages (photo, document, voice, audio, video, video_note)
         const isMedia = !!(msg.photo || msg.document || msg.voice || msg.audio || msg.video || msg.video_note);
@@ -483,7 +478,7 @@ export class AgentManager {
             } else if (media.type === 'document') {
               formatted = FastChecker.formatTelegramDocumentMessage(from, effectiveChatId, media.text, relFilePath, media.file_name!);
             } else if (media.type === 'voice' || media.type === 'audio') {
-              formatted = FastChecker.formatTelegramVoiceMessage(from, effectiveChatId, relFilePath, media.duration);
+              formatted = FastChecker.formatTelegramVoiceMessage(from, effectiveChatId, relFilePath, media.duration, media.transcript);
             } else {
               // video or video_note
               formatted = FastChecker.formatTelegramVideoMessage(from, effectiveChatId, media.text, relFilePath, media.file_name || '', media.duration);
