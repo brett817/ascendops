@@ -204,14 +204,49 @@ export function shouldRollback(
 }
 
 /**
+ * Validate that a commit-ish target is reachable in the repo. Returns true
+ * only if `git cat-file -e <target>^{commit}` succeeds — guards against
+ * resetting to an orphaned/garbage-collected commit hash, which would either
+ * fail loudly or silently move HEAD to an unreachable state.
+ *
+ * Worktree-eats-docs bug (2026-05-12): a stale `last_healthy` commit got
+ * rewritten by an upstream rebase + later garbage-collected. The previous
+ * rollback path called `git reset --hard <orphaned-sha>` without checking
+ * whether the target was still valid. Validation must run BEFORE any
+ * destructive op (stash, tag, reset) so we never strand the working tree.
+ */
+function targetIsValid(repoRoot: string, target: string): boolean {
+  if (!target) return false;
+  try {
+    execFileSync('git', ['cat-file', '-e', `${target}^{commit}`], {
+      cwd: repoRoot,
+      stdio: 'pipe',
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Perform a git rollback:
- *   1. Stash uncommitted work (preserving it for the agent to review).
- *   2. Determine rollback target — last_healthy commit, or origin/main.
+ *   1. Determine + VALIDATE rollback target (last_healthy commit, or origin/main).
+ *   2. Stash uncommitted work (preserving it for the agent to review).
  *   3. git reset --hard <target> on the current branch.
  *   4. Write a recovery note the agent reads on next boot.
  *
  * Returns a RollbackResult describing what happened. On any git error the
  * result has success=false and the daemon falls back to normal restart.
+ *
+ * Worktree-eats-docs bug (2026-05-12) safety patch:
+ *   - Target validation runs BEFORE stash so an invalid target aborts cleanly
+ *     instead of stashing-then-discovering-reset-fails.
+ *   - Stash uses bare `git stash push -m` (NO -u flag) so the watchdog never
+ *     touches untracked files anywhere in the repo tree. Original `-u` could
+ *     interact with the surrounding working tree (especially gitignored agent
+ *     state under orgs/) in unexpected ways across git versions.
+ *   - Refuse to roll back to HEAD itself — a no-op that would still run the
+ *     destructive stash+reset cycle for no benefit.
  */
 export function performRollback(
   stateDir: string,
@@ -220,28 +255,7 @@ export function performRollback(
   const failedCommit = getCurrentCommit(repoRoot) ?? 'unknown';
   const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
 
-  // Step 1: stash uncommitted work
-  let stashRef: string | null = null;
-  try {
-    execFileSync(
-      'git',
-      ['stash', 'push', '-u', '-m', `cct-recovery-${ts}`],
-      { cwd: repoRoot, stdio: 'pipe' },
-    );
-    // Confirm the stash was created (git stash push is silent on nothing-to-stash)
-    const stashList = execFileSync('git', ['stash', 'list', '--max-count=1'], {
-      cwd: repoRoot,
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    if (stashList.trim().includes('cct-recovery')) {
-      stashRef = 'stash@{0}';
-    }
-  } catch {
-    // Nothing to stash or stash failed — continue with rollback
-  }
-
-  // Step 2: determine rollback target
+  // Step 1: determine + validate rollback target FIRST (pre-flight)
   const stability = loadStability(stateDir);
   let target = stability.last_healthy;
 
@@ -262,10 +276,53 @@ export function performRollback(
       return {
         success: false,
         rolledBackTo: '',
-        stashRef,
+        stashRef: null,
         reason: 'Could not determine rollback target (no healthy commit, fetch failed)',
       };
     }
+  }
+
+  // Pre-flight: target must be a reachable commit AND must not equal HEAD.
+  // Either check failing aborts BEFORE we touch the working tree.
+  if (!targetIsValid(repoRoot, target)) {
+    return {
+      success: false,
+      rolledBackTo: target,
+      stashRef: null,
+      reason: `Rollback target ${target.slice(0, 12)} is not a reachable commit — refusing destructive ops`,
+    };
+  }
+
+  if (target === failedCommit) {
+    return {
+      success: false,
+      rolledBackTo: target,
+      stashRef: null,
+      reason: `Rollback target equals current HEAD (${failedCommit.slice(0, 12)}) — refusing no-op destructive cycle`,
+    };
+  }
+
+  // Step 2: stash tracked modifications only (NO -u flag — watchdog must
+  // never touch untracked files, including gitignored agent state). Best-
+  // effort: if stash fails or nothing to stash, continue with reset.
+  let stashRef: string | null = null;
+  try {
+    execFileSync(
+      'git',
+      ['stash', 'push', '-m', `cct-recovery-${ts}`],
+      { cwd: repoRoot, stdio: 'pipe' },
+    );
+    // Confirm the stash was created (git stash push is silent on nothing-to-stash)
+    const stashList = execFileSync('git', ['stash', 'list', '--max-count=1'], {
+      cwd: repoRoot,
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    if (stashList.trim().includes('cct-recovery')) {
+      stashRef = 'stash@{0}';
+    }
+  } catch {
+    // Nothing to stash or stash failed — continue with rollback
   }
 
   // Step 3: tag failed commit and reset to target
