@@ -4,11 +4,13 @@
 
 **Persistent 24/7 Claude Code agents you control from Telegram.**
 
-[Quick Start](#quick-start) · [Architecture](#architecture) · [Templates](#templates) · [Roadmap](#roadmap)
+[Quick Start](#-quick-start) · [Architecture](#%EF%B8%8F-architecture) · [Templates](#-templates) · [Roadmap](#%EF%B8%8F-roadmap)
 
 [![tests](https://img.shields.io/badge/tests-917%20passing-success)](.) [![License](https://img.shields.io/badge/license-MIT-blue)](./LICENSE) [![Node](https://img.shields.io/badge/node-20%2B-43853d)](https://nodejs.org) [![Built with Claude Code](https://img.shields.io/badge/built%20with-Claude%20Code-d97757)](https://docs.anthropic.com/en/docs/claude-code)
 
 </div>
+
+> **Who this is for:** Property management operators (single-owner, small team, or growing portfolio) who want AI agents handling work-order triage, vendor dispatch, leasing pipeline, and resident comms — running on your Mac mini or Linux box, controlled from Telegram. Skool community install path takes ~30 minutes.
 
 ---
 
@@ -63,25 +65,36 @@ Not built for:
 
 ---
 
-## Architecture
+## 🏗️ Architecture
 
 ```mermaid
-flowchart TD
-    U[User · Telegram or iOS] --> D[AscendOps Daemon · Node.js]
-    D --> O[Orchestrator]
-    D --> A[Analyst]
-    D --> W[Specialist agents]
-    O <-->|file bus| A
-    O <-->|file bus| W
-    D --> Web[Web Dashboard · Next.js]
-    Web --> U2[Browser]
+flowchart TB
+    Operator[PM Operator]
+    Telegram[Telegram]
+    Daemon[AscendOps Daemon]
+    MD[Maintenance Director]
+    LC[Leasing Coordinator]
+    PM[Property Meld]
+    Vendors[Vendors]
+    Residents[Residents]
+
+    Operator <--> Telegram
+    Telegram <--> Daemon
+    Daemon --> MD
+    Daemon --> LC
+    MD --> PM
+    LC --> PM
+    PM --> Vendors
+    PM --> Residents
 ```
 
 Every agent is its own PTY-spawned Claude / Codex / Gemini process. The daemon handles spawn, restart, and heartbeat health. Inter-agent communication runs over a file-based bus — no network, no broker. Hooks fire on bus events for custom routing and observability.
 
 ---
 
-## Quick Start
+## 🚀 Quick Start
+
+> `git clone` → `npm install` → `npm run build` → init org → add 2 persona agents → start daemon → message your agents on Telegram. ~30 min total if accounts are ready.
 
 **Prereqs:** Node.js 20+, Claude Code CLI authenticated, Telegram bot token from @BotFather.
 
@@ -104,7 +117,7 @@ More setup details in [CONTRIBUTING.md](./CONTRIBUTING.md) and the environment v
 
 ---
 
-## Templates
+## 👥 Templates
 
 | Template | Best for |
 |---|---|
@@ -164,24 +177,36 @@ Every external action (email, deploy, delete, financial) requires explicit human
 
 ---
 
-## Roadmap
+## 🗺️ Roadmap
 
-- ✅ Multi-vendor adapter MVP — Claude / Codex / Gemini per-agent
-- ✅ Hooks framework Day-1 + Day-2 + Day-3 scaffolding
-- ✅ Codex 2-seat rotation (path-shadow wrapper, rate-limit-aware seat-flip)
-- ⬜ Rust SaaS response filter (token-efficiency layer for vendor APIs)
-- ⬜ Cloud deployment path (Mac mini → AWS or similar)
-- ⬜ Slack + human team-member roster
+**Just shipped:**
+- Maintenance Director + Leasing Coordinator persona templates
+- Property Meld integration (read + write via Nexus API)
+- Skool community install path (this README + SKOOL-INSTALL.md)
+- Telnyx SMS layer with credential abstraction (no hardcoded numbers; pulls from your local creds file)
+- Tirith post-install security layer pointer
+
+**In flight (next ~30 days):**
+- Business profile wizard — guided onboarding to wire your company, vendors, properties, comms style into a fresh install
+- Owner Comms persona template
+- Vendor Manager persona template
+- Dashboard polish for operators
+
+**Longer horizon:**
+- Additional PM software bindings beyond Property Meld (AppFolio, Buildium, Rentvine, Rent Manager — order driven by community demand)
+- Telnyx Voice AI agent for inbound vendor + tenant calls
+- Cloud-hosted deploy path (your Mac mini today → managed cloud later)
+- Slack + human-team-member roster integration
 
 ---
 
-## Contributing
+## 🤝 Contributing
 
 PRs welcome. See [CONTRIBUTING.md](./CONTRIBUTING.md) for setup + code style. Framework-level patches go upstream to [grandamenium/cortextos](https://github.com/grandamenium/cortextos); AscendOps-specific patterns stay in this fork.
 
 ---
 
-## License
+## 📜 License
 
 MIT — see [LICENSE](./LICENSE).
 
