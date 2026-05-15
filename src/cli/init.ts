@@ -8,7 +8,7 @@ import type { OrgContext } from '../types/index.js';
 export const initCommand = new Command('init')
   .argument('<org-name>', 'Organization name')
   .option('--instance <id>', 'Instance ID', 'default')
-  .description('Create a new cortextOS organization')
+  .description('Create a new AscendOps organization')
   .action(async (orgName: string, options: { instance: string }) => {
     const instanceId = options.instance;
     const ctxRoot = join(homedir(), '.cortextos', instanceId);
@@ -67,7 +67,7 @@ export const initCommand = new Command('init')
       }
     } catch { /* tripwire is informational; never block init on its own failure */ }
 
-    console.log(`\nInitializing cortextOS organization: ${orgName}`);
+    console.log(`\nInitializing AscendOps organization: ${orgName}`);
     console.log(`  Instance: ${instanceId}`);
     console.log(`  State: ${ctxRoot}`);
     console.log(`  Project: ${projectRoot}\n`);

@@ -2,6 +2,10 @@
 
 Thank you for contributing a skill or agent template to the AscendOps community catalog. This guide covers everything you need to submit a contribution.
 
+### Brand string convention (fork-only)
+
+The AscendOps fork swaps first-impression user-facing brand strings (CLI welcome banner, install/uninstall descriptions, doctor header, init/dashboard descriptions) to say "AscendOps" instead of "cortextOS". Daemon-level strings (`start.ts`), CLI binary invocation strings (`cortextos <command>`), and runtime infrastructure paths (`~/.cortextos/`) keep cortextOS branding — that's the framework underneath AscendOps. When syncing upstream changes from grandamenium/cortextos, expect occasional merge conflicts on the rebranded lines; re-apply the AscendOps brand and move on.
+
 ## What Can Be Contributed
 
 | Type | Description |

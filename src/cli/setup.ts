@@ -207,7 +207,7 @@ export const setupCommand = new Command('setup')
 
     const iface = rl();
 
-    console.log('\n  Welcome to cortextOS setup\n');
+    console.log('\n  Welcome to AscendOps setup\n');
     console.log('  This wizard will:');
     console.log('    1. Check and install dependencies');
     console.log('    2. Create your organization');

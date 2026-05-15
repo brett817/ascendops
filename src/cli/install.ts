@@ -81,13 +81,13 @@ function tryInstallFfmpeg(): boolean {
 
 export const installCommand = new Command('install')
   .option('--instance <id>', 'Instance ID', 'default')
-  .description('Install cortextOS — create state directories, check and install dependencies')
+  .description('Install AscendOps — create state directories, check and install dependencies')
   .action(async (options: { instance: string }) => {
     const instanceId = options.instance;
     const ctxRoot = join(homedir(), '.cortextos', instanceId);
     const frameworkRoot = process.env.CORTEXTOS_DIR || process.cwd();
 
-    console.log('\ncortextOS Installation\n');
+    console.log('\nAscendOps Installation\n');
 
     // ─── Dependency checks & auto-install ────────────────────────────────────
 

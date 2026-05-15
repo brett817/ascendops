@@ -30,7 +30,7 @@ export const dashboardCommand = new Command('dashboard')
   .option('--instance <id>', 'Instance ID', 'default')
   .option('--build', 'Build for production first (recommended for Cloudflare Tunnel / remote access)')
   .option('--install', 'Install dashboard dependencies first')
-  .description('Start the cortextOS dashboard (Next.js)')
+  .description('Start the AscendOps dashboard (Next.js)')
   .action(async (options: { port: string; instance: string; build?: boolean; install?: boolean }) => {
     const { execSync, spawn } = require('child_process');
 

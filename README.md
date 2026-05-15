@@ -105,7 +105,7 @@ Every agent is its own PTY-spawned Claude / Codex / Gemini process. The daemon h
 curl -fsSL https://raw.githubusercontent.com/noogalabs/ascendops/main/install.mjs | node
 
 # Open in Claude Code + run guided onboarding
-claude ~/cortextos
+claude ~/ascendops
 > /onboarding
 ```
 

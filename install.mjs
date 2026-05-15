@@ -12,8 +12,8 @@ import { existsSync, mkdirSync, writeFileSync, readdirSync, statSync, chmodSync,
 import { join } from 'path';
 import { homedir, platform } from 'os';
 
-const REPO_URL = process.env.CORTEXTOS_REPO || 'https://github.com/grandamenium/cortextos.git';
-const INSTALL_DIR = process.env.CORTEXTOS_DIR || join(homedir(), 'cortextos');
+const REPO_URL = process.env.ASCENDOPS_REPO || process.env.CORTEXTOS_REPO || 'https://github.com/noogalabs/ascendops.git';
+const INSTALL_DIR = process.env.ASCENDOPS_DIR || process.env.CORTEXTOS_DIR || join(homedir(), 'ascendops');
 
 // CORTEXTOS_BRANCH lets you install a specific branch instead of `main`. Useful
 // for testing fixes before they merge:
@@ -455,6 +455,20 @@ console.log('');
 
 // ─── 7. Clone or update ───────────────────────────────────────────────────────
 
+// Friendly note for operators who have an existing ~/cortextos checkout (likely
+// upstream cortextOS, not a prior AscendOps install — AscendOps just shipped
+// today). AscendOps installs separately at ~/ascendops by design; ASCENDOPS_DIR
+// override lets you point elsewhere if you've moved your install path.
+const LEGACY_CORTEXTOS_DIR = join(homedir(), 'cortextos');
+if (
+  !process.env.ASCENDOPS_DIR &&
+  !process.env.CORTEXTOS_DIR &&
+  INSTALL_DIR !== LEGACY_CORTEXTOS_DIR &&
+  existsSync(LEGACY_CORTEXTOS_DIR)
+) {
+  info(`Note: ~/cortextos already exists (likely upstream cortextOS, not a prior AscendOps install). AscendOps installs separately at ${INSTALL_DIR}. Set ASCENDOPS_DIR=<path> to override.`);
+}
+
 if (existsSync(INSTALL_DIR)) {
   warn(`Directory ${INSTALL_DIR} already exists`);
   if (existsSync(join(INSTALL_DIR, '.git'))) {
@@ -469,7 +483,7 @@ if (existsSync(INSTALL_DIR)) {
       // Check if origin points to canonical — if so, rename it to upstream
       let originUrl = '';
       try { originUrl = run('git remote get-url origin', { cwd: INSTALL_DIR }); } catch { /* no origin */ }
-      if (originUrl && (originUrl.includes('grandamenium/cortextos') || originUrl === REPO_URL)) {
+      if (originUrl && (originUrl.includes('noogalabs/ascendops') || originUrl.includes('grandamenium/cortextos') || originUrl === REPO_URL)) {
         log('Migrating git remotes: renaming origin → upstream...');
         try {
           run('git remote rename origin upstream', { cwd: INSTALL_DIR });
@@ -495,17 +509,55 @@ if (existsSync(INSTALL_DIR)) {
     fail(`${INSTALL_DIR} exists but is not a git repo. Remove it or set CORTEXTOS_DIR to a different path.`);
   }
 } else {
-  log(`Cloning AscendOps (branch: ${REPO_BRANCH}) to ${INSTALL_DIR}...`);
-  runVisible(`git clone --branch ${REPO_BRANCH} ${REPO_URL} ${JSON.stringify(INSTALL_DIR)}`);
-  ok('Cloned');
+  // Try fork-by-default first: if gh CLI is installed and authed, create
+  // (or reuse) the user's personal fork on GitHub so origin=fork +
+  // upstream=canonical. That enables both pulling updates AND contributing
+  // back via PR. Fall back to plain clone if gh isn't available — same
+  // observable end state for the install minus the personal fork.
+  const REPO_OWNER_PATH = REPO_URL.replace(/^https:\/\/github\.com\//, '').replace(/\.git$/, '');
+  const REPO_NAME = REPO_OWNER_PATH.split('/').pop();
 
-  // Rename origin → upstream so check-upstream and upstream-sync work out of the box
-  log('Configuring git remotes...');
-  try {
-    run('git remote rename origin upstream', { cwd: INSTALL_DIR });
-    ok('"upstream" remote configured (tracks canonical cortextos)');
-  } catch {
-    warn('Could not configure upstream remote — run manually: git remote rename origin upstream');
+  let ghForkOk = false;
+  if (commandExists('gh')) {
+    let ghAuthed = false;
+    try { run('gh auth status'); ghAuthed = true; } catch { /* not authed */ }
+
+    if (ghAuthed) {
+      log(`Forking ${REPO_OWNER_PATH} to your GitHub account (gh CLI authed)...`);
+      try {
+        run(`gh repo fork ${REPO_OWNER_PATH} --clone=false --remote=false`);
+        const ghUser = run('gh api user --jq .login');
+        const forkUrl = `https://github.com/${ghUser}/${REPO_NAME}.git`;
+        log(`Cloning your fork to ${INSTALL_DIR}...`);
+        runVisible(`git clone --branch ${REPO_BRANCH} ${forkUrl} ${JSON.stringify(INSTALL_DIR)}`);
+        run(`git remote add upstream ${REPO_URL}`, { cwd: INSTALL_DIR });
+        ok(`Forked + cloned (origin = your fork, upstream = ${REPO_OWNER_PATH})`);
+        ghForkOk = true;
+      } catch (err) {
+        warn(`gh repo fork failed (${err.message?.slice(0, 80) || 'unknown'}) — falling back to plain clone`);
+      }
+    } else {
+      info('gh CLI installed but not authed — run `gh auth login` later to enable contributing back. Falling back to plain clone.');
+    }
+  } else {
+    info('gh CLI not installed — using plain clone. Install gh + run `gh auth login` later if you want to contribute changes back upstream.');
+  }
+
+  if (!ghForkOk) {
+    log(`Cloning AscendOps (branch: ${REPO_BRANCH}) to ${INSTALL_DIR}...`);
+    runVisible(`git clone --branch ${REPO_BRANCH} ${REPO_URL} ${JSON.stringify(INSTALL_DIR)}`);
+    ok('Cloned');
+
+    // Rename origin → upstream so check-upstream and upstream-sync work
+    // the same way the gh-fork path produces (origin → fork or absent,
+    // upstream → canonical).
+    log('Configuring git remotes...');
+    try {
+      run('git remote rename origin upstream', { cwd: INSTALL_DIR });
+      ok('"upstream" remote configured (tracks canonical AscendOps)');
+    } catch {
+      warn('Could not configure upstream remote — run manually: git remote rename origin upstream');
+    }
   }
 }
 

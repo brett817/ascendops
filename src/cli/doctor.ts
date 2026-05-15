@@ -15,7 +15,7 @@ export const doctorCommand = new Command('doctor')
   .option('--instance <id>', 'Instance ID', 'default')
   .description('Diagnose common issues')
   .action(async (options: { instance: string }) => {
-    console.log('\ncortextOS Doctor\n');
+    console.log('\nAscendOps Doctor\n');
 
     const checks: Check[] = [];
 
