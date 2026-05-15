@@ -862,6 +862,8 @@ export interface TeamMember {
   slack_handle: string;
   /** Trust level — determines how the agent treats messages from this person */
   trust_level: TrustLevel;
+  /** Optional persona-agent routing hint from Business Profile Wizard */
+  assigned_to_agent?: string;
 }
 
 // Agent Status (returned by daemon)
