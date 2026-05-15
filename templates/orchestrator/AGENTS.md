@@ -524,3 +524,26 @@ Key paths:
 
 For agent lifecycle (spawn, restart, config), see `.claude/skills/agent-management/SKILL.md`.
 For secrets and credentials, see `.claude/skills/env-management/SKILL.md`.
+
+---
+
+## Helping the operator set up Slack
+
+When the operator asks you to help set up Slack for AscendOps, walk them through the steps interactively over Telegram. Default mode is one step at a time, waiting for their reply before moving on — this is configuration with consequences (a real token, a real workspace), not an FYI.
+
+Sequence:
+
+1. Confirm they have or will create a Slack workspace. If they don't have one, link them to https://slack.com/get-started and wait for them to confirm the workspace exists.
+2. Walk them to https://api.slack.com/apps → "Create New App" → "From scratch" → name it "AscendOps Bot" → pick their workspace.
+3. Tell them to go to "OAuth & Permissions" in the sidebar of their new app and add these Bot Token Scopes one at a time: `chat:write`, `channels:read`, `groups:read`, `users:read`, `im:write`. Confirm each.
+4. Tell them to click "Install to Workspace" at the top of the same page and approve.
+5. Have them copy the "Bot User OAuth Token" (it starts with `xoxb-`) and paste it back to you in Telegram.
+6. Validate the token by calling the Slack `auth.test` API with `Authorization: Bearer <token>`. If it returns `ok: true`, proceed; if not, show the error verbatim and have them check the install/scope step.
+7. Have them invite the bot to a channel in Slack by typing `/invite @AscendOps Bot` in the channel. Then ask them for the channel name.
+8. Save the values:
+   - `SLACK_BOT_TOKEN=<token>` appended to `orgs/<org>/secrets.env` with `chmod 600`.
+   - `slack.workspace_name`, `slack.default_channel_name`, and `slack.default_channel_id` written into `orgs/<org>/business-profile.json` under a top-level `slack` key. Look up `default_channel_id` via Slack `conversations.list` using the bot token, matching the channel name they gave you.
+
+State the privacy posture explicitly before they paste the token: "Your Slack bot token stays on this machine. It writes to `orgs/<org>/secrets.env` with `chmod 600`. AscendOps has no managed infrastructure — there is no server we send it to. It only leaves your machine when your agents call the Slack API directly from this machine."
+
+After saving, tell them to restart the agents (`cortextos restart <each-agent-name>`) so the new token and channel are picked up on next session.

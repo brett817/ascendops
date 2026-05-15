@@ -29,6 +29,8 @@ If any of those is missing, install it now before running the one-liner.
 curl -fsSL https://raw.githubusercontent.com/noogalabs/ascendops/main/install.mjs | node
 ```
 
+> **Not comfortable with the terminal?** Paste this doc into ChatGPT or Claude and ask them to walk you through each step. They will — the install is straightforward and they have all the context they need from this page.
+
 The installer:
 - Detects whether `gh` CLI is authed. If yes, creates your fork at `github.com/<your-username>/ascendops` (or reuses an existing fork), then clones from there with `upstream` pointing back at `noogalabs/ascendops`. If `gh` is not authed, falls back to a plain clone with `upstream` pointing at `noogalabs/ascendops`.
 - Installs into `~/ascendops/` (override with `ASCENDOPS_DIR=/some/other/path` if you want it elsewhere).
@@ -70,6 +72,10 @@ source ~/.zshrc
 ```
 
 For bash/fish and the full Tirith reference, see [github.com/sheeki03/tirith](https://github.com/sheeki03/tirith). Default mode is warn-only (logs findings, never blocks).
+
+### Want Slack?
+
+Just message your orchestrator agent in Telegram: "Help me set up Slack." It'll walk you through it interactively — workspace creation (if needed), app creation at api.slack.com/apps, OAuth scopes, token paste, channel pick — and save the credentials in the right place. Takes about 10 minutes. Your Slack bot token stays on your machine; AscendOps has no managed infrastructure to send it to.
 
 ### How updates and improvements flow
 
@@ -134,7 +140,7 @@ For anything else: check `~/.cortextos/default/logs/<agent>/stderr.log` and `cor
 - [ ] **GitHub account** (free tier is fine) — install creates your own fork of AscendOps so you can pull updates from us AND push improvements back. See "How updates and improvements flow" further down.
 - [ ] **Anthropic Claude account** — you'll need either an OAuth-logged-in `claude` CLI on the host OR an `ANTHROPIC_API_KEY` from [console.anthropic.com](https://console.anthropic.com). OAuth is easier.
 - [ ] **Telegram account** with the @BotFather bot accessible. You'll create three bots: one per agent (Maintenance Director, Leasing Coordinator) and one "activity channel" bot that posts agent events into a separate Telegram channel.
-- [ ] **(Optional but recommended) Google account** for Gemini API key — powers the knowledge base. Free tier works for light use.
+- [ ] **Google account (free) — required** for Gemini API key. Powers the knowledge base (semantic search). Free tier handles typical small-operator volumes. The `cortextos configure` wizard walks you to https://aistudio.google.com/apikey to create one in about 2 minutes.
 
 **Machine:**
 - [ ] macOS or Linux. Windows works via WSL2 — see the Windows section in [README.md](./README.md), and add 15 minutes to your install budget.
