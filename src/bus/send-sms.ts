@@ -4,7 +4,6 @@ import { join } from 'path';
 import type { Approval, BusPaths } from '../types/index.js';
 
 const TELNYX_CREDS = join(homedir(), '.claude', 'credentials', 'telnyx.json');
-const TELNYX_FROM = '+14236331021';
 
 export interface SendSmsResult {
   ok: boolean;
@@ -17,17 +16,31 @@ export interface SendSmsResult {
   response?: unknown;
 }
 
-function loadTelnyxApiKey(): string {
+interface TelnyxCreds {
+  apiKey: string;
+  fromNumber: string;
+}
+
+function loadTelnyxCreds(): TelnyxCreds {
   if (!existsSync(TELNYX_CREDS)) {
     throw new Error(`cannot read ${TELNYX_CREDS}`);
   }
 
-  const raw = JSON.parse(readFileSync(TELNYX_CREDS, 'utf-8')) as { api_key?: string };
+  const raw = JSON.parse(readFileSync(TELNYX_CREDS, 'utf-8')) as {
+    api_key?: string;
+    from_number?: string;
+  };
   const apiKey = raw.api_key?.trim();
   if (!apiKey) {
     throw new Error(`.api_key missing in ${TELNYX_CREDS}`);
   }
-  return apiKey;
+  const fromNumber = raw.from_number?.trim();
+  if (!fromNumber) {
+    throw new Error(
+      `.from_number missing in ${TELNYX_CREDS} — add your Telnyx-provisioned E.164 number (e.g. "from_number": "+15551234567") to the same file that holds api_key`,
+    );
+  }
+  return { apiKey, fromNumber };
 }
 
 function loadApproval(paths: BusPaths, approvalId: string): Approval {
@@ -61,14 +74,15 @@ export async function sendSms(
   text: string,
   opts: { sendReal?: boolean; approvedBy?: string } = {},
 ): Promise<SendSmsResult> {
-  const payload = { from: TELNYX_FROM, to, text };
+  const { apiKey, fromNumber } = loadTelnyxCreds();
+  const payload = { from: fromNumber, to, text };
 
   if (!opts.sendReal) {
     return {
       ok: true,
       mode: 'dry-run',
       approvalId: opts.approvedBy ?? null,
-      from: TELNYX_FROM,
+      from: fromNumber,
       to,
       text,
       payload,
@@ -80,7 +94,6 @@ export async function sendSms(
   }
 
   validateSmsApproval(paths, opts.approvedBy);
-  const apiKey = loadTelnyxApiKey();
 
   const response = await fetch('https://api.telnyx.com/v2/messages', {
     method: 'POST',
@@ -106,7 +119,7 @@ export async function sendSms(
     ok: true,
     mode: 'sent',
     approvalId: opts.approvedBy,
-    from: TELNYX_FROM,
+    from: fromNumber,
     to,
     text,
     payload,

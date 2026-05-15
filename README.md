@@ -96,7 +96,11 @@ claude ~/cortextos
 
 `/onboarding` handles dependency checks, org setup, bot creation, PM2 config, and dashboard launch. Your Orchestrator comes online in Telegram and finishes its own setup there.
 
-More setup details in [CONTRIBUTING.md](./CONTRIBUTING.md).
+### Skool members — start here
+
+If you joined via the Skool community and want the two reference personas (Maintenance Director + Leasing Coordinator) running in 30 minutes, follow [SKOOL-INSTALL.md](./SKOOL-INSTALL.md) instead of the install script above. It's a linear happy-path guide with all credentials pre-listed.
+
+More setup details in [CONTRIBUTING.md](./CONTRIBUTING.md) and the environment variable reference in [README.envs.md](./README.envs.md).
 
 ---
 
@@ -108,6 +112,8 @@ More setup details in [CONTRIBUTING.md](./CONTRIBUTING.md).
 | `analyst` | System health, metrics, theta-wave autoresearch. |
 | `agent` | General-purpose worker. Base for specialist agents. |
 | `agent-codex` | Codex-runtime worker, scaffolds with `runtime: codex-app-server` and `model: gpt-5-codex` (see `templates/agent-codex/`) |
+| `agent-maintenance-director` | PM persona — work-order triage, vendor dispatch coordination, resident comms, follow-up tracking. Shipped with the Skool release. |
+| `agent-leasing-coordinator` | PM persona — prospect intake, showings, applications, lease docs, move-in coordination. Shipped with the Skool release. |
 | `property-management/agent` | Pre-configured for PropertyMeld + maintenance ops. |
 
 Add a codex agent the same way you add a claude agent:
