@@ -11,6 +11,8 @@
 </div>
 
 > **Who this is for:** Property management operators (single-owner, small team, or growing portfolio) who want AI agents handling work-order triage, vendor dispatch, leasing pipeline, and resident comms — running on your Mac mini or Linux box, controlled from Telegram. Skool community install path takes ~30 minutes.
+>
+> **Self-hosted by design:** AscendOps runs on your Mac mini, Linux VPS, or Windows machine. Your data, credentials, and Slack tokens never touch our infrastructure — there is no managed SaaS tier and never will be.
 
 ---
 
@@ -49,7 +51,7 @@ Built for:
 
 Not built for:
 - Single-prompt automations — use the Claude API directly.
-- Cloud-only deployments — today AscendOps runs on your local Mac or Linux box, not in your cloud account. Cloud path is on the roadmap.
+- Cloud-only deployments — AscendOps is self-hosted by design. Runs on your Mac mini, Linux VPS, or Windows machine. There is no managed SaaS tier.
 
 ---
 
@@ -184,6 +186,7 @@ Every external action (email, deploy, delete, financial) requires explicit human
 - Property Meld integration (read + write via Nexus API)
 - Skool community install path (this README + SKOOL-INSTALL.md)
 - Telnyx SMS layer with credential abstraction (no hardcoded numbers; pulls from your local creds file)
+- Slack integration + human-team-member roster (route work to teammates by Slack handle alongside agent personas)
 - Tirith post-install security layer pointer
 
 **In flight (next ~30 days):**
@@ -195,8 +198,6 @@ Every external action (email, deploy, delete, financial) requires explicit human
 **Longer horizon:**
 - Additional PM software bindings beyond Property Meld (AppFolio, Buildium, Rentvine, Rent Manager — order driven by community demand)
 - Telnyx Voice AI agent for inbound vendor + tenant calls
-- Cloud-hosted deploy path (your Mac mini today → managed cloud later)
-- Slack + human-team-member roster integration
 
 ---
 
