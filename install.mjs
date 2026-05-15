@@ -525,7 +525,11 @@ if (existsSync(INSTALL_DIR)) {
     if (ghAuthed) {
       log(`Forking ${REPO_OWNER_PATH} to your GitHub account (gh CLI authed)...`);
       try {
-        run(`gh repo fork ${REPO_OWNER_PATH} --clone=false --remote=false`);
+        // gh CLI rejects `--remote` (including `--remote=false`) when a
+        // repository argument is provided: "the --remote flag is unsupported
+        // when a repository argument is provided". Pass `--clone=false` only
+        // and add the upstream remote manually after the clone below.
+        run(`gh repo fork ${REPO_OWNER_PATH} --clone=false`);
         const ghUser = run('gh api user --jq .login');
         const forkUrl = `https://github.com/${ghUser}/${REPO_NAME}.git`;
         log(`Cloning your fork to ${INSTALL_DIR}...`);
@@ -534,7 +538,21 @@ if (existsSync(INSTALL_DIR)) {
         ok(`Forked + cloned (origin = your fork, upstream = ${REPO_OWNER_PATH})`);
         ghForkOk = true;
       } catch (err) {
-        warn(`gh repo fork failed (${err.message?.slice(0, 80) || 'unknown'}) — falling back to plain clone`);
+        // Surface the full error to stderr so future install failures are
+        // diagnosable. execSync wraps the child stderr in err.stderr, so
+        // include it explicitly — err.message alone is just "Command failed".
+        // Truncating to 80 chars previously hid the ship-blocker that caused
+        // this fix; keep the user-facing line short but log full context.
+        const stderrText = err?.stderr ? err.stderr.toString() : '';
+        const stdoutText = err?.stdout ? err.stdout.toString() : '';
+        const fullErr = [err?.message || String(err), stderrText && `stderr: ${stderrText}`, stdoutText && `stdout: ${stdoutText}`]
+          .filter(Boolean)
+          .join('\n');
+        console.error(`\n[install] gh repo fork failed — full error:\n${fullErr}\n`);
+        // Pick the most informative single line for the user-facing warn:
+        // the first non-empty line of stderr is usually the real reason.
+        const userLine = (stderrText.split('\n').find(l => l.trim()) || err?.message || 'unknown').slice(0, 160);
+        warn(`gh repo fork failed (${userLine}) — falling back to plain clone`);
       }
     } else {
       info('gh CLI installed but not authed — run `gh auth login` later to enable contributing back. Falling back to plain clone.');
