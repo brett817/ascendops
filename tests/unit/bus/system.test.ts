@@ -237,6 +237,23 @@ describe('Bus System', () => {
       expect(report.agents[0].stale).toBe(true);
     });
 
+    it('strips "(by <author>)" suffix from generated-md timestamps', () => {
+      // `cortextos goals generate-md` writes `2026-05-18T11:35:27Z (by dane)`.
+      // Without the strip, Date() returns Invalid Date and the cron sees
+      // parse_error on every agent.
+      const agentDir = join(testDir, 'orgs', 'myorg', 'agents', 'worker');
+      mkdirSync(agentDir, { recursive: true });
+      const recentDate = new Date(Date.now() - 86400000).toISOString();
+      writeFileSync(
+        join(agentDir, 'GOALS.md'),
+        `# Goals\n\n## Updated\n${recentDate} (by dane)\n\nSome goal`,
+      );
+
+      const report = checkGoalStaleness(testDir, 7);
+      expect(report.agents[0].status).toBe('fresh');
+      expect(report.agents[0].stale).toBe(false);
+    });
+
     it('returns empty report when no orgs directory', () => {
       const report = checkGoalStaleness(testDir);
       expect(report.summary.total).toBe(0);

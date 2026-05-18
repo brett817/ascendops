@@ -326,8 +326,10 @@ export function checkGoalStaleness(
         continue;
       }
 
-      // Parse ISO 8601 timestamp
-      const parsedDate = new Date(updatedLine);
+      // Parse ISO 8601 timestamp. Strip the " (by <author>)" suffix that
+      // `cortextos goals generate-md` appends so Date() doesn't choke on it.
+      const timestampOnly = updatedLine.replace(/\s*\([^)]*\)\s*$/, '').trim();
+      const parsedDate = new Date(timestampOnly);
       if (isNaN(parsedDate.getTime())) {
         agents.push({
           agent: agentName,
