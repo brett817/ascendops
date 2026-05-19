@@ -761,10 +761,12 @@ busCommand
   .command('check-goal-staleness')
   .description('Detect agents with stale GOALS.md')
   .option('--threshold <days>', 'Staleness threshold in days', '7')
-  .action((opts: { threshold: string }) => {
+  .option('--format <format>', 'Output format (json only; accepted for compatibility)', 'json')
+  .action((opts: { threshold: string; format: string }) => {
     const env = resolveEnv();
     const projectRoot = env.projectRoot || env.frameworkRoot || process.cwd();
     const report = checkGoalStaleness(projectRoot, parseInt(opts.threshold, 10));
+    // --format is accepted for compatibility; only json is emitted (no other shapes exist).
     console.log(JSON.stringify(report, null, 2));
   });
 
