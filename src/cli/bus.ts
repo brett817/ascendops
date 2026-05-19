@@ -70,6 +70,76 @@ function checkDeliverableRequirement(taskId: string, frameworkRoot: string, org:
 export const busCommand = new Command('bus')
   .description('Bus commands for agent messaging, tasks, and events');
 
+type OutboundLintResult = {
+  ok: boolean;
+  phrase?: string;
+  reason?: string;
+};
+
+const BANNED_POSTURE_PATTERNS: RegExp[] = [
+  /\bsleep posture\b/i,
+  /\bstanding by\b/i,
+  /\bstandby\b/i,
+  /\bparked\b/i,
+  /\bon-?deck\b/i,
+  /\bidle\b/i,
+  /\basleep\b/i,
+  /\bsleeping\b/i,
+  /\bwaiting[- ]on[- ]\w+\b/i,
+  /\bholding\b/i,
+];
+
+const PASSIVE_POSTURE_PATTERNS: RegExp[] = [
+  /\b(standing by|standby|parked|idle|asleep|sleeping|holding)\b/i,
+  /\bwaiting\b/i,
+];
+
+const ACTIVE_WORK_CONTEXT = /\b(working on|implementing|building|testing|reviewing|shipping|debugging|patching|running|opened pr|pr #|commit\b|merging|validating)\b/i;
+const NEXT_SIGNAL_CONTEXT = /\b(next dispatch|next heartbeat|when .* (lands|arrives|finishes)|after .* (lands|arrives|finishes)|upon .* (signal|review|feedback))\b/i;
+
+function lintOutboundMessage(text: string): OutboundLintResult {
+  for (const re of BANNED_POSTURE_PATTERNS) {
+    const m = text.match(re);
+    if (m) {
+      return {
+        ok: false,
+        phrase: m[0],
+        reason: 'banned jargon',
+      };
+    }
+  }
+
+  const hasPassive = PASSIVE_POSTURE_PATTERNS.some((re) => re.test(text));
+  if (hasPassive) {
+    const hasActiveContext = ACTIVE_WORK_CONTEXT.test(text) || NEXT_SIGNAL_CONTEXT.test(text);
+    if (!hasActiveContext) {
+      const m = text.match(PASSIVE_POSTURE_PATTERNS[0]) || text.match(PASSIVE_POSTURE_PATTERNS[1]);
+      return {
+        ok: false,
+        phrase: m?.[0] ?? 'passive posture framing',
+        reason: 'passive posture framing without active-work or specific next-signal context',
+      };
+    }
+  }
+
+  return { ok: true };
+}
+
+function enforceOutboundLintOrExit(text: string, skipLint: boolean | undefined): void {
+  if (skipLint) return;
+  const result = lintOutboundMessage(text);
+  if (!result.ok) {
+    const phrase = result.phrase ?? 'unknown';
+    const reason = result.reason ?? 'policy violation';
+    console.error(
+      `Outbound message blocked by comms-lint (${reason}). Violating phrase: "${phrase}". ` +
+      'Active-work framing or specific next-signal trigger only. ' +
+      'Use --skip-lint only for legitimate quoted/post-mortem usage.'
+    );
+    process.exit(1);
+  }
+}
+
 function resolveAgentBusPaths(agentOverride?: string) {
   const env = resolveEnv();
   const agentName = agentOverride ?? env.agentName;
@@ -87,7 +157,8 @@ busCommand
   .argument('<text>', 'Message text')
   .argument('[reply-to]', 'Reply to message ID (optional positional form)')
   .option('--reply-to <id>', 'Reply to message ID')
-  .action((to: string, priority: string, text: string, replyToArg: string | undefined, opts: { replyTo?: string }) => {
+  .option('--skip-lint', 'Skip outbound comms lint (for quoting/post-mortems only)', false)
+  .action((to: string, priority: string, text: string, replyToArg: string | undefined, opts: { replyTo?: string; skipLint?: boolean }) => {
     // Accept reply-to as either positional arg or --reply-to flag (P2 fix #9)
     const effectiveReplyTo = opts.replyTo ?? replyToArg;
     const validPriorities: Priority[] = ['urgent', 'high', 'normal', 'low'];
@@ -105,6 +176,7 @@ busCommand
 
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+    enforceOutboundLintOrExit(text, opts.skipLint);
 
     // Warn if target agent doesn't exist (check project dir)
     const { existsSync } = require('fs');
@@ -1038,11 +1110,13 @@ busCommand
   .option('--image <path>', 'Send a photo with caption')
   .option('--file <path>', 'Send a document/file with caption (any file type)')
   .option('--plain-text', 'Skip Telegram Markdown parsing entirely. Use this when the message contains unescaped _, *, backtick, or [ that would otherwise trip the Markdown parser. Without this flag, sendMessage still retries once with parse_mode disabled on a parse-entity error — so it is purely an opt-in to save the retry roundtrip.', false)
-  .action(async (chatId: string, message: string, opts: { image?: string; file?: string; plainText?: boolean }) => {
+  .option('--skip-lint', 'Skip outbound comms lint (for quoting/post-mortems only)', false)
+  .action(async (chatId: string, message: string, opts: { image?: string; file?: string; plainText?: boolean; skipLint?: boolean }) => {
     // Codex agents emit literal '\n'/'\t' inside single-quoted bash where bash
     // does not expand escapes, so they arrive at argv as 2-char literals and
     // Telegram renders them as visible text. Normalize before send + log.
     message = message.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+    enforceOutboundLintOrExit(message, opts.skipLint);
     // Resolve bot token: agent .env first, then process.env
     const env = resolveEnv();
     let botToken = '';
@@ -1714,9 +1788,11 @@ busCommand
   .argument('<agent>', 'Agent name sending the reply')
   .argument('<reply>', 'Reply text')
   .argument('[msg-id]', 'Inbox message ID to ACK')
-  .action((agent: string, reply: string, msgId?: string) => {
+  .option('--skip-lint', 'Skip outbound comms lint (for quoting/post-mortems only)', false)
+  .action((agent: string, reply: string, msgId?: string, opts?: { skipLint?: boolean }) => {
     // Same literal '\n'/'\t' normalize as send-telegram (codex agent fix).
     reply = reply.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+    enforceOutboundLintOrExit(reply, opts?.skipLint);
     const { mkdirSync, appendFileSync } = require('fs');
     const { join } = require('path');
     const env = resolveEnv();
