@@ -8,6 +8,7 @@ import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTa
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
 import { updateHeartbeat, readAllHeartbeats } from '../bus/heartbeat.js';
+import { queryCap } from '../bus/query-cap.js';
 import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, postActivity } from '../bus/system.js';
 import { createExperiment, runExperiment, evaluateExperiment, listExperiments, gatherContext, manageCycle, loadExperimentConfig } from '../bus/experiment.js';
 import { browseCatalog, installCommunityItem, prepareSubmission, submitCommunityItem } from '../bus/catalog.js';
@@ -590,6 +591,25 @@ busCommand
       const label = hb.display_name ? `${hb.display_name} (${hb.agent})` : hb.agent;
       console.log(`${label} (${hb.org}) — ${hb.status}${staleFlag} — last seen ${hb.last_heartbeat}`);
       if (hb.current_task) console.log(`  task: ${hb.current_task}`);
+    }
+  });
+
+busCommand
+  .command('query-cap')
+  .description('Query real Anthropic usage cap (5h + weekly %) for the current or named agent')
+  .option('--agent <name>', 'Agent name (defaults to CTX_AGENT_NAME)')
+  .action(async (opts: { agent?: string }) => {
+    const env = resolveEnv();
+    const agentName = opts.agent || env.agentName;
+    try {
+      const readout = await queryCap({ agent: agentName });
+      // Exit 0 even on estimate fallback — the source-layer module signals
+      // degraded paths via the `source` field, not via exit code.
+      console.log(JSON.stringify(readout));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`query-cap: unexpected error: ${msg}`);
+      process.exit(1);
     }
   });
 
