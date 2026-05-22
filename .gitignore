@@ -57,12 +57,7 @@ docs/
 # so last-match-wins precedence takes effect on durable/ specifically.
 # Strict containment: only orgs/<org>/docs/durable/** is the intended carve-out;
 # ALL other orgs/ contents (agents/, secrets, knowledge, brand-voice, scripts,
-# community, nested .gitignore, etc.) stay ignored via aggressive re-exclude.
-# Known side effect: nested orgs/.gitignore line 8 (!**/*.env.example) was always
-# trying to track .env.example template files but the parent orgs/ lock hid them.
-# Post-carve-out, those template files become visible as the nested rule intended.
-# They are placeholder-only by design — no real secrets — but flagged here for
-# audit-trail clarity per the org-state-persistence-policy doc §4.2 amendments.
+# community, etc.) stay ignored via aggressive re-exclude.
 !orgs/
 orgs/*
 !orgs/*/
