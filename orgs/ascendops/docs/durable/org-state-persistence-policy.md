@@ -317,3 +317,57 @@ Sign off on the 3-class taxonomy + 2-line gitignore carve-out per §4.2, then di
 - Inventory classified: 113 files into 14 subtypes → 3 macro-classes
 - Open questions surfaced: 5 (front-matter enforcement, superseded placement, taxonomy edge cases, cross-org timing, auto-commit interaction)
 - Path-2 + path-3 eliminated with single-line rationale each — kept choice space minimal so Dane can decide fast
+
+---
+
+## 10. Migration Status — Post-Cleanup (2026-05-22)
+
+**Tracking entry for §5 migration completion + non-durable cleanup pass.** Appended by Collie 2026-05-22 ~18:25 UTC after PR #45 + the live/+ephemeral/ sweep landed.
+
+### 10.1 Final classification state
+
+| Class | Destination | Count | Tracked? | Tracking notes |
+|---|---|---|---|---|
+| DURABLE | `orgs/ascendops/docs/durable/` | 90 + 1 policy doc = **91** | Yes (carve-out fires) | Migrated via PR #45 (commit 2826702, merged 2026-05-22T16:30:25Z) |
+| LIVE-COLLAB | `orgs/ascendops/docs/live/` | **11** | No (intentional — gitignored per §4.4) | Moved via this PR. Multi-agent mid-cycle writes survive via daily auto-commit snapshot, NOT git tracking |
+| EPHEMERAL | `orgs/ascendops/docs/ephemeral/` | **10** | No (intentional — gitignored per §4.4) | Moved via this PR. Bounded TTL; weekly housekeeping prunes per Aussie's lane |
+| **Aussie-deferred at root** | `orgs/ascendops/docs/` | **2** | No (will promote to durable/ in Aussie follow-up PR) | `voice-coordinator-phase-4-smoke-FINAL-2026-05-17.md` (Nit 5 — Aussie reclassifies DURABLE-RESEARCH per §1.4 pattern) + `telnyx-voice-agent-setup-guide-2026-05-19.md` (Nit 6 — Aussie reclassifies DURABLE-RUNBOOK per voice-infra family) |
+
+**Total accounted for: 91 + 11 + 10 + 2 = 114** (113 originally inventoried in §1.1 + the policy doc itself = 114 file ledger).
+
+### 10.2 Non-doc cleanup in this PR
+
+- `orgs/ascendops/secrets.env.bak.20260521T185508Z` — DELETED. Stale backup from 2026-05-21 18:55Z. Out of scope for the 3-class taxonomy but caught during the same cleanup pass per Dane dispatch 2026-05-22 ~18:01 UTC.
+
+### 10.3 Heuristic miss banked (lesson for future classification work)
+
+My §5 filename-heuristic rule `*-setup-guide-YYYY-MM-DD.md → EPHEMERAL-DRAFT` was too aggressive on the `-setup-guide-` suffix. `telnyx-voice-agent-setup-guide-2026-05-19.md` is actually a foundational runbook for active voice infrastructure (same operational-record family as voice-coordinator-phase-4-smoke-FINAL). Caught post-merge by Codex bot review of PR #45 (Nit 6).
+
+**Banked rule for future classification passes:** filename heuristics catch most cases but voice/telnyx infra docs need a manual-reclassify pass like Aussie did §1.4 to override false-EPHEMERAL hits. Voice/Telnyx infra docs with `-setup-guide-`, `-smoke-FINAL-`, `-audit-`, or similar suffixes default to DURABLE unless content review confirms ephemeral.
+
+### 10.4 Post-cleanup verify gates
+
+```bash
+# Run from repo root
+ls orgs/ascendops/docs/*.md 2>/dev/null | wc -l
+# Expect: 2 (Aussie-deferred Nit 5 + Nit 6 only)
+
+ls orgs/ascendops/docs/live/*.md 2>/dev/null | wc -l
+# Expect: 11
+
+ls orgs/ascendops/docs/ephemeral/ 2>/dev/null | wc -l
+# Expect: 10 (8 .md + 2 .html)
+
+ls orgs/ascendops/docs/durable/*.md 2>/dev/null | wc -l
+# Expect: 91 (90 migrated + this policy doc)
+
+ls orgs/ascendops/secrets.env.bak.* 2>/dev/null | wc -l
+# Expect: 0 (deleted)
+```
+
+### 10.5 Open follow-ups (Aussie's PR scope)
+
+1. Promote 2 Aussie-deferred files to `durable/` (Nit 5 + Nit 6)
+2. Update §10.1 count table to reflect 93 durable + 11 live + 10 ephemeral + 0 root after Aussie's PR merges
+3. Address §6 open questions 1-5 as needed
+4. Address peer-review nits 1-4 from PR #44 follow-up (false side-effect copy, live/+ephemeral/ clarification, nested gitignore disclosure, narrow `**/*-token*` pattern)
