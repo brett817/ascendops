@@ -51,6 +51,27 @@ tests/playwright/dashboard-ui.spec.ts
 # Local ops docs (personal, not for public repo)
 docs/
 
+# Carve-out (org-state-persistence-policy 2026-05-22): tracked durable org docs.
+# Chain re-includes parent dirs because gitignore cannot re-include files under
+# an ignored parent dir. Applied AFTER both orgs/ (line 15) and docs/ (line 52)
+# so last-match-wins precedence takes effect on durable/ specifically.
+# Strict containment: only orgs/<org>/docs/durable/** is the intended carve-out;
+# ALL other orgs/ contents (agents/, secrets, knowledge, brand-voice, scripts,
+# community, nested .gitignore, etc.) stay ignored via aggressive re-exclude.
+# Known side effect: nested orgs/.gitignore line 8 (!**/*.env.example) was always
+# trying to track .env.example template files but the parent orgs/ lock hid them.
+# Post-carve-out, those template files become visible as the nested rule intended.
+# They are placeholder-only by design — no real secrets — but flagged here for
+# audit-trail clarity per the org-state-persistence-policy doc §4.2 amendments.
+!orgs/
+orgs/*
+!orgs/*/
+orgs/*/*
+!orgs/*/docs/
+orgs/*/docs/*
+!orgs/*/docs/durable/
+!orgs/*/docs/durable/**
+
 # Internal developer/planning notes (not for public repo)
 KNOWN-ISSUES.md
 WINDOWS-IMPLEMENTATION-PLAN.md
