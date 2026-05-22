@@ -437,7 +437,7 @@ Create the Railway project + service that will host the gateway, then connect it
 
 3. Connect the GitHub repo for auto-deploy on `main`:
    - Railway dashboard → Project → Settings → Source → connect repo, set deploy branch = `main`.
-   - Or via CLI: `railway service connect --repo noogalabs/blue-voice-gateway --branch main`.
+   - Note: the Railway CLI does not expose a `service connect` subcommand for repo wire-up (current `railway service` subcommands: list/link/delete/status/logs/redeploy/restart/scale). Use the dashboard for source-repo linkage.
 
 4. Build + start config (auto-detected; override only if needed):
    - Build command: `npm install && npm run build`
