@@ -225,6 +225,8 @@ orgs/*/docs/*
 | 6 | `orgs/ascendops/agents/aussie/memory/2026-05-22.md` | IGNORED | ✓ IGNORED |
 | 7 | `orgs/ascendops/docs/durable/superseded/foo.md` | NOT IGNORED | ✓ NOT IGNORED |
 
+**Note on `orgs/.gitignore` (correction to PR #44 disclosure):** A nested `orgs/.gitignore` file does exist on some local machines (mine has a `cortextos-orgs-private — backup gitignore` from 2026-05-10 with belt-and-suspenders secret/PII patterns), BUT the file is itself in the ignored space — not tracked by git, not present on clean clones. The PR #44 body originally claimed a "Known Side Effect" where post-carve-out the nested file's `!**/*.env.example` rule would expose `.env.example` templates. That claim was correct for my LOCAL machine state but FALSE for the merged state and reviewer experience: on clean clones, the nested file doesn't exist, so the rule doesn't apply, and the carve-out's `orgs/*/*` re-ignore correctly keeps `.env.example` files hidden. The PR #44 disclosure was scope-confusion between local-state and merged-state; this amendment captures the correction (caught by Collie's peer review of PR #44).
+
 Net `.gitignore` after change:
 
 ```gitignore

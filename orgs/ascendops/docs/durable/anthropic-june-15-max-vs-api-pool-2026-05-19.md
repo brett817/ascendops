@@ -35,7 +35,7 @@ API-rate burn-down inside Pool 2 ([Anthropic API pricing](https://www.finout.io/
 
 ## Math against AscendOps fleet (current)
 
-**Empirical anchor**: David's actual readout 2026-05-18: 5h-window 11%, weekly 3% of Max 20x unified limits ([incident memory](../../docs/ — captured by cap-watchdog PR #37)).
+**Empirical anchor**: David's actual readout 2026-05-18: 5h-window 11%, weekly 3% of Max 20x unified limits (captured by [cap-watchdog PR #37](https://github.com/noogalabs/ascendops/pull/37)).
 
 **Assumption flagged**: we're on **Max 20x at $200/mo** — confirm if I'm wrong. Math below scales linearly down to Max 5x ($100 credit) and Pro ($20 credit).
 
