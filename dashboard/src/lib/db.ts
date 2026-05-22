@@ -11,6 +11,41 @@ const DB_PATH = ctxRoot
   ? path.join(ctxRoot, 'dashboard', `cortextos-${instanceId}.db`)
   : path.join(process.cwd(), '.data', `cortextos-${instanceId}.db`);
 
+const SQLITE_BUSY_RETRIES = 8;
+const SQLITE_BUSY_BASE_DELAY_MS = 50;
+
+function sleepMs(ms: number): void {
+  // Block without CPU spin; safe here because db init is a startup path.
+  const sab = new SharedArrayBuffer(4);
+  const arr = new Int32Array(sab);
+  Atomics.wait(arr, 0, 0, ms);
+}
+
+function isSqliteBusy(err: unknown): boolean {
+  return (err as NodeJS.ErrnoException & { code?: string })?.code === 'SQLITE_BUSY';
+}
+
+function withSqliteBusyRetry<T>(label: string, fn: () => T): T {
+  let attempt = 0;
+  let lastErr: unknown;
+  while (attempt <= SQLITE_BUSY_RETRIES) {
+    try {
+      return fn();
+    } catch (err: unknown) {
+      if (!isSqliteBusy(err)) throw err;
+      lastErr = err;
+      if (attempt === SQLITE_BUSY_RETRIES) break;
+      // Linear backoff with tiny deterministic jitter.
+      const delayMs = SQLITE_BUSY_BASE_DELAY_MS * (attempt + 1) + (attempt % 3) * 7;
+      sleepMs(delayMs);
+      attempt += 1;
+    }
+  }
+  throw new Error(`[db] ${label} failed after ${SQLITE_BUSY_RETRIES + 1} SQLITE_BUSY retries`, {
+    cause: lastErr,
+  });
+}
+
 function createDatabase(): Database.Database {
   // Ensure .data directory exists
   const dir = path.dirname(DB_PATH);
@@ -26,22 +61,25 @@ function createDatabase(): Database.Database {
   db.pragma('busy_timeout = 10000');
 
   // Switch to WAL mode (requires exclusive lock on the DB file).
-  // Guard against SQLITE_BUSY when multiple Next.js build workers open the DB
-  // simultaneously: if the switch fails, check whether another worker already
-  // succeeded. If so, continue; otherwise re-throw.
-  try {
-    db.pragma('journal_mode = WAL');
-  } catch (err: unknown) {
-    if ((err as NodeJS.ErrnoException & { code?: string }).code !== 'SQLITE_BUSY') throw err;
-    const rows = db.pragma('journal_mode') as { journal_mode: string }[];
-    if (rows[0]?.journal_mode !== 'wal') throw err;
-    // Another worker already switched to WAL — we're fine.
-  }
+  // In CI/Next page-data collection, multiple workers can race to initialize.
+  // Retry boundedly on SQLITE_BUSY, and tolerate "already switched by another
+  // process" by checking current journal mode.
+  withSqliteBusyRetry('journal_mode WAL init', () => {
+    try {
+      db.pragma('journal_mode = WAL');
+    } catch (err: unknown) {
+      if (!isSqliteBusy(err)) throw err;
+      const rows = db.pragma('journal_mode') as { journal_mode: string }[];
+      if (rows[0]?.journal_mode === 'wal') return;
+      throw err;
+    }
+  });
   db.pragma('synchronous = NORMAL');
   db.pragma('foreign_keys = ON');
 
-  // Run schema initialization
-  initializeSchema(db);
+  // Run schema initialization. This can contend when multiple workers open the
+  // same DB path at startup, so apply the same bounded SQLITE_BUSY retry.
+  withSqliteBusyRetry('schema init', () => initializeSchema(db));
 
   return db;
 }
