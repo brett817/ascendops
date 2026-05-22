@@ -37,7 +37,7 @@ describe('Task Management', () => {
         priority: 'high',
       });
 
-      expect(taskId).toMatch(/^task_\d+_\d{6}$/);
+      expect(taskId).toMatch(/^task_\d+_\d{8}$/);
 
       const content = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8'));
 
