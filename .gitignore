@@ -55,9 +55,11 @@ docs/
 # Chain re-includes parent dirs because gitignore cannot re-include files under
 # an ignored parent dir. Applied AFTER both orgs/ (line 15) and docs/ (line 52)
 # so last-match-wins precedence takes effect on durable/ specifically.
-# Strict containment: only orgs/<org>/docs/durable/** is the intended carve-out;
-# ALL other orgs/ contents (agents/, secrets, knowledge, brand-voice, scripts,
-# community, etc.) stay ignored via aggressive re-exclude.
+# Strict containment: only orgs/<org>/docs/durable/** + orgs/<org>/knowledge.md
+# are the intended carve-outs; ALL other orgs/ contents (agents/, secrets,
+# brand-voice, scripts, community, etc.) stay ignored via aggressive re-exclude.
+# knowledge.md added 2026-05-23 per Option A of C4 dispatch — it IS doctrine per
+# Memory Architecture Policy (4/18), same class as durable/ contents.
 !orgs/
 orgs/*
 !orgs/*/
@@ -66,6 +68,7 @@ orgs/*/*
 orgs/*/docs/*
 !orgs/*/docs/durable/
 !orgs/*/docs/durable/**
+!orgs/*/knowledge.md
 
 # Internal developer/planning notes (not for public repo)
 KNOWN-ISSUES.md
