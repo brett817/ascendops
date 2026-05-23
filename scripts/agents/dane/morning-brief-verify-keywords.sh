@@ -16,6 +16,13 @@
 #     → exit 1; PROCEED with task creation as normal
 #   NO-KEYWORDS: title too generic; cannot verify by keyword
 #     → exit 1; proceed (graceful fallback — manual judgment)
+#   QUERY-FAILED: gh pr list failed for one or more keyword/repo combos
+#     → exit 2; CANNOT VERIFY — surface to caller for judgment. Common
+#       causes: gh auth token expired, GitHub API throttle, network outage.
+#       The morning-review skill should either retry, surface the failure
+#       to David, or proceed with explicit "could not verify" annotation.
+#       (Aussie + Codex bot caught the silent-swallow false-negative on PR #50,
+#       2026-05-23 — defeats the verify's whole point.)
 #
 # Trigger context: PR #14 noogalabs/blue-voice-gateway "/version refactor"
 # merged 02:57Z but Dane's morning brief 5/22 listed it as a proposed task
@@ -69,14 +76,33 @@ SINCE=$(date -u -v-${WINDOW_HOURS}H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
 # Repos to search — keep aligned with active noogalabs surface
 REPOS=(noogalabs/cortextos noogalabs/ascendops noogalabs/cli-anything-pm noogalabs/blue-voice-gateway)
 
+TMP_OUT="/tmp/morning-brief-verify-$$.$RANDOM"
+trap 'rm -f "$TMP_OUT"' EXIT
+
 for kw in "${TOP_KEYWORDS[@]}"; do
   for repo in "${REPOS[@]}"; do
     # Restrict to PR title (in:title) — full-text body match catches PRs that
     # just mention the keyword in passing (false-positive risk). Title-only =
     # high signal that the PR is actually ABOUT this topic.
-    HIT=$(gh pr list --repo "$repo" --state merged \
-          --search "$kw in:title merged:>$SINCE" \
-          --json title,url,mergedAt --jq '.[0] // empty' 2>/dev/null) || continue
+    #
+    # Capture stdout to temp file + stderr to GH_ERR + exit code separately.
+    # The previous form (... 2>/dev/null) || continue) silently swallowed
+    # auth/throttle/network failures as "no match" — that defeats the verify
+    # safety check entirely. Distinguish QUERY-FAILED from NOT-FOUND.
+    # Merge stdout+stderr into TMP_OUT; on success contains JSON, on failure
+    # contains the gh error message. Single-redirect avoids subtle bash
+    # ordering gotchas with separate stderr capture.
+    gh pr list --repo "$repo" --state merged \
+       --search "$kw in:title merged:>$SINCE" \
+       --json title,url,mergedAt --jq '.[0] // empty' \
+       > "$TMP_OUT" 2>&1
+    GH_EXIT=$?
+    if [ "$GH_EXIT" -ne 0 ]; then
+      ERR_PREVIEW=$(head -c 200 "$TMP_OUT" | tr '\n' ' ')
+      echo "QUERY-FAILED: gh pr list failed for repo=$repo keyword=$kw exit=$GH_EXIT err=\"$ERR_PREVIEW\""
+      exit 2
+    fi
+    HIT=$(cat "$TMP_OUT")
     if [ -n "$HIT" ]; then
       URL=$(echo "$HIT" | jq -r .url)
       MERGED=$(echo "$HIT" | jq -r .mergedAt)
