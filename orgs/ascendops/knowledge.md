@@ -187,7 +187,7 @@ Provided by David 2026-04-19. Use for any carrier registration (Telnyx; previous
 
 - **Business address:** 9305 Royal Shadows Dr., Chattanooga, TN 37421
 - **Business phone:** +16788156005 (David's cell)
-- **Website:** https://danaiq.com
+- **Website:** https://daneiq.com
 - **Entity type:** LLC
 - **Monthly SMS volume estimate:** 500–750
 - **Legal company name:** Dane IQ LLC
