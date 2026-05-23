@@ -127,4 +127,76 @@ describe('outbound comms lint', () => {
     const body = readFileSync(outPath, 'utf-8');
     expect(body).toContain('parked here until tomorrow');
   });
+
+  // ─── Telegram-only plain-talk lint (C5 dispatch 2026-05-22 by Dane) ──────
+
+  it('blocks send-telegram when message contains a PR number', async () => {
+    await expect(
+      busCommand.parseAsync(['send-telegram', '12345', 'The migration shipped via PR #45 - clean'], { from: 'user' })
+    ).rejects.toThrow();
+    expect(telegramSendSpy).not.toHaveBeenCalled();
+  });
+
+  it('blocks send-telegram when message contains a commit SHA', async () => {
+    await expect(
+      busCommand.parseAsync(['send-telegram', '12345', 'merge commit 9c9f1c65 landed'], { from: 'user' })
+    ).rejects.toThrow();
+    expect(telegramSendSpy).not.toHaveBeenCalled();
+  });
+
+  it('does NOT block send-telegram on plain numeric IDs (post-SHA-regex-tightening 2026-05-23)', async () => {
+    // SHA regex must require at least one hex letter; plain numeric IDs
+    // (phone numbers, dollar amounts, ticket numbers) must NOT block.
+    await busCommand.parseAsync(
+      ['send-telegram', '12345', 'Call back at 4233161234 about ticket 9876543'],
+      { from: 'user' },
+    );
+    expect(telegramSendSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('blocks send-telegram when message contains the cortextos framework name', async () => {
+    await expect(
+      busCommand.parseAsync(['send-telegram', '12345', 'cortextos updated overnight'], { from: 'user' })
+    ).rejects.toThrow();
+    expect(telegramSendSpy).not.toHaveBeenCalled();
+  });
+
+  it('blocks send-telegram by default when message contains an agent name', async () => {
+    await expect(
+      busCommand.parseAsync(['send-telegram', '12345', 'Codie just shipped the work'], { from: 'user' })
+    ).rejects.toThrow();
+    expect(telegramSendSpy).not.toHaveBeenCalled();
+  });
+
+  it('allows send-telegram with --explicit-naming when agent name is intentional', async () => {
+    await busCommand.parseAsync(
+      ['send-telegram', '12345', 'Codie just shipped the work', '--explicit-naming'],
+      { from: 'user' },
+    );
+    expect(telegramSendSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('does NOT apply Telegram patterns to send-message (agent-to-agent stays technical)', async () => {
+    await busCommand.parseAsync(
+      ['send-message', 'target-agent', 'normal', 'Codie shipped PR #45 commit 9c9f1c65 on cortextos repo'],
+      { from: 'user' },
+    );
+    expect(sendMessageSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('allows send-telegram with --skip-lint for legitimate quoted post-mortem references', async () => {
+    await busCommand.parseAsync(
+      ['send-telegram', '12345', 'Yesterday I quoted "PR #45" as a reference', '--skip-lint'],
+      { from: 'user' },
+    );
+    expect(telegramSendSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('allows clean send-telegram message that avoids all Telegram patterns', async () => {
+    await busCommand.parseAsync(
+      ['send-telegram', '12345', 'The migration shipped overnight - durable docs are now in git'],
+      { from: 'user' },
+    );
+    expect(telegramSendSpy).toHaveBeenCalledTimes(1);
+  });
 });

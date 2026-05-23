@@ -141,6 +141,105 @@ function enforceOutboundLintOrExit(text: string, skipLint: boolean | undefined):
   }
 }
 
+// ─── Telegram-only plain-talk patterns (locked 2026-05-22 by Dane C5 dispatch) ───
+// These fire ONLY on send-telegram (outbound to David). Agent-to-agent bus
+// comms stay technical/jargon-permissive — the new patterns catch engineer-
+// speak that confuses non-technical recipients.
+
+type TelegramLintRule = {
+  pattern: RegExp;
+  reason: string;
+  suggest?: string;
+};
+
+const TELEGRAM_BANNED_PATTERNS: TelegramLintRule[] = [
+  {
+    pattern: /\bpr #\d+\b/i,
+    reason: 'PR number leak (David tracks features not PR numbers)',
+    suggest: 'reference the feature/fix by what it does, e.g. "the migration" not "PR #45"',
+  },
+  {
+    pattern: /\bpull request #\d+\b/i,
+    reason: 'PR number leak',
+    suggest: 'reference the feature/fix by what it does',
+  },
+  {
+    // SHA shape: 7-40 hex chars AND must contain at least one a-f letter.
+    // Without the letter requirement the regex matched plain numeric IDs
+    // (phone numbers, dollar amounts, version codes) and blocked valid
+    // Telegram messages. (Aussie + Codex bot catch on PR #51, 2026-05-23.)
+    pattern: /\b(?=[0-9a-f]{7,40}\b)[0-9a-f]*[a-f][0-9a-f]*\b/i,
+    reason: 'commit SHA leak (engineer-speak)',
+    suggest: 'drop the SHA — describe the change instead',
+  },
+  {
+    pattern: /\bcortextos\b/i,
+    reason: 'framework brand leak (cortextos is the internal framework name)',
+    suggest: 'use "AscendOps" (the product David knows)',
+  },
+];
+
+const AGENT_NAME_PATTERN: TelegramLintRule = {
+  pattern: /\b(codie|collie|dane|aussie|blue|codex)\b/i,
+  reason: 'agent name in outbound Telegram (David usually wants the outcome not which agent shipped it)',
+  suggest: 'rephrase to describe the work, OR pass --explicit-naming to allow when naming is intentional',
+};
+
+function lintOutboundTelegramMessage(
+  text: string,
+  explicitNaming: boolean,
+): OutboundLintResult {
+  // First run the standard outbound lint (banned jargon + passive posture).
+  const baseResult = lintOutboundMessage(text);
+  if (!baseResult.ok) return baseResult;
+
+  // Then run Telegram-only banned patterns.
+  for (const rule of TELEGRAM_BANNED_PATTERNS) {
+    const m = text.match(rule.pattern);
+    if (m) {
+      return {
+        ok: false,
+        phrase: m[0],
+        reason: rule.suggest ? `${rule.reason} — ${rule.suggest}` : rule.reason,
+      };
+    }
+  }
+
+  // Agent names: BLOCK by default, but allow when caller asserts --explicit-naming.
+  if (!explicitNaming) {
+    const m = text.match(AGENT_NAME_PATTERN.pattern);
+    if (m) {
+      return {
+        ok: false,
+        phrase: m[0],
+        reason: AGENT_NAME_PATTERN.suggest
+          ? `${AGENT_NAME_PATTERN.reason} — ${AGENT_NAME_PATTERN.suggest}`
+          : AGENT_NAME_PATTERN.reason,
+      };
+    }
+  }
+
+  return { ok: true };
+}
+
+function enforceTelegramLintOrExit(
+  text: string,
+  skipLint: boolean | undefined,
+  explicitNaming: boolean | undefined,
+): void {
+  if (skipLint) return;
+  const result = lintOutboundTelegramMessage(text, !!explicitNaming);
+  if (!result.ok) {
+    const phrase = result.phrase ?? 'unknown';
+    const reason = result.reason ?? 'policy violation';
+    console.error(
+      `Outbound Telegram message blocked by comms-lint (${reason}). Violating phrase: "${phrase}". ` +
+      'Use --skip-lint for legitimate quoted/post-mortem usage, or --explicit-naming to allow agent names.'
+    );
+    process.exit(1);
+  }
+}
+
 function resolveAgentBusPaths(agentOverride?: string) {
   const env = resolveEnv();
   const agentName = agentOverride ?? env.agentName;
@@ -1133,12 +1232,13 @@ busCommand
   .option('--file <path>', 'Send a document/file with caption (any file type)')
   .option('--plain-text', 'Skip Telegram Markdown parsing entirely. Use this when the message contains unescaped _, *, backtick, or [ that would otherwise trip the Markdown parser. Without this flag, sendMessage still retries once with parse_mode disabled on a parse-entity error — so it is purely an opt-in to save the retry roundtrip.', false)
   .option('--skip-lint', 'Skip outbound comms lint (for quoting/post-mortems only)', false)
-  .action(async (chatId: string, message: string, opts: { image?: string; file?: string; plainText?: boolean; skipLint?: boolean }) => {
+  .option('--explicit-naming', 'Allow agent names in the message body (e.g. when David explicitly asked which agent did something)', false)
+  .action(async (chatId: string, message: string, opts: { image?: string; file?: string; plainText?: boolean; skipLint?: boolean; explicitNaming?: boolean }) => {
     // Codex agents emit literal '\n'/'\t' inside single-quoted bash where bash
     // does not expand escapes, so they arrive at argv as 2-char literals and
     // Telegram renders them as visible text. Normalize before send + log.
     message = message.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
-    enforceOutboundLintOrExit(message, opts.skipLint);
+    enforceTelegramLintOrExit(message, opts.skipLint, opts.explicitNaming);
     // Resolve bot token: agent .env first, then process.env
     const env = resolveEnv();
     let botToken = '';
