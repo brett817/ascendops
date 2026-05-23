@@ -373,3 +373,59 @@ ls orgs/ascendops/secrets.env.bak.* 2>/dev/null | wc -l
 2. Update §10.1 count table to reflect 93 durable + 11 live + 10 ephemeral + 0 root after Aussie's PR merges
 3. Address §6 open questions 1-5 as needed
 4. Address peer-review nits 1-4 from PR #44 follow-up (false side-effect copy, live/+ephemeral/ clarification, nested gitignore disclosure, narrow `**/*-token*` pattern)
+
+---
+
+## 11. Carve-out Expansion — knowledge.md (added 2026-05-23 via C4 dispatch)
+
+**Trigger:** Dane C4 dispatch to ship a knowledge.md stale-reference correction PR. Aussie surfaced that knowledge.md sits at `orgs/ascendops/knowledge.md` — outside the original carve-out which only covered `orgs/*/docs/durable/**`. Per Dane's Option A routing (locked 2026-05-23), the carve-out chain was extended to include `!orgs/*/knowledge.md` as a tracked entry.
+
+### 11.1 Why knowledge.md belongs in the tracked set
+
+Per the load-bearing Memory Architecture Policy (4/18 by David), knowledge.md is doctrine — same content class as the durable/ specs/policies/runbooks already tracked under §3. The original policy doc inadvertently scoped the carve-out to durable/ subdirs only, missing the org-root knowledge.md case.
+
+Leaving knowledge.md untracked re-created the silent-loss risk that PR #44 was built to close. Option A (carve-out expansion) is structurally consistent with the 3-class taxonomy: knowledge.md classifies as DURABLE-DOCTRINE; it just lives at a different filesystem level.
+
+### 11.2 Updated .gitignore chain
+
+The Phase 1 chain from §4.2 (placed after `docs/` line 52 for last-match precedence) gains a single line at the end:
+
+```diff
+ !orgs/
+ orgs/*
+ !orgs/*/
+ orgs/*/*
+ !orgs/*/docs/
+ orgs/*/docs/*
+ !orgs/*/docs/durable/
+ !orgs/*/docs/durable/**
++!orgs/*/knowledge.md
+```
+
+### 11.3 Verify gates (5-test extension of §4.2)
+
+```bash
+# Test E1 — knowledge.md NOT ignored (new)
+git check-ignore orgs/ascendops/knowledge.md
+# Expect exit 1 (NOT ignored, now tracked under expanded carve-out)
+
+# Test E2 — other root-level org files stay ignored (regression guard)
+git check-ignore orgs/ascendops/brand-voice.md
+git check-ignore orgs/ascendops/goals.json
+# Expect exit 0 for both (still ignored — only knowledge.md is carved out)
+```
+
+All 5 original §4.2 tests still pass post-expansion (re-verified 2026-05-23). Plus the 2 new tests above.
+
+### 11.4 Cross-org generalization note
+
+The pattern `!orgs/*/knowledge.md` uses the same wildcard shape as `!orgs/*/docs/durable/` — extends naturally to additional orgs without per-org gitignore changes. Stays consistent with the cross-org-generalization deferral in §6 Open Question 4 (deferred for v1, the wildcard form keeps the shape ready).
+
+### 11.5 Class taxonomy footnote
+
+knowledge.md does NOT live under `docs/durable/`. The 3-class taxonomy in §3 should be read as:
+
+- **DURABLE** = `orgs/<org>/docs/durable/**` PLUS `orgs/<org>/knowledge.md` (org-root doctrine)
+- LIVE-COLLAB, EPHEMERAL — destinations unchanged
+
+This is a minor schema expansion, not a class redefinition. Future durable artifacts that need to live at org-root (e.g. an `INVENTORY.md`, an `ARCHITECTURE.md`) can be added the same way via individual `!orgs/*/<filename>` rules. If the count grows beyond ~3-4 such files, consider a `orgs/*/durable-root/` subdir as a structural alternative.
