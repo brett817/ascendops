@@ -15,7 +15,13 @@ if [ -z "$AGENT" ]; then
   exit 2
 fi
 
-"$SCRIPT_DIR/init-agent-worktree.sh" "$AGENT"
+# Run init; abort the migration if init fails (don't print the misleading
+# "Migration complete" banner over a broken state). (Aussie Nit 2 on PR #53,
+# 2026-05-23.)
+if ! "$SCRIPT_DIR/init-agent-worktree.sh" "$AGENT"; then
+  echo "migrate-agent-to-worktree.sh: init-agent-worktree.sh failed for agent=$AGENT — migration aborted" >&2
+  exit 1
+fi
 
 WORKTREE_PATH=$("$SCRIPT_DIR/agent-worktree-path.sh" "$AGENT")
 

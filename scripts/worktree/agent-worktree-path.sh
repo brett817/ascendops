@@ -12,4 +12,13 @@ if [ -z "$AGENT" ]; then
 fi
 
 CTX_ROOT_VAL="${CTX_ROOT:-$HOME/.cortextos/default}"
-echo "${CTX_AGENT_WORKTREE:-$CTX_ROOT_VAL/state/agents/$AGENT/worktree}"
+
+# Honor CTX_AGENT_WORKTREE only when the caller is asking about their own
+# agent. Cross-agent path lookups (e.g. dispatch helpers querying another
+# agent's worktree path) must compute from CTX_ROOT, not inherit the
+# current-agent override. (Codex bot P2 catch on PR #53, 2026-05-23.)
+if [ -n "${CTX_AGENT_WORKTREE:-}" ] && [ "$AGENT" = "${CTX_AGENT_NAME:-}" ]; then
+  echo "$CTX_AGENT_WORKTREE"
+else
+  echo "$CTX_ROOT_VAL/state/agents/$AGENT/worktree"
+fi

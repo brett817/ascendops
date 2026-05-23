@@ -37,7 +37,23 @@ if [ -e "$WORKTREE/.git" ]; then
   exit 0
 fi
 
-# Ensure parent dir exists, then create the worktree on main.
+# Ensure parent dir exists, then create the worktree on a per-agent default
+# branch based on origin/main. We CANNOT reuse 'main' directly because git
+# worktree add refuses to reuse a branch that's already checked out elsewhere
+# (the canonical CTX_FRAMEWORK_ROOT is typically on main — see design §4.2
+# where Dane stays on canonical). Instead each agent gets its own base branch
+# 'agent/{agent}-base' tracking origin/main, which the refresh script keeps
+# in sync. (Codex bot P1 catch on PR #53, 2026-05-23.)
 mkdir -p "$(dirname "$WORKTREE")"
 echo "init-agent-worktree.sh: creating worktree for agent=$AGENT at $WORKTREE"
-git -C "$FRAMEWORK_ROOT" worktree add "$WORKTREE" main
+BASE_BRANCH="agent/$AGENT-base"
+
+# If the base branch already exists (e.g. from a prior init that was cleaned
+# up but the branch ref stayed), use it; otherwise create new from origin/main.
+if git -C "$FRAMEWORK_ROOT" rev-parse --verify "refs/heads/$BASE_BRANCH" >/dev/null 2>&1; then
+  git -C "$FRAMEWORK_ROOT" worktree add "$WORKTREE" "$BASE_BRANCH"
+else
+  # Fetch origin/main first so the new branch tracks the latest.
+  git -C "$FRAMEWORK_ROOT" fetch origin main
+  git -C "$FRAMEWORK_ROOT" worktree add -b "$BASE_BRANCH" "$WORKTREE" origin/main
+fi
