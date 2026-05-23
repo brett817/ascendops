@@ -661,6 +661,14 @@ export interface CtxEnv {
   projectRoot: string;
   timezone?: string;
   orchestrator?: string;
+  /**
+   * Per-agent git worktree path. Computed from CTX_ROOT + CTX_AGENT_NAME so
+   * each specialist agent operates on an isolated checkout of the framework
+   * repo. Prevents shared-HEAD branch collisions between concurrent agents
+   * (worktree-isolation-design-2026-05-23.md). Empty when agentName or
+   * ctxRoot is unset.
+   */
+  agentWorktree?: string;
 }
 
 // Bus Path Types

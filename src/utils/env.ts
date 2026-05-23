@@ -130,7 +130,17 @@ export function resolveEnv(overrides?: Partial<CtxEnv>): CtxEnv {
     }
   }
 
-  return { instanceId, ctxRoot, frameworkRoot, agentName, agentDir, org, projectRoot, timezone, orchestrator };
+  // Per-agent git worktree path (worktree-isolation pattern,
+  // orgs/ascendops/docs/durable/worktree-isolation-design-2026-05-23.md).
+  // Lives under per-agent state so each specialist gets its own HEAD + index,
+  // sharing only the canonical .git/objects/ via git worktree's native linking.
+  const agentWorktree =
+    overrides?.agentWorktree ||
+    process.env.CTX_AGENT_WORKTREE ||
+    envFile.CTX_AGENT_WORKTREE ||
+    (ctxRoot && agentName ? join(ctxRoot, 'state', 'agents', agentName, 'worktree') : '');
+
+  return { instanceId, ctxRoot, frameworkRoot, agentName, agentDir, org, projectRoot, timezone, orchestrator, agentWorktree };
 }
 
 /**
@@ -139,7 +149,7 @@ export function resolveEnv(overrides?: Partial<CtxEnv>): CtxEnv {
  */
 export function writeCortextosEnv(agentDir: string, env: CtxEnv): void {
   ensureDir(agentDir);
-  const content = [
+  const lines = [
     `CTX_INSTANCE_ID=${env.instanceId}`,
     `CTX_ROOT=${env.ctxRoot}`,
     `CTX_FRAMEWORK_ROOT=${env.frameworkRoot}`,
@@ -147,9 +157,11 @@ export function writeCortextosEnv(agentDir: string, env: CtxEnv): void {
     `CTX_ORG=${env.org}`,
     `CTX_AGENT_DIR=${env.agentDir}`,
     `CTX_PROJECT_ROOT=${env.projectRoot}`,
-  ].join('\n');
-
-  writeFileSync(join(agentDir, '.cortextos-env'), content + '\n', 'utf-8');
+  ];
+  if (env.agentWorktree) {
+    lines.push(`CTX_AGENT_WORKTREE=${env.agentWorktree}`);
+  }
+  writeFileSync(join(agentDir, '.cortextos-env'), lines.join('\n') + '\n', 'utf-8');
 }
 
 /**
