@@ -41,6 +41,7 @@ Every parallel review subagent you spawn in Stage 1, the synthesis subagent in S
 2. **High-level workflow steps** — what each reviewer/synthesizer should produce, not how to format it line-by-line
 3. **Validation loop** — required output files with exact paths, line counts where applicable
 4. **Past + future contracts (KEYSTONE)** — input shape (the diff + prior-stage outputs) and output shape (what the next stage will consume)
+   - **Research artifact sub-bullet (v2)**: include `RESEARCH_ARTIFACT_PATH=<repo-relative-path>.md` for Stage 1 review subagents — they accumulate raw findings (specific bugs, line refs, code excerpts) that Stage 2 synthesis benefits from. Subagent writes raw facts there; main-agent / synthesis stage reads on demand. See canonical spec §Part 4 sub-bullet for format.
 
 **Receiver-side enforcement**: if a subagent receives a dispatch missing any of the 4 parts, PUSH BACK and request them before starting. Refusal-to-start is the enforcement.
 

@@ -69,6 +69,17 @@ orgs/*/docs/*
 !orgs/*/docs/durable/
 !orgs/*/docs/durable/**
 !orgs/*/knowledge.md
+# research-artifacts/ — convention dir for contract-at-dispatch v2
+# RESEARCH_ARTIFACT_PATH sub-bullet. The directory shell + its own
+# .gitignore land here so the convention path resolves for receivers,
+# but the contents stay blocked by default (transient session artifacts).
+# Promotion to durable = move to docs/durable/ per separate decision.
+# Multi-org defense-in-depth: re-block contents at top-level too, so a
+# fork org that creates orgs/<neworg>/research-artifacts/ without the
+# in-dir .gitignore guard still has contents blocked by default.
+!orgs/*/research-artifacts/
+orgs/*/research-artifacts/*
+!orgs/*/research-artifacts/.gitignore
 
 # Internal developer/planning notes (not for public repo)
 KNOWN-ISSUES.md

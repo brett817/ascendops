@@ -1,0 +1,14 @@
+# Block all contents of this directory by default. Per-session subagent
+# research artifacts live here transient — they should NOT auto-commit
+# alongside spec docs.
+#
+# Promoting a specific artifact to durable preservation = move it to
+# orgs/ascendops/docs/durable/ as a separate per-artifact decision.
+# That path is covered by the !orgs/<org>/docs/durable/** carve-out
+# in the top-level .gitignore.
+#
+# This file itself is tracked so the directory exists in the repo and
+# the convention path resolves for receivers following the
+# contract-at-dispatch v2 RESEARCH_ARTIFACT_PATH sub-bullet.
+*
+!.gitignore

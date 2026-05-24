@@ -90,6 +90,30 @@ Past/future contracts catch:
 - "This scenario is yours to handle, not something to silently first-match through" → explicit ownership
 - "The handoff between you and the consumer has these invariants" → no integration surprises
 
+**Sub-bullet: research artifact contract (v2 — 2026-05-24)**
+
+When a subagent does meaningful research (reads multiple files, fetches external content, gathers raw facts), the dispatch MUST include a `RESEARCH_ARTIFACT_PATH` future-contract field:
+
+```
+Research artifact contract:
+- Write your raw facts (URLs, code excerpts, line numbers, exact quotes)
+  to RESEARCH_ARTIFACT_PATH=<repo-relative-path>.md before returning your
+  summary. Repo-relative is canonical (survives worktree migrations + matches
+  the convention path shape below).
+- Inline summary covers the high-level finding only — main agent reads the
+  artifact on demand for specifics.
+- File format: structured markdown with `## Sources`, `## Key findings`,
+  `## Raw excerpts` sections. Main agent greps headers when seeking specifics.
+```
+
+**Why it matters:** the Agent tool returns only a summary string. Without an external artifact, the raw facts the subagent found are lost the moment it returns. Main agent has to re-spawn or re-fetch when integration needs specifics. Writing to a path keeps facts addressable without polluting main-agent context.
+
+**Convention:** artifacts live at `orgs/<org>/research-artifacts/<dispatch-id>/<lane-id>.md`. The `research-artifacts/` directory is `.gitignore`-blocked by default — promotion to `docs/durable/` is a separate per-artifact decision when an artifact deserves preservation across sessions.
+
+**Related frameworks:** the pattern lifts from RALF loop (Research, Analyze, Loop, Finalize) most directly. Also in conversation with BEADS (Brief/Examine/Analyze/Decide/Synthesize) and Get Shit Done (GSD). Source lesson: Skool agent-architects 6.3 Subagents, "external research directory" segment.
+
+**See:** [Design doc with full inventory + before/after example](programmatic-mcp-and-subagent-research-dir-design-2026-05-24.md).
+
 ---
 
 ## Scope: applies to ALL dispatches (spawn-worker + peer-agent)
@@ -147,7 +171,26 @@ Future contract:
 - `kind: 'ambiguous'` MUST trigger the retry-SMS-listing-candidates flow at the consumer — your job is to surface it, consumer handles UX
 - The queue entry must NOT be removed in ambiguous case (consumer needs it for retry)
 - Concurrent invocation safety: this function is called from N parallel webhooks; pure function preferred, no module-level mutable state
+- Research artifact contract: write your raw facts (Codex bot quote, line numbers, related code sites, existing test patterns) to RESEARCH_ARTIFACT_PATH=orgs/ascendops/research-artifacts/hotfix-mms-p1a/lane-research.md before returning your summary. Inline return = headline + path. Main agent reads the artifact when integrating to confirm exact line numbers + test patterns.
 ```
+
+### Before/after with the research-artifact sub-bullet
+
+Today's MMS hotfix (2026-05-24) is the worked counter-example for why the sub-bullet matters:
+
+**Before (no research artifact contract):**
+- Subagent A returns: "PM list returns flat phone, get returns nested contact.cell_phone. Suggested predicate change at http_backend.py:1247."
+- Main agent integrates. Needs the exact response keys to write a test fixture. Doesn't have them in the summary. Re-runs `pm tenants list --json` to recover the key list.
+
+**After (with research artifact contract):**
+- Subagent A writes to `orgs/ascendops/research-artifacts/c2-pm-tenants/lane-a-research.md`:
+  - `## Sources`: pm tenants list endpoint + /api/tenants/ docs link
+  - `## Key findings`: flat top-level phone, no nested contact, predicate at http_backend.py:1247
+  - `## Raw excerpts`: full curl response, complete key list (channel/email/.../phone/status), 3 related code sites
+- Returns inline: "Wrote analysis to <path>. Headline: flat top-level phone, fix predicate at http_backend.py:1247."
+- Main agent integrates from the summary. When test fixture needs exact keys, greps `## Raw excerpts` section of the artifact for the key list. No re-fetch.
+
+Net: main-agent context stays small + raw facts stay addressable.
 
 ---
 
