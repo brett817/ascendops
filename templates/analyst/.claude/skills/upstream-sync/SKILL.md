@@ -8,6 +8,10 @@ triggers: ["upstream", "framework update", "check updates", "new version", "pull
 
 Check for cortextOS framework updates from the remote repository. Never auto-merges. Always explains changes and waits for approval.
 
+## Scope (worktree-aware)
+
+This skill operates EXCLUSIVELY at the canonical framework root (`$CTX_FRAMEWORK_ROOT`). The `upstream` git remote is only tracked at canonical — not in per-agent worktrees. Every bash block in this skill starts with `cd "${CTX_FRAMEWORK_ROOT:?CTX_FRAMEWORK_ROOT must be set}"` to guarantee correct cwd; each shell invocation in an agent session is a fresh shell. Running this skill from a per-agent worktree would either fail the fetch (no `upstream` remote) or fetch into the wrong tree.
+
 ## When to Run
 
 - Daily cron (configured via `cortextos bus add-cron`)
@@ -19,6 +23,7 @@ Check for cortextOS framework updates from the remote repository. Never auto-mer
 ### Step 1: Check for updates
 
 ```bash
+cd "${CTX_FRAMEWORK_ROOT:?CTX_FRAMEWORK_ROOT must be set}"
 RESULT=$(cortextos bus check-upstream)
 ```
 
@@ -28,7 +33,7 @@ The script fetches from upstream and returns a JSON summary categorizing changes
 
 1. Read the JSON output to understand what changed
 2. If `catalog_additions` array is present, note those new community items separately — surface them to user after the framework update conversation
-3. Read the actual diff: `git diff HEAD..upstream/main`
+3. Read the actual diff: `cd "${CTX_FRAMEWORK_ROOT:?CTX_FRAMEWORK_ROOT must be set}" && git diff HEAD..upstream/main`
 4. Explain EVERY change in plain English to the user via Telegram
 5. Categorize: security fix, new feature, template change, breaking change
 6. Recommend: "safe to apply" or "review needed because..."
@@ -37,6 +42,7 @@ The script fetches from upstream and returns a JSON summary categorizing changes
 ### Step 3: Apply (only after approval)
 
 ```bash
+cd "${CTX_FRAMEWORK_ROOT:?CTX_FRAMEWORK_ROOT must be set}"
 cortextos bus check-upstream --apply
 ```
 
@@ -45,6 +51,7 @@ cortextos bus check-upstream --apply
 After the merge applies, run the security gate BEFORE verifying build/tests:
 
 ```bash
+cd "${CTX_FRAMEWORK_ROOT:?CTX_FRAMEWORK_ROOT must be set}"
 npm install
 npm audit --audit-level=moderate
 ```
@@ -58,7 +65,7 @@ This catches upstream merges that silently downgrade a dependency that was previ
 
 ### Step 5: Post-apply verification
 
-- Run `npm run build` and `npm test` — both must pass
+- Run `cd "${CTX_FRAMEWORK_ROOT:?CTX_FRAMEWORK_ROOT must be set}" && npm run build && npm test` — both must pass
 - Verify the merge was clean
 - Check if any agent bootstrap files need updating (template changes)
 - Report results to orchestrator

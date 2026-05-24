@@ -15,21 +15,26 @@ triggers: ["upstream check", "framework update", "check upstream", "upstream aut
 [AGENT_NAME] owns upstream framework health for the cortextos workspace. Bug fix application authority should be documented in your MEMORY.md or deployment config. Feature-level changes always route to [ORCHESTRATOR], who routes to the user for approval.
 
 ## Inputs
-- Framework repo: the cortextos workspace root (the `CTX_ROOT` parent — the git repo, not the state dir)
+- Framework repo: the cortextos workspace root at `$CTX_FRAMEWORK_ROOT` (the canonical git repo, not the state dir, never a per-agent worktree)
 - Upstream: `upstream/main` (verify with `git remote -v` if unsure)
 - Current local state: local main can run ahead of upstream (your local fixes may flow upstream). Do NOT try to "sync" ahead-commits downward.
+
+## Scope (worktree-aware)
+
+This skill operates EXCLUSIVELY at the canonical framework root (`$CTX_FRAMEWORK_ROOT`). The `upstream` git remote is only tracked at canonical — not in per-agent worktrees. Every bash block in this skill starts with `cd "${CTX_FRAMEWORK_ROOT:?CTX_FRAMEWORK_ROOT must be set}"` to guarantee correct cwd; each shell invocation in an agent session is a fresh shell. Running this skill from a per-agent worktree would either fail the fetch (no `upstream` remote) or fetch into the wrong tree.
 
 ## Procedure
 
 ### Step 1 — Fetch and inspect
 ```bash
-cd /path/to/cortextos
+cd "${CTX_FRAMEWORK_ROOT:?CTX_FRAMEWORK_ROOT must be set}"
 cortextos bus check-upstream
 ```
 Read the output. If it reports no new commits, skip to Step 7 (log noop and stop).
 
 If there are new commits, list them:
 ```bash
+cd "${CTX_FRAMEWORK_ROOT:?CTX_FRAMEWORK_ROOT must be set}"
 git fetch upstream main
 git log --oneline HEAD..upstream/main
 ```
@@ -37,6 +42,7 @@ git log --oneline HEAD..upstream/main
 ### Step 2 — Classify each commit
 For each new commit, read the subject and the diff:
 ```bash
+cd "${CTX_FRAMEWORK_ROOT:?CTX_FRAMEWORK_ROOT must be set}"
 git show --stat <sha>
 git show <sha>
 ```
@@ -65,14 +71,14 @@ When flagging: collect the commit SHAs, commit messages, and touched paths, and 
 ### Step 4 — Apply safe bugfix / docs / chore commits
 If all new commits are pure bugfix or docs/chore AND none touch the guardrail paths:
 ```bash
-cd /path/to/cortextos
+cd "${CTX_FRAMEWORK_ROOT:?CTX_FRAMEWORK_ROOT must be set}"
 CORTEXTOS_CONFIRM_UPSTREAM_MERGE=yes cortextos bus check-upstream --apply
 ```
 **The `CORTEXTOS_CONFIRM_UPSTREAM_MERGE=yes` env var is required.** Without it, `check-upstream --apply` returns `{"status": "error", "error": "Refusing to auto-merge upstream..."}` as a safety gate. The env var is the "I have reviewed the diff and I trust the changes" signal. Set it inline, not exported, so it does not leak into subsequent unrelated commands.
 
 After applying:
 ```bash
-cd /path/to/cortextos
+cd "${CTX_FRAMEWORK_ROOT:?CTX_FRAMEWORK_ROOT must be set}"
 npm run build
 npm test
 ```
