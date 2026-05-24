@@ -46,6 +46,9 @@ knowledge-base/venv/
 knowledge-base/__pycache__/
 knowledge-base/scripts/__pycache__/
 knowledge-base/scripts/_test_clients/__pycache__/
+# Python cache from programmatic-tools skill lib
+community/skills/programmatic-tools/lib/__pycache__/
+community/skills/programmatic-tools/examples/__pycache__/
 tests/playwright/dashboard-ui.spec.ts
 
 # Local ops docs (personal, not for public repo)
