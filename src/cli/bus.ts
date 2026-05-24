@@ -18,6 +18,7 @@ import { listActiveThreads, addActiveThread, updateActiveThread, removeActiveThr
 import { listVendorDocPatterns, vendorDocPattern } from '../bus/vendor-patterns.js';
 import { createReminder, listReminders, ackReminder, pruneReminders } from '../bus/reminders.js';
 import { sendSms } from '../bus/send-sms.js';
+import { sendViaRelay } from '../bus/send-via-relay.js';
 import { updateCronFire, parseDurationMs, readCronState } from '../bus/cron-state.js';
 import { addCron, removeCron, readCrons, updateCron as updateCronDef, getCronByName, getExecutionLog } from '../bus/crons.js';
 import { nextFireFromCron } from '../daemon/cron-scheduler.js';
@@ -3416,3 +3417,22 @@ function sleepMs(ms: number): Promise<void> {
 function pct(v: number): string {
   return `${Math.round(v * 100)}%`;
 }
+
+busCommand
+  .command('send-via-relay')
+  .description('Send an SMS or MMS reply through blue-relay (resolves bus message_id → original sender phone, supports optional MMS photo URL)')
+  .requiredOption('--to <target>', 'Bus message_id (relay resolves to sender phone) or E.164 phone (with +)')
+  .requiredOption('--text <text>', 'Reply text body')
+  .option('--photo <url>', 'Optional pre-signed photo URL for MMS attachment')
+  .action(async (opts: { to: string; text: string; photo?: string }) => {
+    const result = await sendViaRelay({
+      to: opts.to,
+      text: opts.text,
+      photoUrl: opts.photo,
+    });
+    if (!result.ok) {
+      console.error(JSON.stringify({ ok: false, error: result.error, status: result.status, body: result.body }));
+      process.exit(1);
+    }
+    console.log(JSON.stringify({ ok: true, status: result.status, body: result.body }));
+  });
