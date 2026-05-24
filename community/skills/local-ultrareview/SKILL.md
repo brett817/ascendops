@@ -33,6 +33,19 @@ If the diff is empty, tell the user there is nothing to review and stop.
 
 ---
 
+## Contract-at-dispatch (load-bearing)
+
+Every parallel review subagent you spawn in Stage 1, the synthesis subagent in Stage 2, and the implementation-planning subagent in Stage 3 must be dispatched following the 4-part structure from `orgs/ascendops/docs/durable/subagent-prompt-structure-2026-05-24.md`:
+
+1. **Index-doc framing** — files to read with "why" annotations (especially `$SESSION_DIR/diff.txt`)
+2. **High-level workflow steps** — what each reviewer/synthesizer should produce, not how to format it line-by-line
+3. **Validation loop** — required output files with exact paths, line counts where applicable
+4. **Past + future contracts (KEYSTONE)** — input shape (the diff + prior-stage outputs) and output shape (what the next stage will consume)
+
+**Receiver-side enforcement**: if a subagent receives a dispatch missing any of the 4 parts, PUSH BACK and request them before starting. Refusal-to-start is the enforcement.
+
+---
+
 ## Stage 1: Three Parallel Opus Review Agents
 
 Spawn all three simultaneously using the Agent tool. Use `model: claude-opus-4-7` for each.

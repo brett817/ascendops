@@ -24,6 +24,21 @@ You provide the brain dump, answer discovery questions, help with tool setup, mo
 
 ---
 
+## Contract-at-dispatch (load-bearing)
+
+Every non-trivial dispatch you SEND — to the worker, and every subagent spawned within the worker — must follow the 4-part structure from the durable spec at `orgs/ascendops/docs/durable/subagent-prompt-structure-2026-05-24.md`:
+
+1. **Index-doc framing** — files to read with "why" annotations, not inlined docs
+2. **High-level workflow steps** — outcome-oriented, not bash-by-bash
+3. **Validation loop** — proof-not-word baked in (exit codes, line counts, `git diff --stat`)
+4. **Past + future contracts (KEYSTONE)** — input shape + output shape + explicit ownership of edge cases
+
+**Receiver-side enforcement**: if you RECEIVE a dispatch missing any of the 4 parts (especially past/future contracts), PUSH BACK and request them before starting. Refusal-to-start is the enforcement — neither agent needs the orchestrator to police it.
+
+Critical for M2C1 because the framework spawns N parallel subagents at each phase. Without contracts at the sharding step, integration-shape bugs surface only at validation, not at dispatch.
+
+---
+
 ## Prerequisites
 
 - M2C1 skill files available (bundled in cortextos templates)

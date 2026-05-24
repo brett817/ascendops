@@ -39,6 +39,21 @@ Codex is a configurable option. Pick the mode that matches your setup:
 
 ---
 
+## Contract-at-dispatch (load-bearing)
+
+Every dispatch in this matrix — orchestrator → agent, agent → Codex, agent → another agent — must follow the 4-part structure from the durable spec at `orgs/ascendops/docs/durable/subagent-prompt-structure-2026-05-24.md`:
+
+1. **Index-doc framing** — files to read with "why" annotations, not inlined docs
+2. **High-level workflow steps** — outcome-oriented, not bash-by-bash
+3. **Validation loop** — proof-not-word baked in (exit codes, line counts, `git diff --stat`)
+4. **Past + future contracts (KEYSTONE)** — input shape + output shape + explicit ownership of edge cases
+
+**Receiver-side enforcement**: if you RECEIVE a dispatch missing any of the 4 parts (especially past/future contracts), PUSH BACK and request them before starting. Refusal-to-start is the enforcement — neither agent needs the orchestrator to police it.
+
+This applies equally to spawn-worker dispatches and peer-agent dispatches (orchestrator → agent, agent → Codex, agent → agent). The durable spec carries the worked example.
+
+---
+
 ## Default Coding Workflow by Mode
 
 ### Mode 1 — Codex as reviewer (default, out of box)

@@ -47,6 +47,23 @@ TARGET: Every significant piece of work (>10 minutes) = at least 1 task created.
 
 ---
 
+## Contract-at-dispatch (load-bearing)
+
+Every non-trivial dispatch you SEND — to a subagent (Agent tool), a spawned worker, or a peer agent (bus message handing off a task) — must follow the 4-part structure from the durable spec at `orgs/ascendops/docs/durable/subagent-prompt-structure-2026-05-24.md`:
+
+1. **Index-doc framing** — files to read with "why" annotations, not inlined docs
+2. **High-level workflow steps** — outcome-oriented, not bash-by-bash
+3. **Validation loop** — proof-not-word baked in (exit codes, line counts, `git diff --stat`)
+4. **Past + future contracts (KEYSTONE)** — input shape + output shape + explicit ownership of edge cases
+
+**Receiver-side enforcement**: if you RECEIVE a dispatch missing any of the 4 parts (especially past/future contracts), PUSH BACK and request them before starting. Refusal-to-start is the enforcement — neither agent needs the orchestrator to police it.
+
+This applies equally to spawn-worker dispatches and peer-agent dispatches. The durable spec carries the worked example.
+
+CONSEQUENCE: Skipping the 4-part pattern at dispatch time = integration-shape bugs surface at merge time (or worse, post-merge), not at dispatch time. The pattern moves catch-point upstream.
+
+---
+
 ## Mandatory Memory Protocol
 
 You have THREE memory layers. All are mandatory.
