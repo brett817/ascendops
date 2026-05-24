@@ -517,12 +517,27 @@ if (existsSync(INSTALL_DIR)) {
   const REPO_OWNER_PATH = REPO_URL.replace(/^https:\/\/github\.com\//, '').replace(/\.git$/, '');
   const REPO_NAME = REPO_OWNER_PATH.split('/').pop();
 
+  const REPO_OWNER = REPO_OWNER_PATH.split('/')[0];
+
   let ghForkOk = false;
   if (commandExists('gh')) {
     let ghAuthed = false;
     try { run('gh auth status'); ghAuthed = true; } catch { /* not authed */ }
 
+    // When the operator's gh account IS the canonical repo owner (e.g. someone
+    // from noogalabs installing their own AscendOps), `gh repo fork` errors
+    // with "can't create fork in own account". The catch falls through to
+    // plain clone, but it's a noisy stderr dump for a known no-op. Detect the
+    // case up front and skip the fork attempt cleanly.
+    let ghUser = '';
     if (ghAuthed) {
+      try { ghUser = run('gh api user --jq .login'); } catch { /* unreachable when authed */ }
+    }
+    const ownsCanonical = ghAuthed && ghUser && ghUser === REPO_OWNER;
+
+    if (ghAuthed && ownsCanonical) {
+      info(`gh CLI authed as ${ghUser} — you own ${REPO_OWNER_PATH}. Skipping fork; using plain clone.`);
+    } else if (ghAuthed) {
       log(`Forking ${REPO_OWNER_PATH} to your GitHub account (gh CLI authed)...`);
       try {
         // gh CLI rejects `--remote` (including `--remote=false`) when a
@@ -530,7 +545,6 @@ if (existsSync(INSTALL_DIR)) {
         // when a repository argument is provided". Pass `--clone=false` only
         // and add the upstream remote manually after the clone below.
         run(`gh repo fork ${REPO_OWNER_PATH} --clone=false`);
-        const ghUser = run('gh api user --jq .login');
         const forkUrl = `https://github.com/${ghUser}/${REPO_NAME}.git`;
         log(`Cloning your fork to ${INSTALL_DIR}...`);
         runVisible(`git clone --branch ${REPO_BRANCH} ${forkUrl} ${JSON.stringify(INSTALL_DIR)}`);
