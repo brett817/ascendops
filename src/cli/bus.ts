@@ -368,7 +368,8 @@ busCommand
   .command('update-task')
   .argument('<id>', 'Task ID')
   .argument('<status>', 'New status (pending, in_progress, completed, blocked, cancelled)')
-  .action((id: string, status: string) => {
+  .option('--assignee <agent>', 'Reassign the task to a different agent (alongside the status update)')
+  .action((id: string, status: string, opts: { assignee?: string }) => {
     const validStatuses: TaskStatus[] = ['pending', 'in_progress', 'completed', 'blocked', 'cancelled'];
     if (!validStatuses.includes(status as TaskStatus)) {
       console.error(`Invalid status '${status}'. Must be one of: ${validStatuses.join(', ')}`);
@@ -388,8 +389,15 @@ busCommand
       }
     }
 
-    updateTask(paths, id, status as TaskStatus);
-    console.log(`Updated ${id} -> ${status}`);
+    updateTask(paths, id, status as TaskStatus, opts.assignee);
+    console.log(`Updated ${id} -> ${status}${opts.assignee ? ` (assignee: ${opts.assignee})` : ''}`);
+    // Auto-notify the new assignee so a reassigned task is visible immediately,
+    // mirroring the create-task --assignee notification (issue #78).
+    if (opts.assignee && opts.assignee !== env.agentName) {
+      const assigneePaths = resolvePaths(opts.assignee, env.instanceId, env.org);
+      sendMessage(assigneePaths, env.agentName, opts.assignee, 'normal',
+        `Task reassigned to you: ${id} (status: ${status})`);
+    }
   });
 
 busCommand

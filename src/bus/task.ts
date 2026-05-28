@@ -261,6 +261,7 @@ export function updateTask(
   paths: BusPaths,
   taskId: string,
   status: TaskStatus,
+  newAssignee?: string,
 ): void {
   const filePath = findTaskFile(paths, taskId);
   if (!filePath) {
@@ -269,19 +270,35 @@ export function updateTask(
     );
   }
   let prevStatus: TaskStatus | undefined;
-  let assignee: string | undefined;
+  let prevAssignee: string | undefined;
   try {
     const content = readFileSync(filePath, 'utf-8');
     const task: Task = JSON.parse(content);
     prevStatus = task.status;
-    assignee = task.assigned_to;
+    prevAssignee = task.assigned_to;
     task.status = status;
+    // Optional reassignment: when newAssignee is provided, mutate assigned_to
+    // alongside the status change. Passing undefined leaves the assignee
+    // untouched so existing status-only callers are unaffected.
+    if (newAssignee !== undefined) {
+      task.assigned_to = newAssignee;
+    }
     task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
     atomicWriteSync(filePath, JSON.stringify(task));
   } catch (err) {
     throw new Error(`Task ${taskId} update failed: ${err}`);
   }
-  appendTaskAudit(paths, taskId, { event: 'update', agent: assignee || 'unknown', from: prevStatus, to: status });
+  const reassigned = newAssignee !== undefined && newAssignee !== prevAssignee;
+  const note = reassigned
+    ? `reassigned ${prevAssignee ?? 'unassigned'} → ${newAssignee}`
+    : undefined;
+  appendTaskAudit(paths, taskId, {
+    event: 'update',
+    agent: newAssignee ?? prevAssignee ?? 'unknown',
+    from: prevStatus,
+    to: status,
+    note,
+  });
 }
 
 /**

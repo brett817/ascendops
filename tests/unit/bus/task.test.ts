@@ -70,6 +70,45 @@ describe('Task Management', () => {
       const content = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8'));
       expect(content.status).toBe('in_progress');
     });
+
+    it('leaves assigned_to untouched when newAssignee is omitted', () => {
+      const taskId = createTask(paths, 'paul', 'acme', 'Owned task', { assignee: 'boris' });
+      updateTask(paths, taskId, 'in_progress');
+
+      const content = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8'));
+      expect(content.status).toBe('in_progress');
+      expect(content.assigned_to).toBe('boris');
+    });
+
+    it('reassigns the task when newAssignee is provided', () => {
+      const taskId = createTask(paths, 'paul', 'acme', 'Reassign me', { assignee: 'boris' });
+      updateTask(paths, taskId, 'pending', 'paul');
+
+      const content = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8'));
+      expect(content.status).toBe('pending');
+      expect(content.assigned_to).toBe('paul');
+    });
+
+    it('records the reassignment in the audit log with a from→to note', () => {
+      const taskId = createTask(paths, 'paul', 'acme', 'Audit reassign', { assignee: 'boris' });
+      updateTask(paths, taskId, 'pending', 'paul');
+
+      const audit = readTaskAudit(paths, taskId);
+      const reassignEntry = audit.find((e) => typeof e.note === 'string' && e.note.includes('reassigned'));
+      expect(reassignEntry).toBeDefined();
+      expect(reassignEntry!.note).toContain('boris');
+      expect(reassignEntry!.note).toContain('paul');
+      expect(reassignEntry!.agent).toBe('paul');
+    });
+
+    it('does not emit a reassignment note when newAssignee equals the current assignee', () => {
+      const taskId = createTask(paths, 'paul', 'acme', 'No-op reassign', { assignee: 'boris' });
+      updateTask(paths, taskId, 'in_progress', 'boris');
+
+      const audit = readTaskAudit(paths, taskId);
+      const reassignEntry = audit.find((e) => typeof e.note === 'string' && e.note.includes('reassigned'));
+      expect(reassignEntry).toBeUndefined();
+    });
   });
 
   describe('completeTask', () => {
