@@ -571,7 +571,14 @@ busCommand
     const STATUS_ICON: Record<string, string> = { pending: '○', in_progress: '●', blocked: '◑', completed: '✓', done: '✓', cancelled: '✗' };
 
     console.log(`\n  Tasks (${tasks.length})\n`);
-    const header = '  Status  Pri  ID                        Assignee         Title';
+    // ID column is sized to the widest task id in the result set and NEVER
+    // truncates: a displayed task id is the value operators copy-paste straight
+    // into `update-task`/`complete-task`, so a clipped id is a silent
+    // command-failure footgun (a 27-char `task_<13-digit-epoch>_<8-digit-rand>`
+    // was being cut to 26, dropping the last suffix digit). Min width 2 keeps
+    // the 'ID' header column from collapsing when the list is empty.
+    const idWidth = Math.max(2, ...tasks.map((t) => t.id.length));
+    const header = `  Status  Pri  ${'ID'.padEnd(idWidth)}  Assignee         Title`;
     const separator = '  ' + '-'.repeat(header.length - 2);
     console.log(header);
     console.log(separator);
@@ -579,10 +586,10 @@ busCommand
     for (const t of tasks) {
       const statusIcon = (STATUS_ICON[t.status] || '?').padEnd(8);
       const priIcon = (PRIORITY_ICON[t.priority] || '·').padEnd(5);
-      const id = t.id.substring(0, 26).padEnd(26);
+      const id = t.id.padEnd(idWidth);
       const assignee = (t.assigned_to || '-').substring(0, 16).padEnd(17);
       const title = t.title.substring(0, 50);
-      console.log(`  ${statusIcon}${priIcon}${id}${assignee}${title}`);
+      console.log(`  ${statusIcon}${priIcon}${id}  ${assignee}${title}`);
     }
     console.log('');
   });
