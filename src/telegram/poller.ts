@@ -13,11 +13,23 @@ export type ReactionHandler = (reaction: TelegramMessageReaction) => void;
  * Polls getUpdates every 1 second and routes messages/callbacks to handlers.
  */
 export class TelegramPoller {
+  /**
+   * Process-wide registry of offset-file paths claimed by live pollers.
+   * Keyed on the resolved `join(stateDir, offsetFileName)` path. Two pollers
+   * resolving to the same offset file would silently clobber each other's
+   * offset tracking (the exact failure the offsetFileSuffix arg defends
+   * against). This registry turns that silent clobber into a loud throw at
+   * construction time, so a future third poller wired without a distinct
+   * suffix fails fast instead of corrupting offset state at runtime.
+   */
+  private static claimedOffsetFiles = new Set<string>();
+
   private api: TelegramAPI;
   private offset: number = 0;
   private running: boolean = false;
   private stateDir: string;
   private offsetFileName: string;
+  private offsetFilePath: string;
   private messageHandlers: MessageHandler[] = [];
   private callbackHandlers: CallbackHandler[] = [];
   private reactionHandlers: ReactionHandler[] = [];
@@ -44,6 +56,21 @@ export class TelegramPoller {
     this.offsetFileName = offsetFileSuffix
       ? `.telegram-offset-${offsetFileSuffix}`
       : '.telegram-offset';
+    this.offsetFilePath = join(this.stateDir, this.offsetFileName);
+    // Defensive collision guard: fail loud if another live poller already
+    // owns this offset file. Without a distinct offsetFileSuffix, two pollers
+    // in one stateDir both resolve to `.telegram-offset` and silently clobber
+    // each other's offsets — losing track of which bot each offset belonged
+    // to. Throwing here forces the caller to pass a unique suffix.
+    if (TelegramPoller.claimedOffsetFiles.has(this.offsetFilePath)) {
+      throw new Error(
+        `[telegram-poller] offset-file collision: ${this.offsetFilePath} is ` +
+        `already claimed by a live poller. Two pollers sharing a stateDir must ` +
+        `each pass a distinct offsetFileSuffix (e.g. 'activity') so their ` +
+        `offset files don't clobber. Pass a unique offsetFileSuffix to this poller.`,
+      );
+    }
+    TelegramPoller.claimedOffsetFiles.add(this.offsetFilePath);
     this.loadOffset();
   }
 
@@ -92,6 +119,10 @@ export class TelegramPoller {
    */
   stop(): void {
     this.running = false;
+    // Release the offset-file claim so a later poller can re-bind the same
+    // stateDir+suffix (e.g. after a reconnect or agent restart) without
+    // tripping the collision guard.
+    TelegramPoller.claimedOffsetFiles.delete(this.offsetFilePath);
   }
 
   /**
@@ -174,7 +205,7 @@ export class TelegramPoller {
    * Load persisted offset from state file.
    */
   private loadOffset(): void {
-    const offsetFile = join(this.stateDir, this.offsetFileName);
+    const offsetFile = this.offsetFilePath;
     try {
       if (existsSync(offsetFile)) {
         const content = readFileSync(offsetFile, 'utf-8').trim();
@@ -193,7 +224,7 @@ export class TelegramPoller {
    */
   private saveOffset(): void {
     ensureDir(this.stateDir);
-    const offsetFile = join(this.stateDir, this.offsetFileName);
+    const offsetFile = this.offsetFilePath;
     try {
       writeFileSync(offsetFile, String(this.offset), 'utf-8');
     } catch {

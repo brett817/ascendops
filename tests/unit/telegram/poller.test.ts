@@ -223,3 +223,68 @@ describe('TelegramPoller — offset-after-handler', () => {
     }
   });
 });
+
+describe('TelegramPoller — offset-file collision guard', () => {
+  let stateDir: string;
+
+  beforeEach(() => {
+    stateDir = mkdtempSync(join(tmpdir(), 'cortextos-poller-collision-'));
+  });
+
+  afterEach(() => {
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  it('throws when a second poller claims the same stateDir without a distinct suffix', () => {
+    const { api: api1 } = makeStubApi([]);
+    const { api: api2 } = makeStubApi([]);
+    const first = new TelegramPoller(api1, stateDir);
+    try {
+      expect(() => new TelegramPoller(api2, stateDir)).toThrow(/offset-file collision/);
+    } finally {
+      first.stop();
+    }
+  });
+
+  it('allows a second poller in the same stateDir with a distinct suffix', () => {
+    const { api: api1 } = makeStubApi([]);
+    const { api: api2 } = makeStubApi([]);
+    const primary = new TelegramPoller(api1, stateDir);
+    const activity = new TelegramPoller(api2, stateDir, 1000, 'activity');
+    try {
+      expect(primary).toBeInstanceOf(TelegramPoller);
+      expect(activity).toBeInstanceOf(TelegramPoller);
+    } finally {
+      primary.stop();
+      activity.stop();
+    }
+  });
+
+  it('releases the claim on stop() so the same suffix can be re-bound', () => {
+    const { api: api1 } = makeStubApi([]);
+    const { api: api2 } = makeStubApi([]);
+    const first = new TelegramPoller(api1, stateDir);
+    first.stop();
+    // After stop() releases the claim, a fresh poller on the same stateDir
+    // (e.g. after a reconnect / agent restart) must construct without throwing.
+    let second: TelegramPoller | undefined;
+    expect(() => { second = new TelegramPoller(api2, stateDir); }).not.toThrow();
+    second?.stop();
+  });
+
+  it('treats two distinct stateDirs as non-colliding even with default suffix', () => {
+    const other = mkdtempSync(join(tmpdir(), 'cortextos-poller-other-'));
+    const { api: api1 } = makeStubApi([]);
+    const { api: api2 } = makeStubApi([]);
+    const a = new TelegramPoller(api1, stateDir);
+    const b = new TelegramPoller(api2, other);
+    try {
+      expect(a).toBeInstanceOf(TelegramPoller);
+      expect(b).toBeInstanceOf(TelegramPoller);
+    } finally {
+      a.stop();
+      b.stop();
+      rmSync(other, { recursive: true, force: true });
+    }
+  });
+});
