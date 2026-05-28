@@ -109,6 +109,84 @@ describe('Task Management', () => {
       const reassignEntry = audit.find((e) => typeof e.note === 'string' && e.note.includes('reassigned'));
       expect(reassignEntry).toBeUndefined();
     });
+
+    describe('claim-lock reconciliation on reassign (PR #64 P2 fix)', () => {
+      const claimPathFor = (id: string) => join(paths.taskDir, '.claims', `${id}.claim`);
+
+      it('clears a stale claim-lock when reassigning to pending (fresh pickup)', () => {
+        const taskId = createTask(paths, 'paul', 'acme', 'Claimed then reassigned');
+        claimTask(paths, taskId, 'alice'); // alice holds the lock, status in_progress
+        expect(existsSync(claimPathFor(taskId))).toBe(true);
+
+        updateTask(paths, taskId, 'pending', 'bob');
+
+        // Lock cleared so bob can claim fresh; assigned_to moved to bob.
+        expect(existsSync(claimPathFor(taskId))).toBe(false);
+        const content = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8'));
+        expect(content.assigned_to).toBe('bob');
+        expect(content.status).toBe('pending');
+      });
+
+      it('lets the new assignee claim fresh after a pending reassign (end-to-end bug repro)', () => {
+        const taskId = createTask(paths, 'paul', 'acme', 'Handoff to bob');
+        claimTask(paths, taskId, 'alice');
+        updateTask(paths, taskId, 'pending', 'bob');
+
+        // Pre-fix this threw "already claimed by alice". Now bob claims cleanly
+        // and hits the full flip path.
+        expect(() => claimTask(paths, taskId, 'bob')).not.toThrow();
+        const content = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8'));
+        expect(content.status).toBe('in_progress');
+        expect(content.assigned_to).toBe('bob');
+      });
+
+      it('transfers the claim-lock to the new assignee on an in_progress handoff', () => {
+        const taskId = createTask(paths, 'paul', 'acme', 'Mid-work handoff');
+        claimTask(paths, taskId, 'alice');
+
+        updateTask(paths, taskId, 'in_progress', 'bob');
+
+        // Lock persists but now names bob; alice can no longer act, bob owns it.
+        expect(existsSync(claimPathFor(taskId))).toBe(true);
+        const owner = readFileSync(claimPathFor(taskId), 'utf-8').split('\t')[0];
+        expect(owner).toBe('bob');
+        // bob re-claiming is idempotent success (he owns the lock).
+        expect(() => claimTask(paths, taskId, 'bob')).not.toThrow();
+      });
+
+      it('records the claim reconciliation in the audit note', () => {
+        const taskId = createTask(paths, 'paul', 'acme', 'Audited handoff');
+        claimTask(paths, taskId, 'alice');
+        updateTask(paths, taskId, 'pending', 'bob');
+
+        const audit = readTaskAudit(paths, taskId);
+        const entry = audit.find((e) => typeof e.note === 'string' && e.note.includes('claim-lock'));
+        expect(entry).toBeDefined();
+        expect(entry!.note).toContain('cleared');
+        expect(entry!.note).toContain('alice');
+      });
+
+      it('is a no-op on an unclaimed task (no lock file created)', () => {
+        const taskId = createTask(paths, 'paul', 'acme', 'Never claimed', { assignee: 'alice' });
+        updateTask(paths, taskId, 'pending', 'bob');
+
+        // No claim existed → reconcile creates nothing; reassignment still applies.
+        expect(existsSync(claimPathFor(taskId))).toBe(false);
+        const content = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8'));
+        expect(content.assigned_to).toBe('bob');
+      });
+
+      it('leaves the lock untouched when the new assignee already owns it', () => {
+        const taskId = createTask(paths, 'paul', 'acme', 'Self reassign');
+        claimTask(paths, taskId, 'alice');
+        const before = readFileSync(claimPathFor(taskId), 'utf-8');
+
+        updateTask(paths, taskId, 'in_progress', 'alice');
+
+        const after = readFileSync(claimPathFor(taskId), 'utf-8');
+        expect(after).toBe(before); // unchanged
+      });
+    });
   });
 
   describe('completeTask', () => {

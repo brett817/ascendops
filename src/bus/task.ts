@@ -253,6 +253,76 @@ export function findTaskFile(paths: BusPaths, taskId: string): string | null {
 }
 
 /**
+ * Reconcile the claim-lock when a task is reassigned to a different agent.
+ *
+ * Background: `claimTask` writes a companion lock at
+ * `<taskDir>/.claims/<taskId>.claim` (`<owner>\t<iso>`) and rejects any later
+ * claim whose owner differs. If `update-task --assignee` moved `assigned_to`
+ * without touching that lock, the new assignee would be permanently blocked
+ * from claiming a task it now owns — a silent handoff break (Codex P2 on
+ * PR #64). This reconciles the lock with the reassignment, status-aware:
+ *
+ *   - newStatus === 'pending'  → CLEAR the stale lock. Fresh-pickup intent:
+ *     the new assignee runs claimTask later and hits the full
+ *     write-lock + flip-to-in_progress path. Avoids the pending+owned
+ *     weird state where claimTask's idempotent branch returns early
+ *     (owner === agent) without flipping status.
+ *   - newStatus !== 'pending'  → TRANSFER the lock to the new assignee.
+ *     Mid-work handoff: the new owner holds the lock directly (the prior
+ *     owner can no longer act) and does not need to re-claim.
+ *   - owner already === newAssignee, or no lock exists → no-op.
+ *
+ * Audit continuity lives in the task audit log (the `reassigned X → Y`
+ * note on the update event), not the lock file — the lock is mutual
+ * exclusion, not history.
+ *
+ * CROSS-ORG BOUNDARY (known framework asymmetry, not handled here):
+ * `findTaskFile` resolves a task .json cross-org (an assignee in one org can
+ * drive a task filed in another), but `claimTask` builds its claims dir from
+ * the CALLER's own `paths.taskDir`, keyed only on taskId — never org-qualified.
+ * So a lock taken by an agent in org A lives in org-A/.claims and is NOT
+ * reachable from org B. This reconcile uses `paths.taskDir/.claims` to match
+ * exactly where `claimTask` writes for the calling agent's org — correct for
+ * the single-org deployment (all agents share one taskDir). A cross-org
+ * reassignment of a claimed task cannot reach the original lock; the root fix
+ * is to make claimTask's claim path org-aware (derive from the resolved task
+ * filePath dir) — tracked separately, out of scope for this P2.
+ *
+ * Returns a short audit note describing what happened, or undefined for no-op.
+ */
+function reconcileClaimOnReassign(
+  paths: BusPaths,
+  taskId: string,
+  newAssignee: string,
+  newStatus: TaskStatus,
+): string | undefined {
+  const claimPath = join(paths.taskDir, '.claims', `${taskId}.claim`);
+  if (!existsSync(claimPath)) return undefined; // unclaimed — nothing to reconcile
+  let owner: string | undefined;
+  try {
+    owner = readFileSync(claimPath, 'utf-8').split('\t')[0];
+  } catch {
+    return undefined; // unreadable lock — leave it; claimTask handles fall-through
+  }
+  if (owner === newAssignee) return undefined; // already correct
+  if (newStatus === 'pending') {
+    try {
+      unlinkSync(claimPath);
+      return `claim-lock cleared (was ${owner}) for fresh pickup`;
+    } catch {
+      return undefined;
+    }
+  }
+  const now = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+  try {
+    writeFileSync(claimPath, `${newAssignee}\t${now}\n`, { encoding: 'utf-8', mode: 0o600 });
+    return `claim-lock transferred ${owner} → ${newAssignee}`;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Update a task's status. Matches bash update-task.sh behavior, with the
  * cross-org fallback from findTaskFile so an assignee in one org can drive
  * the lifecycle of a task filed by an orchestrator in a sibling org.
@@ -269,13 +339,33 @@ export function updateTask(
       `Task ${taskId} not found in any org under ${paths.ctxRoot}/orgs/`,
     );
   }
-  let prevStatus: TaskStatus | undefined;
-  let prevAssignee: string | undefined;
+  let task: Task;
   try {
-    const content = readFileSync(filePath, 'utf-8');
-    const task: Task = JSON.parse(content);
-    prevStatus = task.status;
-    prevAssignee = task.assigned_to;
+    task = JSON.parse(readFileSync(filePath, 'utf-8')) as Task;
+  } catch (err) {
+    throw new Error(`Task ${taskId} update failed (unreadable): ${err}`);
+  }
+  const prevStatus = task.status;
+  const prevAssignee = task.assigned_to;
+  const reassigned = newAssignee !== undefined && newAssignee !== prevAssignee;
+
+  // Reconcile the claim-lock BEFORE committing the assigned_to change so the
+  // new assignee isn't blocked from claiming a task it now owns (Codex P2 on
+  // PR #64). Ordering matters for crash recovery: reconciling first means that
+  // if the JSON write below fails, a retry still reads assigned_to ==
+  // prevAssignee, re-enters this reassignment branch, and re-runs reconcile
+  // (idempotent — a no-op once the lock already matches the new assignee or is
+  // already cleared). Reconciling AFTER the write would strand a failed
+  // reconcile: the JSON would already name the new assignee, so the retry's
+  // `reassigned` guard would skip reconcile entirely and the stale lock would
+  // persist forever. atomicWriteSync is itself atomic (tmp + rename), so the
+  // only non-atomic seam is between these two local-fs steps, and the
+  // reorder + idempotent guard make that seam self-healing on retry.
+  const claimNote = reassigned
+    ? reconcileClaimOnReassign(paths, taskId, newAssignee as string, status)
+    : undefined;
+
+  try {
     task.status = status;
     // Optional reassignment: when newAssignee is provided, mutate assigned_to
     // alongside the status change. Passing undefined leaves the assignee
@@ -288,9 +378,10 @@ export function updateTask(
   } catch (err) {
     throw new Error(`Task ${taskId} update failed: ${err}`);
   }
-  const reassigned = newAssignee !== undefined && newAssignee !== prevAssignee;
   const note = reassigned
-    ? `reassigned ${prevAssignee ?? 'unassigned'} → ${newAssignee}`
+    ? [`reassigned ${prevAssignee ?? 'unassigned'} → ${newAssignee}`, claimNote]
+        .filter(Boolean)
+        .join('; ')
     : undefined;
   appendTaskAudit(paths, taskId, {
     event: 'update',
