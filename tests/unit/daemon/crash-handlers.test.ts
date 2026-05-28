@@ -14,6 +14,8 @@ import {
   CRASH_LOOP_THRESHOLD,
   CRASH_LOOP_COOLDOWN_MS,
   CrashHistory,
+  assessOperatorAlertReadiness,
+  getOperatorChatCreds,
 } from '../../../src/daemon/index';
 
 // Regression guard for the 2026-04-22 restart storm visibility work. These
@@ -179,5 +181,78 @@ describe('writeDaemonCrashedMarkers', () => {
     const content = readFileSync(join(ctxRoot, 'state', 'boris', '.daemon-crashed'), 'utf-8');
     expect(content).not.toBe('OLD');
     expect(content).toMatch(/\d{4}-\d{2}-\d{2}T/);
+  });
+});
+
+// Crash-loop alert readiness (arch-map surprise #3): the daemon must surface
+// a missing alert destination AT STARTUP rather than silently drop the alert
+// to stderr mid-crash-loop. 'blind' (fresh install) is fatal; 'degraded'
+// (creds didn't resolve but agent .env exists) warns and keeps running.
+describe('assessOperatorAlertReadiness', () => {
+  let fwRoot: string;
+  let savedChat: string | undefined;
+  let savedToken: string | undefined;
+
+  const VALID_TOKEN = '123456789:AAEhBP0abcDEFghiJKLmnoPQRstuVWxyz12';
+
+  function writeAgentEnv(org: string, agent: string, body: string): void {
+    const dir = join(fwRoot, 'orgs', org, 'agents', agent);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, '.env'), body, 'utf-8');
+  }
+
+  beforeEach(() => {
+    fwRoot = mkdtempSync(join(tmpdir(), 'cortextos-alert-ready-'));
+    // Isolate from the ambient daemon environment so the operator-env tier
+    // is controlled per-test.
+    savedChat = process.env.CTX_OPERATOR_CHAT_ID;
+    savedToken = process.env.CTX_OPERATOR_BOT_TOKEN;
+    delete process.env.CTX_OPERATOR_CHAT_ID;
+    delete process.env.CTX_OPERATOR_BOT_TOKEN;
+  });
+
+  afterEach(() => {
+    rmSync(fwRoot, { recursive: true, force: true });
+    if (savedChat === undefined) delete process.env.CTX_OPERATOR_CHAT_ID;
+    else process.env.CTX_OPERATOR_CHAT_ID = savedChat;
+    if (savedToken === undefined) delete process.env.CTX_OPERATOR_BOT_TOKEN;
+    else process.env.CTX_OPERATOR_BOT_TOKEN = savedToken;
+  });
+
+  it("returns 'ok' when operator env creds are set", () => {
+    process.env.CTX_OPERATOR_CHAT_ID = '999';
+    process.env.CTX_OPERATOR_BOT_TOKEN = VALID_TOKEN;
+    expect(assessOperatorAlertReadiness(fwRoot)).toBe('ok');
+  });
+
+  it("returns 'ok' when an agent .env carries valid BOT_TOKEN + CHAT_ID", () => {
+    writeAgentEnv('ascendops', 'collie', `BOT_TOKEN=${VALID_TOKEN}\nCHAT_ID=42\n`);
+    expect(getOperatorChatCreds(fwRoot)).not.toBeNull();
+    expect(assessOperatorAlertReadiness(fwRoot)).toBe('ok');
+  });
+
+  it("returns 'degraded' when an agent .env exists but has no valid creds", () => {
+    // .env present (configured install) but the token doesn't match the
+    // expected shape → creds don't resolve, yet there's something to warn about.
+    writeAgentEnv('ascendops', 'collie', 'BOT_TOKEN=not-a-valid-token\nCHAT_ID=42\n');
+    expect(getOperatorChatCreds(fwRoot)).toBeNull();
+    expect(assessOperatorAlertReadiness(fwRoot)).toBe('degraded');
+  });
+
+  it("returns 'blind' on a fresh install: no operator env and no agent .env", () => {
+    mkdirSync(join(fwRoot, 'orgs', 'ascendops', 'agents'), { recursive: true });
+    // agents dir exists but contains no agent with a .env
+    expect(assessOperatorAlertReadiness(fwRoot)).toBe('blind');
+  });
+
+  it("returns 'blind' when the orgs directory doesn't exist at all", () => {
+    expect(assessOperatorAlertReadiness(fwRoot)).toBe('blind');
+  });
+
+  it("ignores _shared and hidden dirs when looking for an agent .env", () => {
+    writeAgentEnv('ascendops', '_shared', `BOT_TOKEN=${VALID_TOKEN}\nCHAT_ID=42\n`);
+    writeAgentEnv('ascendops', '.hidden', `BOT_TOKEN=${VALID_TOKEN}\nCHAT_ID=42\n`);
+    // Only _shared/.hidden have .env → must NOT count as a real agent fallback.
+    expect(assessOperatorAlertReadiness(fwRoot)).toBe('blind');
   });
 });

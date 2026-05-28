@@ -110,7 +110,7 @@ export function writeDaemonCrashedMarkers(ctxRoot: string): void {
   }
 }
 
-function getOperatorChatCreds(frameworkRoot: string): { chatId: string; botToken: string } | null {
+export function getOperatorChatCreds(frameworkRoot: string): { chatId: string; botToken: string } | null {
   // Priority 1: explicit operator env (recommended for production).
   const envChat = process.env.CTX_OPERATOR_CHAT_ID;
   const envToken = process.env.CTX_OPERATOR_BOT_TOKEN;
@@ -151,6 +151,53 @@ function getOperatorChatCreds(frameworkRoot: string): { chatId: string; botToken
     }
   } catch { /* fall through */ }
   return null;
+}
+
+/**
+ * Whether ANY agent has a `.env` file on disk (regardless of whether it
+ * carries valid creds). Used to distinguish a fresh-install-pre-any-agent
+ * state (nothing could ever back the crash-loop alert) from a configured
+ * install whose creds simply didn't resolve. Mirrors getOperatorChatCreds'
+ * orgs/<org>/agents/<agent> walk and the same _shared/hidden-dir filter.
+ */
+function anyAgentEnvExists(frameworkRoot: string): boolean {
+  try {
+    const orgsRoot = join(frameworkRoot, 'orgs');
+    if (!existsSync(orgsRoot)) return false;
+    const orgs = readdirSync(orgsRoot, { withFileTypes: true }).filter(d => d.isDirectory());
+    for (const org of orgs) {
+      const agentsRoot = join(orgsRoot, org.name, 'agents');
+      if (!existsSync(agentsRoot)) continue;
+      const agents = readdirSync(agentsRoot, { withFileTypes: true })
+        .filter(d => d.isDirectory())
+        .filter(d => !d.name.startsWith('_') && !d.name.startsWith('.'));
+      for (const a of agents) {
+        if (existsSync(join(agentsRoot, a.name, '.env'))) return true;
+      }
+    }
+  } catch { /* fall through to false */ }
+  return false;
+}
+
+/**
+ * Classify the daemon's ability to deliver a crash-loop alert, evaluated
+ * once at startup so the operator learns about a gap WHILE they are watching
+ * the boot — not buried in a stderr line 15 minutes into a crash-loop (the
+ * silent-drop failure from arch-map surprise #3).
+ *
+ *   'ok'       — operator env creds OR a valid agent .env resolved.
+ *   'degraded' — no creds resolved, but agent .env(s) exist (mid-life creds
+ *                loss / invalid token). Warn loudly, keep running: breaking
+ *                startup is worse than the alert gap, and the install is
+ *                otherwise functional.
+ *   'blind'    — no creds AND no agent .env anywhere (fresh-install pre-any-
+ *                agent). The one-alert-before-fleet-dies promise is
+ *                structurally impossible; hard-fail with a clear fix message
+ *                rather than boot into a silent-no-alerts state.
+ */
+export function assessOperatorAlertReadiness(frameworkRoot: string): 'ok' | 'degraded' | 'blind' {
+  if (getOperatorChatCreds(frameworkRoot)) return 'ok';
+  return anyAgentEnvExists(frameworkRoot) ? 'degraded' : 'blind';
 }
 
 function sendCrashLoopAlertBestEffort(
@@ -250,6 +297,35 @@ class Daemon {
     if (!frameworkRoot) {
       console.error('[daemon] CTX_FRAMEWORK_ROOT not set');
       process.exit(1);
+    }
+
+    // Crash-loop alert readiness (arch-map surprise #3): surface a missing
+    // alert destination AT STARTUP rather than silently dropping the alert to
+    // stderr mid-crash-loop. Two failure modes, two responses:
+    //   - 'blind' (fresh install, no creds + no agent .env): the safety net is
+    //     structurally impossible — hard-fail with a fix message.
+    //   - 'degraded' (creds didn't resolve but agent .env(s) exist): warn
+    //     loudly and keep running; breaking startup is worse than the gap.
+    const alertReadiness = assessOperatorAlertReadiness(frameworkRoot);
+    if (alertReadiness === 'blind') {
+      console.error(
+        '\n[daemon] FATAL: no crash-loop alert destination configured and no agent .env exists.\n' +
+        '  The daemon could not notify you if it crash-loops — the one-alert-before-fleet-dies\n' +
+        '  safety net is structurally impossible in this state.\n' +
+        '  Fix one of:\n' +
+        '    • set CTX_OPERATOR_CHAT_ID + CTX_OPERATOR_BOT_TOKEN in the daemon environment, or\n' +
+        '    • create at least one agent with BOT_TOKEN + CHAT_ID in its .env\n' +
+        '  then restart the daemon.\n',
+      );
+      process.exit(1);
+    }
+    if (alertReadiness === 'degraded') {
+      console.warn(
+        '\n[daemon] WARNING: no operator alert destination resolved.\n' +
+        '  Crash-loop alerts will be UNDELIVERABLE until CTX_OPERATOR_CHAT_ID +\n' +
+        '  CTX_OPERATOR_BOT_TOKEN are set, or an agent .env carries a valid\n' +
+        '  BOT_TOKEN + CHAT_ID. Daemon continues; agent operation is unaffected.\n',
+      );
     }
 
     // Write PID file
