@@ -4,6 +4,7 @@ import { join } from 'path';
 import { homedir, platform } from 'os';
 import { execSync, spawn, spawnSync } from 'child_process';
 import { IPCClient } from '../daemon/ipc-server.js';
+import { requestKeepAlive } from './_finalize.js';
 
 const IS_WINDOWS = platform() === 'win32';
 const SAFE_CMD = /^[@a-z0-9._/-]+$/i;
@@ -67,6 +68,11 @@ export const startCommand = new Command('start')
         process.on('SIGINT', () => child.kill('SIGTERM'));
         process.on('SIGTERM', () => child.kill('SIGTERM'));
         process.on('exit', () => { try { child.kill(); } catch { /* already dead */ } });
+        // This command intentionally stays attached to the foreground daemon
+        // child. Opt out of the CLI's drain-safe forced exit (see _finalize.ts);
+        // otherwise the entry's finalizeProcess(0) would fire when this action
+        // returns and the process.on('exit') handler above would kill the daemon.
+        requestKeepAlive();
         return;
       }
 

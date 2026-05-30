@@ -25,6 +25,7 @@ import { configureCommand } from './configure.js';
 import { spawnWorkerCommand, terminateWorkerCommand, listWorkersCommand, injectWorkerCommand } from './workers.js';
 import { importAgentCommand } from './import-agent.js';
 import { botCommand } from './bot.js';
+import { finalizeProcess } from './_finalize.js';
 
 const program = new Command();
 
@@ -71,4 +72,14 @@ const crashAlertCommand = new Command('crash-alert')
   });
 program.addCommand(crashAlertCommand);
 
-program.parse();
+// Drain-safe process exit — forces a clean exit after the command's work
+// completes, working around Node 25 keeping an inherited socket/pipe stdin
+// handle ref'd (the intermittent "bus command hangs until stdin EOF" bug)
+// without truncating un-flushed piped stdout. See ./_finalize.ts.
+program
+  .parseAsync(process.argv)
+  .then(() => finalizeProcess(0))
+  .catch((err: unknown) => {
+    console.error(err instanceof Error ? err.message : String(err));
+    finalizeProcess(1);
+  });
