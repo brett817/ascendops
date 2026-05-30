@@ -987,11 +987,11 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → context_status.json', 
     return JSON.parse(lastCall[1]) as Record<string, unknown>;
   }
 
-  it('writes context_status.json atomically with computed used_percentage', () => {
+  it('writes context_status.json atomically with current-window used_percentage', () => {
     const pty = new CodexAppServerPTY(mockEnv, {});
     (pty as unknown as { _threadId: string })._threadId = 'thread-9';
     feedTokenUsage(pty, {
-      last: { cachedInputTokens: 0, inputTokens: 1000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 1000 },
+      last: { cachedInputTokens: 15000, inputTokens: 70000, outputTokens: 2000, reasoningOutputTokens: 0, totalTokens: 72000 },
       total: { cachedInputTokens: 5000, inputTokens: 60000, outputTokens: 4000, reasoningOutputTokens: 1000, totalTokens: 70000 },
       modelContextWindow: 200000,
     });
@@ -1006,18 +1006,37 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → context_status.json', 
     expect(payload.session_id).toBe('thread-9');
     expect(typeof payload.written_at).toBe('string');
     expect(payload.current_usage).toEqual({
-      input_tokens: 60000,
-      output_tokens: 4000,
-      cache_read_input_tokens: 5000,
+      input_tokens: 70000,
+      output_tokens: 2000,
+      cache_read_input_tokens: 15000,
       cache_creation_input_tokens: 0,
     });
+  });
+
+  it('keeps used_percentage stable from tokenUsage.last instead of cumulative total', () => {
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    (pty as unknown as { _threadId: string })._threadId = 'thread-9';
+
+    feedTokenUsage(pty, {
+      last: { cachedInputTokens: 12000, inputTokens: 40000, outputTokens: 1000, reasoningOutputTokens: 0, totalTokens: 41000 },
+      total: { cachedInputTokens: 700000, inputTokens: 900000, outputTokens: 10000, reasoningOutputTokens: 0, totalTokens: 910000 },
+      modelContextWindow: 200000,
+    });
+    expect(lastWrittenPayload()!.used_percentage).toBeCloseTo(20, 5);
+
+    feedTokenUsage(pty, {
+      last: { cachedInputTokens: 13000, inputTokens: 40000, outputTokens: 1200, reasoningOutputTokens: 0, totalTokens: 41200 },
+      total: { cachedInputTokens: 900000, inputTokens: 1_100_000, outputTokens: 12000, reasoningOutputTokens: 0, totalTokens: 1_112_000 },
+      modelContextWindow: 200000,
+    });
+    expect(lastWrittenPayload()!.used_percentage).toBeCloseTo(20, 5);
   });
 
   it('falls back to default 256000 cap when modelContextWindow is null', () => {
     const pty = new CodexAppServerPTY(mockEnv, {});
     (pty as unknown as { _threadId: string })._threadId = 'thread-9';
     feedTokenUsage(pty, {
-      last: { cachedInputTokens: 0, inputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
+      last: { cachedInputTokens: 0, inputTokens: 64000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 64000 },
       total: { cachedInputTokens: 0, inputTokens: 64000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 64000 },
       modelContextWindow: null,
     });
@@ -1031,7 +1050,7 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → context_status.json', 
     const pty = new CodexAppServerPTY(mockEnv, { codex_context_cap: 100000 });
     (pty as unknown as { _threadId: string })._threadId = 'thread-9';
     feedTokenUsage(pty, {
-      last: { cachedInputTokens: 0, inputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
+      last: { cachedInputTokens: 0, inputTokens: 50000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 50000 },
       total: { cachedInputTokens: 0, inputTokens: 50000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 50000 },
       modelContextWindow: null,
     });
@@ -1045,8 +1064,8 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → context_status.json', 
     const pty = new CodexAppServerPTY(mockEnv, {});
     (pty as unknown as { _threadId: string })._threadId = 'thread-9';
     feedTokenUsage(pty, {
-      last: { cachedInputTokens: 0, inputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
-      total: { cachedInputTokens: 0, inputTokens: 210000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 210000 },
+      last: { cachedInputTokens: 0, inputTokens: 210000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 210000 },
+      total: { cachedInputTokens: 0, inputTokens: 1_000_000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 1_000_000 },
       modelContextWindow: 1000000,
     });
 
@@ -1054,11 +1073,11 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → context_status.json', 
     expect(payload.exceeds_200k_tokens).toBe(true);
   });
 
-  it('clamps used_percentage to 100 when totals exceed cap', () => {
+  it('clamps used_percentage to 100 when current-window input exceeds cap', () => {
     const pty = new CodexAppServerPTY(mockEnv, {});
     (pty as unknown as { _threadId: string })._threadId = 'thread-9';
     feedTokenUsage(pty, {
-      last: { cachedInputTokens: 0, inputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
+      last: { cachedInputTokens: 0, inputTokens: 300000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 300000 },
       total: { cachedInputTokens: 0, inputTokens: 300000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 300000 },
       modelContextWindow: 256000,
     });
@@ -1077,12 +1096,22 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → context_status.json', 
     expect(atomicWriteSyncMock).not.toHaveBeenCalled();
   });
 
-  it('skips the write when total.totalTokens is missing', () => {
+  it('skips the write when tokenUsage.last is missing', () => {
     const pty = new CodexAppServerPTY(mockEnv, {});
     (pty as unknown as { _threadId: string })._threadId = 'thread-9';
     feedTokenUsage(pty, {
-      last: { cachedInputTokens: 0, inputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
-      total: { cachedInputTokens: 0, inputTokens: 100, outputTokens: 0, reasoningOutputTokens: 0 },
+      total: { cachedInputTokens: 0, inputTokens: 100, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 100 },
+      modelContextWindow: 200000,
+    });
+    expect(atomicWriteSyncMock).not.toHaveBeenCalled();
+  });
+
+  it('skips the write when last.inputTokens is missing', () => {
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    (pty as unknown as { _threadId: string })._threadId = 'thread-9';
+    feedTokenUsage(pty, {
+      last: { cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
+      total: { cachedInputTokens: 0, inputTokens: 100, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 100 },
       modelContextWindow: 200000,
     });
     expect(atomicWriteSyncMock).not.toHaveBeenCalled();
@@ -1092,7 +1121,7 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → context_status.json', 
     const pty = new CodexAppServerPTY(mockEnv, {});
     (pty as unknown as { _threadId: string })._threadId = 'thread-9';
     feedTokenUsage(pty, {
-      last: { cachedInputTokens: 0, inputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
+      last: { cachedInputTokens: 0, inputTokens: 1000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 1000 },
       total: { cachedInputTokens: 0, inputTokens: 1000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 1000 },
       modelContextWindow: 200000,
     });
@@ -1104,7 +1133,7 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → context_status.json', 
     const pty = new CodexAppServerPTY(mockEnv, {});
     (pty as unknown as { _threadId: string })._threadId = 'thread-9';
     expect(() => feedTokenUsage(pty, {
-      last: { cachedInputTokens: 0, inputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
+      last: { cachedInputTokens: 0, inputTokens: 1000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 1000 },
       total: { cachedInputTokens: 0, inputTokens: 1000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 1000 },
       modelContextWindow: 200000,
     })).not.toThrow();

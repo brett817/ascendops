@@ -873,34 +873,36 @@ export class CodexAppServerPTY {
    * monitor. Writes atomically; failures are non-fatal (observability only).
    *
    * Mapping (per codex schema ThreadTokenUsageUpdatedNotification):
-   *   - used_percentage = total.totalTokens / cap * 100  (clamped to [0, 100])
+   *   - used_percentage = last.inputTokens / cap * 100  (clamped to [0, 100])
    *   - context_window_size = modelContextWindow ?? config.codex_context_cap ?? 256000
-   *   - exceeds_200k_tokens = total.totalTokens > 200000
-   *   - current_usage.{input,output,cache_read} from total.{input,output,cachedInput}Tokens
+   *   - exceeds_200k_tokens = last.inputTokens > 200000
+   *   - current_usage.{input,output,cache_read} from last.{input,output,cachedInput}Tokens
    *   - session_id = current threadId
    */
   private writeContextStatus(params: Record<string, unknown>): void {
     const tokenUsage = isRecord(params.tokenUsage) ? params.tokenUsage : null;
     if (!tokenUsage) return;
-    const total = isRecord(tokenUsage.total) ? tokenUsage.total : null;
-    if (!total) return;
-    const totalTokens = typeof total.totalTokens === 'number' ? total.totalTokens : null;
-    if (totalTokens === null) return;
+    const last = isRecord(tokenUsage.last) ? tokenUsage.last : null;
+    if (!last) return;
+    const currentWindowInputTokens = typeof last.inputTokens === 'number' ? last.inputTokens : null;
+    if (currentWindowInputTokens === null) return;
 
     const modelContextWindow = typeof tokenUsage.modelContextWindow === 'number'
       ? tokenUsage.modelContextWindow
       : null;
     const cap = modelContextWindow ?? this._config.codex_context_cap ?? 256000;
-    const usedPct = cap > 0 ? Math.min(100, (totalTokens / cap) * 100) : null;
+    const usedPct = cap > 0
+      ? Math.min(100, Math.max(0, (currentWindowInputTokens / cap) * 100))
+      : null;
 
-    const inputTokens = typeof total.inputTokens === 'number' ? total.inputTokens : 0;
-    const outputTokens = typeof total.outputTokens === 'number' ? total.outputTokens : 0;
-    const cachedInputTokens = typeof total.cachedInputTokens === 'number' ? total.cachedInputTokens : 0;
+    const inputTokens = currentWindowInputTokens;
+    const outputTokens = typeof last.outputTokens === 'number' ? last.outputTokens : 0;
+    const cachedInputTokens = typeof last.cachedInputTokens === 'number' ? last.cachedInputTokens : 0;
 
     const payload = JSON.stringify({
       used_percentage: usedPct,
       context_window_size: cap,
-      exceeds_200k_tokens: totalTokens > 200000,
+      exceeds_200k_tokens: currentWindowInputTokens > 200000,
       current_usage: {
         input_tokens: inputTokens,
         output_tokens: outputTokens,
