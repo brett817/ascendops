@@ -178,6 +178,15 @@ const TELEGRAM_BANNED_PATTERNS: TelegramLintRule[] = [
     reason: 'framework brand leak (cortextos is the internal framework name)',
     suggest: 'use "AscendOps" (the product David knows)',
   },
+  {
+    // Em-dash, en-dash, and horizontal bar. David hard rule 2026-05-30:
+    // "we do not use em dashes ever in human communication and writing" —
+    // they read as machine-written and break trust. Regular hyphen-minus
+    // (U+002D) is intentionally NOT matched, so compounds and ranges are fine.
+    pattern: /[–—―]/,
+    reason: 'em-dash banned (reads as AI-written, David hard rule 2026-05-30)',
+    suggest: 'use a comma, period, or parentheses instead, never a long dash',
+  },
 ];
 
 const AGENT_NAME_PATTERN: TelegramLintRule = {

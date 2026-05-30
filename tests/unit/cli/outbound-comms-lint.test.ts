@@ -192,6 +192,28 @@ describe('outbound comms lint', () => {
     expect(telegramSendSpy).toHaveBeenCalledTimes(1);
   });
 
+  it('blocks send-telegram when message contains an em-dash (David hard rule 2026-05-30)', async () => {
+    await expect(
+      busCommand.parseAsync(['send-telegram', '12345', 'The fix is live — no silent drop'], { from: 'user' })
+    ).rejects.toThrow();
+    expect(telegramSendSpy).not.toHaveBeenCalled();
+  });
+
+  it('blocks send-telegram when message contains an en-dash', async () => {
+    await expect(
+      busCommand.parseAsync(['send-telegram', '12345', 'Window is 1–3pm today'], { from: 'user' })
+    ).rejects.toThrow();
+    expect(telegramSendSpy).not.toHaveBeenCalled();
+  });
+
+  it('does NOT block send-telegram on plain hyphen-minus (compounds and numeric ranges stay safe)', async () => {
+    await busCommand.parseAsync(
+      ['send-telegram', '12345', 'The well-known issue is fixed, ETA 1-3pm'],
+      { from: 'user' },
+    );
+    expect(telegramSendSpy).toHaveBeenCalledTimes(1);
+  });
+
   it('allows clean send-telegram message that avoids all Telegram patterns', async () => {
     await busCommand.parseAsync(
       ['send-telegram', '12345', 'The migration shipped overnight - durable docs are now in git'],
