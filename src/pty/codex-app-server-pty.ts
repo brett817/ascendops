@@ -897,6 +897,12 @@ export class CodexAppServerPTY {
 
     const inputTokens = currentWindowInputTokens;
     const outputTokens = typeof last.outputTokens === 'number' ? last.outputTokens : 0;
+    // Codex invariant, verified from rollout samples and live notification
+    // payloads: last.inputTokens is the full current-window size and already
+    // includes cachedInputTokens. cachedInputTokens is a subset of inputTokens
+    // (cached <= input), while total tokens = input + output. Do not add
+    // cachedInputTokens to this metric; unlike Anthropic cache_read semantics,
+    // that would double-count the cached subset and trigger premature handoffs.
     const cachedInputTokens = typeof last.cachedInputTokens === 'number' ? last.cachedInputTokens : 0;
 
     const payload = JSON.stringify({

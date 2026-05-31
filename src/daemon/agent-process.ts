@@ -658,6 +658,10 @@ export class AgentProcess {
     // Check for force-fresh marker
     const forceFreshPath = join(this.env.ctxRoot, 'state', this.name, '.force-fresh');
     if (existsSync(forceFreshPath)) {
+      // Context watchdog and hard-restart use this marker to force a fresh
+      // session instead of `--continue`. The marker is consumed here in the
+      // daemon launch decision, before runtime-specific boot prompts run; do
+      // not expect codex-app-server itself to read or clear `.force-fresh`.
       try {
         const { unlinkSync } = require('fs');
         unlinkSync(forceFreshPath);

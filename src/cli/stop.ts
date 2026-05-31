@@ -9,6 +9,12 @@ import { IPCClient } from '../daemon/ipc-server.js';
  * so the SessionEnd crash-alert hook (src/hooks/hook-crash-alert.ts) knows
  * the stop was intentional and does not fire a false 🚨 CRASH alarm.
  * Pattern matches src/cli/bus.ts:1285-1289.
+ *
+ * Marker hygiene note: `cortextos start <agent>` currently does not clear a
+ * stale `.user-stop` marker. If the operator expects auto-respawn semantics
+ * after a manual stop/start cycle, remove the stale marker before relying on
+ * daemon-driven recovery. Keep this marker intentionally separate from
+ * context-restart `.force-fresh` handling.
  */
 export function writeStopMarker(instanceId: string, agent: string, reason: string): void {
   try {
