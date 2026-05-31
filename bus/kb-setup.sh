@@ -89,7 +89,10 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
   "text_chunk_size": 1000,
   "text_chunk_overlap": 200,
   "similarity_threshold": 0.5,
-  "default_collection": "shared"
+  "default_collection": "shared",
+  "rerank_enabled": false,
+  "rerank_model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+  "rerank_overfetch": 5
 }
 EOF
   echo "  [OK] mmrag config.json created"

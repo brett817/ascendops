@@ -55,6 +55,9 @@ DEFAULT_EMBEDDING_DIMENSIONS = 768
 DEFAULT_SIMILARITY_THRESHOLD = 0.0  # return everything by default, let caller filter
 DEFAULT_MAX_TOKENS = 0  # 0 = unlimited
 DEFAULT_PREVIEW_CHARS = 300
+DEFAULT_RERANK_ENABLED = False
+DEFAULT_RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+DEFAULT_RERANK_OVERFETCH = 5
 
 # Pricing (per 1M tokens)
 EMBEDDING_PRICE_PER_M = 0.20
@@ -72,6 +75,8 @@ USAGE_FILE = MMRAG_DIR / "usage.json"
 # Usage Tracker
 # ---------------------------------------------------------------------------
 _tracker = None  # module-level, set by cmd_ingest/cmd_query
+_reranker = None
+_reranker_model_name = None
 
 
 class UsageTracker:
@@ -164,7 +169,11 @@ def load_config():
         print(f"  bash {Path(__file__).parent / 'setup.sh'}")
         sys.exit(1)
     with open(CONFIG_FILE) as f:
-        return json.load(f)
+        config = json.load(f)
+    config.setdefault("rerank_enabled", DEFAULT_RERANK_ENABLED)
+    config.setdefault("rerank_model", DEFAULT_RERANK_MODEL)
+    config.setdefault("rerank_overfetch", DEFAULT_RERANK_OVERFETCH)
+    return config
 
 
 def get_api_key(config):
@@ -1173,6 +1182,56 @@ def deduplicate_results(results, similarity_ratio=0.85):
     return deduped
 
 
+def _get_reranker(model_name):
+    """Lazy-load the cross-encoder only when reranking is explicitly enabled."""
+    global _reranker, _reranker_model_name
+    if _reranker is not None and _reranker_model_name == model_name:
+        return _reranker, 0.0
+
+    started = time.perf_counter()
+    try:
+        from sentence_transformers import CrossEncoder
+    except ImportError as exc:
+        raise RuntimeError(
+            "rerank_enabled is true but sentence-transformers is not installed. "
+            "Install knowledge-base/scripts/requirements.txt into knowledge-base/venv."
+        ) from exc
+
+    try:
+        _reranker = CrossEncoder(model_name)
+    except Exception as exc:
+        raise RuntimeError(
+            f"rerank_enabled is true but rerank_model {model_name!r} failed to load: {exc}"
+        ) from exc
+    _reranker_model_name = model_name
+    return _reranker, time.perf_counter() - started
+
+
+def rerank_results(question, results, model_name):
+    """Reorder candidate results with a cross-encoder, preserving vector similarity."""
+    if len(results) <= 1:
+        return results
+
+    reranker, load_seconds = _get_reranker(model_name)
+    pairs = [(question, r.get("content", "")) for r in results]
+    inference_started = time.perf_counter()
+    try:
+        scores = reranker.predict(pairs)
+    except Exception as exc:
+        raise RuntimeError(f"rerank_enabled is true but rerank inference failed: {exc}") from exc
+    inference_seconds = time.perf_counter() - inference_started
+
+    for r, score in zip(results, scores):
+        r["rerank_score"] = float(score)
+
+    print(
+        f"Rerank timings: model_load={load_seconds:.3f}s inference={inference_seconds:.3f}s "
+        f"candidates={len(results)} model={model_name}",
+        file=sys.stderr,
+    )
+    return sorted(results, key=lambda r: r.get("rerank_score", float("-inf")), reverse=True)
+
+
 def cmd_query(args):
     global _tracker
     _tracker = UsageTracker("query")
@@ -1186,8 +1245,19 @@ def cmd_query(args):
         print("Knowledge base is empty. Ingest some files first.")
         return
 
+    rerank_enabled = bool(config.get("rerank_enabled", DEFAULT_RERANK_ENABLED))
+    rerank_model = config.get("rerank_model", DEFAULT_RERANK_MODEL)
+    try:
+        rerank_overfetch = int(config.get("rerank_overfetch", DEFAULT_RERANK_OVERFETCH))
+    except (TypeError, ValueError):
+        print("ERROR: rerank_overfetch must be an integer", file=sys.stderr)
+        sys.exit(1)
+    if rerank_overfetch < 1:
+        print("ERROR: rerank_overfetch must be >= 1", file=sys.stderr)
+        sys.exit(1)
+
     # Fetch extra results so we have room after filtering/dedup
-    fetch_k = (args.top_k or 5) * 3
+    fetch_k = (args.top_k or 5) * (rerank_overfetch if rerank_enabled else 3)
     threshold = args.threshold if args.threshold is not None else config.get("similarity_threshold", DEFAULT_SIMILARITY_THRESHOLD)
     max_tokens = args.max_tokens or config.get("max_tokens", DEFAULT_MAX_TOKENS)
     show_full = args.full
@@ -1247,6 +1317,13 @@ def cmd_query(args):
     # Deduplicate near-identical results (same file in multiple lesson folders)
     filtered = deduplicate_results(filtered)
 
+    if rerank_enabled:
+        try:
+            filtered = rerank_results(args.question, filtered, rerank_model)
+        except RuntimeError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
+
     # Trim to requested top_k after dedup
     final_k = args.top_k or 5
     filtered = filtered[:final_k]
@@ -1290,6 +1367,8 @@ def cmd_query(args):
                 "type": meta.get("type", ""),
                 "filename": meta.get("filename", ""),
             }
+            if r.get("rerank_score") is not None:
+                entry["rerank_score"] = round(r["rerank_score"], 4)
             # Add type-specific fields
             if meta.get("chunk_index") is not None:
                 entry["chunk_index"] = meta["chunk_index"]
