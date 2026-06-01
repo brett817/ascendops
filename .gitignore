@@ -102,3 +102,13 @@ logs/weekly-tool-update/*.md
 
 # Local vendor research checkout — not runtime load-bearing
 vendor/everything-claude-code/
+
+# Pulled from public repo (David 2026-06-01): competitor/partner recon, internal
+# decisions log, and reverse-engineered PM API captures. Kept local, off public repo.
+orgs/*/docs/durable/pm-nexus-partner-recon-*.md
+orgs/*/docs/durable/competitive-pmdash-recon-*.md
+orgs/*/docs/durable/pm-september-conference-recon-*.md
+orgs/*/docs/durable/decisions-log.md
+orgs/*/docs/durable/pm-create-meld-in-and-merge-endpoint-capture-*.md
+orgs/*/docs/durable/pm-tenant-notes-endpoint-capture-*.md
+orgs/*/docs/durable/pm-phone-field-investigation-*.md
