@@ -822,7 +822,56 @@ export class FastChecker {
         .sendMessage(this.chatId, `Got stuck (${reason}). Hard-restarting now.`)
         .catch(() => { /* non-critical */ });
     }
+    // Preserve any recent handoff doc before the abrupt restart, same as the
+    // metric-driven forceContextRestart (Tier 2/3) path. Without this, a
+    // watchdog-triggered hard restart — including the cooperative ctx-threshold
+    // 15min fallback (Signal 3) — drops the handoff context the agent just
+    // wrote. This gap lost the Slack P1 dispatch context on the 2026-06-01
+    // 00:52Z forced restart.
+    this.preserveRecentHandoffDoc();
     this.agent.hardRestartSelf(reason).catch(e => this.log(`hardRestartSelf failed: ${e}`));
+  }
+
+  /**
+   * If the agent wrote a handoff doc in the last 15 minutes but didn't get to
+   * call `hard-restart --handoff-doc` (e.g. a watchdog or Tier-3 force-restart
+   * cut it short), write the `.handoff-doc-path` marker so the next session
+   * still receives the handoff context via AgentProcess.consumeHandoffBlock().
+   * Non-fatal: any failure proceeds without handoff context.
+   */
+  private preserveRecentHandoffDoc(): void {
+    try {
+      const handoffsDir = join(this.agent.getAgentDir(), 'memory', 'handoffs');
+      if (!existsSync(handoffsDir)) return;
+      const cutoff = Date.now() - 15 * 60_000;
+      const recent = readdirSync(handoffsDir)
+        .filter(f => f.startsWith('handoff-') && f.endsWith('.md'))
+        .map(f => ({ f, mtime: statSync(join(handoffsDir, f)).mtimeMs }))
+        .filter(({ mtime }) => mtime >= cutoff)
+        .sort((a, b) => b.mtime - a.mtime);
+      if (recent.length > 0) {
+        const docPath = join(handoffsDir, recent[0].f);
+        // Don't resurrect an already-consumed handoff doc. A cooperative handoff
+        // writes the doc, restarts, and the new session's consumeHandoffBlock()
+        // records {path, mtimeMs} in .handoff-doc-consumed. If a watchdog restart
+        // then fires within the 15-min window, re-preserving that same doc would
+        // re-inject stale, already-actioned context. Skip ONLY when both the path
+        // AND mtime match the consumed record: a NEWER doc (different path) OR a
+        // rewrite at a REUSED filename (same path, newer mtime) is still preserved
+        // so a genuinely-new handoff is never lost.
+        const consumedMarker = join(this.paths.stateDir, '.handoff-doc-consumed');
+        if (existsSync(consumedMarker)) {
+          try {
+            const consumed = JSON.parse(readFileSync(consumedMarker, 'utf-8')) as
+              { path?: string; mtimeMs?: number };
+            if (consumed.path === docPath && consumed.mtimeMs === recent[0].mtime) return;
+          } catch { /* fall through — preserve rather than silently skip */ }
+        }
+        const markerPath = join(this.paths.stateDir, '.handoff-doc-path');
+        writeFileSync(markerPath, docPath, 'utf-8');
+        this.log(`Restart: found recent handoff doc, writing marker → ${docPath}`);
+      }
+    } catch { /* non-fatal — proceed without handoff context */ }
   }
 
   /**
@@ -2027,26 +2076,9 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     this.ctxCircuitRestarts.push(now);
     this.saveCtxCircuit();
 
-    // If the agent wrote a handoff doc in the last 15 minutes but didn't get to call
-    // hard-restart --handoff-doc (e.g. Tier 3 force-restart cut it short), pick it up
-    // so the new session still receives handoff context.
-    try {
-      const handoffsDir = join(this.agent.getAgentDir(), 'memory', 'handoffs');
-      if (existsSync(handoffsDir)) {
-        const cutoff = now - 15 * 60_000;
-        const recent = readdirSync(handoffsDir)
-          .filter(f => f.startsWith('handoff-') && f.endsWith('.md'))
-          .map(f => ({ f, mtime: statSync(join(handoffsDir, f)).mtimeMs }))
-          .filter(({ mtime }) => mtime >= cutoff)
-          .sort((a, b) => b.mtime - a.mtime);
-        if (recent.length > 0) {
-          const docPath = join(handoffsDir, recent[0].f);
-          const markerPath = join(this.paths.stateDir, '.handoff-doc-path');
-          writeFileSync(markerPath, docPath, 'utf-8');
-          this.log(`Tier 3 restart: found recent handoff doc, writing marker → ${docPath}`);
-        }
-      }
-    } catch { /* non-fatal — proceed without handoff context */ }
+    // Preserve a recent handoff doc the agent wrote but didn't get to pass via
+    // hard-restart --handoff-doc, so the new session still receives it.
+    this.preserveRecentHandoffDoc();
 
     // Reset per-session context state for the new session
     this.ctxHandoffFiredAt = 0;

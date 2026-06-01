@@ -15,7 +15,7 @@ vi.mock('../../../src/slack/api.js', () => ({
     };
   }),
 }));
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, existsSync } from 'fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, existsSync, utimesSync, statSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { execFile } from 'child_process';
@@ -1460,6 +1460,157 @@ describe('FastChecker', () => {
       expect(checker.watchdogCircuitBroken).toBe(false);
       expect(checker.watchdogRestarts).toEqual([]);
       expect(checker.watchdogCircuitBrokenAt).toBe(0);
+    });
+  });
+
+  describe('preserveRecentHandoffDoc — watchdog (path A) handoff preservation', () => {
+    function makeAgentWithDir(agentDir: string) {
+      return {
+        name: 'test-agent',
+        isBootstrapped: vi.fn().mockReturnValue(true),
+        injectMessage: vi.fn().mockReturnValue(true),
+        write: vi.fn(),
+        getAgentDir: vi.fn().mockReturnValue(agentDir),
+        hardRestartSelf: vi.fn().mockResolvedValue(undefined),
+      } as any;
+    }
+
+    // The gap: the cooperative ctx-threshold 15min fallback (and every other
+    // watchdog signal) routes through triggerHardRestart, which previously did
+    // NOT preserve a handoff doc — unlike the metric-driven forceContextRestart.
+    // This lost the Slack P1 dispatch context on the 2026-06-01 00:52Z restart.
+    it('triggerHardRestart preserves a recent handoff doc via the .handoff-doc-path marker', () => {
+      const agentDir = join(testDir, 'agent');
+      const handoffsDir = join(agentDir, 'memory', 'handoffs');
+      mkdirSync(handoffsDir, { recursive: true });
+      const recentDoc = join(handoffsDir, 'handoff-2026-06-01T00-50-00Z.md');
+      writeFileSync(recentDoc, '# Handoff\n## Current Tasks\n- Slack P1 dispatch', 'utf-8');
+
+      const agent = makeAgentWithDir(agentDir);
+      const checker = new FastChecker(agent, paths, '/framework');
+      (checker as any).triggerHardRestart('ctx threshold fallback: agent ignored graceful restart');
+
+      const markerPath = join(paths.stateDir, '.handoff-doc-path');
+      expect(existsSync(markerPath)).toBe(true);
+      expect(readFileSync(markerPath, 'utf-8').trim()).toBe(recentDoc);
+      // The restart still fires — preservation is additive, not a gate.
+      expect(agent.hardRestartSelf).toHaveBeenCalledTimes(1);
+    });
+
+    it('writes NO marker when the only handoff doc is older than the 15-min window', () => {
+      const agentDir = join(testDir, 'agent2');
+      const handoffsDir = join(agentDir, 'memory', 'handoffs');
+      mkdirSync(handoffsDir, { recursive: true });
+      const oldDoc = join(handoffsDir, 'handoff-2026-05-31T00-00-00Z.md');
+      writeFileSync(oldDoc, '# old', 'utf-8');
+      const oldTime = Date.now() / 1000 - 3600; // 1h ago
+      utimesSync(oldDoc, oldTime, oldTime);
+
+      const agent = makeAgentWithDir(agentDir);
+      const checker = new FastChecker(agent, paths, '/framework');
+      (checker as any).triggerHardRestart('frozen: stdout unchanged');
+
+      expect(existsSync(join(paths.stateDir, '.handoff-doc-path'))).toBe(false);
+      expect(agent.hardRestartSelf).toHaveBeenCalledTimes(1);
+    });
+
+    it('picks the most recent handoff doc when several are within the window', () => {
+      const agentDir = join(testDir, 'agent3');
+      const handoffsDir = join(agentDir, 'memory', 'handoffs');
+      mkdirSync(handoffsDir, { recursive: true });
+      const older = join(handoffsDir, 'handoff-older.md');
+      const newer = join(handoffsDir, 'handoff-newer.md');
+      writeFileSync(older, 'older', 'utf-8');
+      writeFileSync(newer, 'newer', 'utf-8');
+      const base = Date.now() / 1000;
+      utimesSync(older, base - 600, base - 600); // 10 min ago
+      utimesSync(newer, base - 60, base - 60);   // 1 min ago
+
+      const agent = makeAgentWithDir(agentDir);
+      const checker = new FastChecker(agent, paths, '/framework');
+      (checker as any).triggerHardRestart('ctx exhaustion: session survey prompt');
+
+      expect(readFileSync(join(paths.stateDir, '.handoff-doc-path'), 'utf-8').trim()).toBe(newer);
+    });
+
+    it('does not throw when the handoffs dir does not exist', () => {
+      const agent = makeAgentWithDir(join(testDir, 'no-such-agent'));
+      const checker = new FastChecker(agent, paths, '/framework');
+      expect(() => (checker as any).triggerHardRestart('reason')).not.toThrow();
+      expect(existsSync(join(paths.stateDir, '.handoff-doc-path'))).toBe(false);
+    });
+
+    // A cooperative handoff that already restarted + was consumed records the doc
+    // in .handoff-doc-consumed. A watchdog restart within 15min must NOT re-preserve
+    // that same doc (would re-inject stale, already-actioned context).
+    it('does NOT resurrect a handoff doc the previous boot already consumed', () => {
+      const agentDir = join(testDir, 'agent-consumed');
+      const handoffsDir = join(agentDir, 'memory', 'handoffs');
+      mkdirSync(handoffsDir, { recursive: true });
+      const consumedDoc = join(handoffsDir, 'handoff-consumed.md');
+      writeFileSync(consumedDoc, '# already consumed', 'utf-8');
+      // The previous boot recorded this doc (path + mtime) as consumed.
+      writeFileSync(
+        join(paths.stateDir, '.handoff-doc-consumed'),
+        JSON.stringify({ path: consumedDoc, mtimeMs: statSync(consumedDoc).mtimeMs }),
+        'utf-8',
+      );
+
+      const agent = makeAgentWithDir(agentDir);
+      const checker = new FastChecker(agent, paths, '/framework');
+      (checker as any).triggerHardRestart('frozen: stdout unchanged');
+
+      expect(existsSync(join(paths.stateDir, '.handoff-doc-path'))).toBe(false);
+      expect(agent.hardRestartSelf).toHaveBeenCalledTimes(1);
+    });
+
+    it('still preserves a NEWER unconsumed handoff doc even when an older one was consumed', () => {
+      const agentDir = join(testDir, 'agent-newer');
+      const handoffsDir = join(agentDir, 'memory', 'handoffs');
+      mkdirSync(handoffsDir, { recursive: true });
+      const consumedDoc = join(handoffsDir, 'handoff-old.md');
+      const newerDoc = join(handoffsDir, 'handoff-new.md');
+      writeFileSync(consumedDoc, '# old consumed', 'utf-8');
+      writeFileSync(newerDoc, '# new unconsumed', 'utf-8');
+      const base = Date.now() / 1000;
+      utimesSync(consumedDoc, base - 600, base - 600); // 10 min ago
+      utimesSync(newerDoc, base - 60, base - 60);      // 1 min ago (most recent)
+      writeFileSync(
+        join(paths.stateDir, '.handoff-doc-consumed'),
+        JSON.stringify({ path: consumedDoc, mtimeMs: statSync(consumedDoc).mtimeMs }),
+        'utf-8',
+      );
+
+      const agent = makeAgentWithDir(agentDir);
+      const checker = new FastChecker(agent, paths, '/framework');
+      (checker as any).triggerHardRestart('ctx threshold fallback');
+
+      expect(readFileSync(join(paths.stateDir, '.handoff-doc-path'), 'utf-8').trim()).toBe(newerDoc);
+    });
+
+    // Reused-filename edge: a NEW handoff written to the SAME path as a consumed
+    // one (newer mtime) must still be preserved — path-only matching would lose it.
+    it('preserves a rewritten handoff at a REUSED filename (same path, newer mtime)', () => {
+      const agentDir = join(testDir, 'agent-reused');
+      const handoffsDir = join(agentDir, 'memory', 'handoffs');
+      mkdirSync(handoffsDir, { recursive: true });
+      const reusedDoc = join(handoffsDir, 'handoff-latest.md');
+      writeFileSync(reusedDoc, '# new version (rewritten)', 'utf-8');
+      // Previous boot consumed an OLDER version at this same path (stale mtime).
+      const staleMtime = statSync(reusedDoc).mtimeMs - 5000;
+      writeFileSync(
+        join(paths.stateDir, '.handoff-doc-consumed'),
+        JSON.stringify({ path: reusedDoc, mtimeMs: staleMtime }),
+        'utf-8',
+      );
+
+      const agent = makeAgentWithDir(agentDir);
+      const checker = new FastChecker(agent, paths, '/framework');
+      (checker as any).triggerHardRestart('survey prompt');
+
+      // The rewritten doc has a newer mtime than the consumed record, so it is
+      // preserved (not skipped).
+      expect(readFileSync(join(paths.stateDir, '.handoff-doc-path'), 'utf-8').trim()).toBe(reusedDoc);
     });
   });
 });

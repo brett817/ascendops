@@ -854,12 +854,27 @@ export class AgentProcess {
   }
 
   private consumeHandoffBlock(): string {
-    const markerPath = join(this.env.ctxRoot, 'state', this.name, '.handoff-doc-path');
+    const stateDir = join(this.env.ctxRoot, 'state', this.name);
+    const markerPath = join(stateDir, '.handoff-doc-path');
     if (!existsSync(markerPath)) return '';
     try {
       const docPath = readFileSync(markerPath, 'utf-8').trim();
       unlinkSync(markerPath);
       if (!docPath || !existsSync(docPath)) return '';
+      // Record the consumed doc (path + mtime) so a watchdog restart shortly
+      // after this handoff does not re-preserve (resurrect) the same
+      // already-consumed doc and inject stale prior-session context. mtime is
+      // stored alongside the path so a NEW handoff written to a REUSED filename
+      // (same path, newer mtime) is still preserved rather than wrongly skipped.
+      // See FastChecker.preserveRecentHandoffDoc.
+      try {
+        const mtimeMs = statSync(docPath).mtimeMs;
+        writeFileSync(
+          join(stateDir, '.handoff-doc-consumed'),
+          JSON.stringify({ path: docPath, mtimeMs }),
+          'utf-8',
+        );
+      } catch { /* non-fatal */ }
       return ` CONTEXT HANDOFF: Before restoring crons or checking inbox, read the handoff document at ${docPath} to resume your prior session state.`;
     } catch {
       return '';
