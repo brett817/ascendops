@@ -3,12 +3,17 @@ import { execFile } from 'child_process';
 import { join } from 'path';
 import { createHash } from 'crypto';
 import { hardRestart } from '../bus/system.js';
-import type { InboxMessage, BusPaths, TelegramMessage, TelegramCallbackQuery, Event } from '../types/index.js';
+import type { InboxMessage, BusPaths, TelegramMessage, TelegramCallbackQuery, Event, TeamMember } from '../types/index.js';
 import { checkInbox, ackInbox, sendMessage } from '../bus/message.js';
 import { updateApproval } from '../bus/approval.js';
 import { AgentProcess } from './agent-process.js';
 import type { TelegramAPI } from '../telegram/api.js';
 import { SlackAPI, type SlackMessage } from '../slack/api.js';
+import {
+  resolveSlackIdentity,
+  evaluateSlackTrust,
+  formatSlackOriginator,
+} from '../slack/slack-identity.js';
 import { KEYS } from '../pty/inject.js';
 import { stripControlChars, validateOrgName } from '../utils/validate.js';
 import { resolve as pathResolve } from 'path';
@@ -92,6 +97,13 @@ export class FastChecker {
   private slackLastTs: string = '0';
   private slackLastCheckedAt: number = 0;
   private readonly SLACK_DEFAULT_INTERVAL_MS = 60 * 1000;
+  // Slack identity + trust layer (P2 — text-enrich only).
+  private slackTrustedUsers?: string[];
+  private slackTeamMembers?: TeamMember[];
+  // userId -> resolved identity; cache hits skip users.info.
+  private slackIdentityCache: Map<string, { handle: string | null; displayName: string }> = new Map();
+  // Loudly-open warning is logged at most once per checker instance.
+  private slackOpenWarned: boolean = false;
 
   // Usage rate-limit guard state
   private usageLastCheckedAt: number = Date.now(); // skip check on startup; first run at 30-min mark
@@ -244,7 +256,13 @@ export class FastChecker {
       chatId?: string;
       allowedUserId?: number;
       gmailWatch?: { query: string; intervalMs: number; processedLabelId?: string };
-      slackWatch?: { channel: string; intervalMs: number; token: string };
+      slackWatch?: {
+        channel: string;
+        intervalMs: number;
+        token: string;
+        trustedSlackUsers?: string[];
+        teamMembers?: TeamMember[];
+      };
       ctxRestartThreshold?: number;
     } = {},
   ) {
@@ -275,6 +293,8 @@ export class FastChecker {
       this.slackWatch = { channel: options.slackWatch.channel, intervalMs: options.slackWatch.intervalMs };
       this.slackApi = new SlackAPI(options.slackWatch.token);
       this.slackLastTs = (Date.now() / 1000).toFixed(6);
+      this.slackTrustedUsers = options.slackWatch.trustedSlackUsers;
+      this.slackTeamMembers = options.slackWatch.teamMembers;
     }
 
     // Initialize usage tier state
@@ -1012,22 +1032,60 @@ export class FastChecker {
     const newest = messages[messages.length - 1];
     this.slackLastTs = newest.ts;
 
-    const formatted: string[] = [];
-    for (const msg of messages.slice(0, 10)) {
-      let displayName = msg.username ?? msg.user ?? 'unknown';
-      if (msg.user && !msg.username && this.slackApi) {
-        displayName = await this.slackApi.getUserName(msg.user).catch(() => msg.user ?? 'unknown');
+    const slackApi = this.slackApi;
+    // Gate the WHOLE batch first, then cap for display. The 10-item display cap
+    // must apply to DELIVERABLE messages, not raw history: slackLastTs has
+    // already advanced to the batch's newest, so any message not delivered now
+    // is permanently skipped. If we capped raw history at 10 and the first 10
+    // were all dropped (untrusted/userless), a trusted message at position 11+
+    // would be lost. Gating before the cap keeps trusted messages.
+    const deliverable: string[] = [];
+    for (const msg of messages) {
+      let from: string;
+      if (msg.user) {
+        // Identity + trust gate (P2). Cache hits skip users.info.
+        const identity = await resolveSlackIdentity(
+          msg.user,
+          (id) => slackApi.getUserInfo(id),
+          this.slackTeamMembers,
+          this.slackIdentityCache,
+        );
+        const trust = evaluateSlackTrust(identity.handle, this.slackTrustedUsers);
+        if (trust.openWarning && !this.slackOpenWarned) {
+          this.log('Slack allowlist not configured — all workspace users can drive the agent.');
+          this.slackOpenWarned = true;
+        }
+        if (!trust.allowed) {
+          this.log(`Slack message from untrusted user ${identity.handle ?? msg.user} dropped (not in allowlist)`);
+          continue;
+        }
+        from = formatSlackOriginator(identity);
+      } else {
+        // No user id (e.g. some app/integration/webhook messages): the sender
+        // cannot be resolved or trust-gated. FAIL-CLOSED — if an allowlist is
+        // configured, drop it; otherwise a userless message would bypass the
+        // allowlist entirely. When no allowlist is set (loudly-open), deliver
+        // via the username fallback as before.
+        if (this.slackTrustedUsers && this.slackTrustedUsers.length > 0) {
+          this.log('Slack message with no user id dropped (allowlist configured — sender cannot be verified)');
+          continue;
+        }
+        from = msg.username ?? 'unknown';
       }
-      formatted.push(
-        `=== SLACK from ${displayName} (channel:${this.slackWatch.channel} ts:${msg.ts}) ===\n` +
+      deliverable.push(
+        `=== SLACK from ${from} (channel:${this.slackWatch.channel} ts:${msg.ts}) ===\n` +
         `${msg.text}\n` +
         `Reply using: cortextos bus send-slack ${this.slackWatch.channel} "<reply>"`,
       );
     }
 
-    const remaining = messages.length - formatted.length;
+    if (deliverable.length === 0) return;
+
+    // Display cap applies to deliverable messages (see gating note above).
+    const shown = deliverable.slice(0, 10);
+    const remaining = deliverable.length - shown.length;
     const trailer = remaining > 0 ? `\n\n(${remaining} more messages not shown)` : '';
-    const inboxText = formatted.join('\n\n---\n\n') + trailer;
+    const inboxText = shown.join('\n\n---\n\n') + trailer;
 
     this.log(`Slack watch: ${messages.length} new message(s) in ${this.slackWatch.channel} — writing inbox`);
     try {

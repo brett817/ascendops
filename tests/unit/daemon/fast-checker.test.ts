@@ -10,6 +10,7 @@ vi.mock('../../../src/slack/api.js', () => ({
     return {
     getHistory: vi.fn(),
     getUserName: vi.fn().mockResolvedValue('Test User'),
+    getUserInfo: vi.fn().mockResolvedValue({ handle: null, displayName: 'Test User' }),
     postMessage: vi.fn(),
     };
   }),
@@ -1241,14 +1242,90 @@ describe('FastChecker', () => {
 
     it('TC-S2: new message — wakes agent with correct inbox format', async () => {
       mockApi.getHistory.mockResolvedValue([{ ts: '1234.0001', user: 'U123', text: 'Hello', type: 'message' }]);
-      mockApi.getUserName.mockResolvedValue('Brittany Hunter');
+      mockApi.getUserInfo.mockResolvedValue({ handle: 'brittany.hunter', displayName: 'Brittany Hunter' });
       await (checker as any).checkSlackWatch();
       expect(sendMessage).toHaveBeenCalledTimes(1);
       const text = (sendMessage as any).mock.calls[0][4];
-      expect(text).toContain('=== SLACK from Brittany Hunter');
+      // Handle present, no team_members -> "Name (@handle)".
+      expect(text).toContain('=== SLACK from Brittany Hunter (@brittany.hunter)');
       expect(text).toContain('channel:C1234567890');
       expect(text).toContain('Hello');
       expect(text).toContain('Reply using: cortextos bus send-slack');
+    });
+
+    it('TC-S9: untrusted user dropped when allowlist configured', async () => {
+      const gated = new FastChecker(createMockAgent(), paths, '/framework', {
+        slackWatch: {
+          channel: 'C1234567890',
+          intervalMs: 60000,
+          token: 'xoxb-test',
+          trustedSlackUsers: ['brittany.hunter'],
+        },
+      });
+      (gated as any).slackLastCheckedAt = 0;
+      const gatedApi = vi.mocked(SlackAPI).mock.results[vi.mocked(SlackAPI).mock.results.length - 1].value;
+      gatedApi.getHistory.mockResolvedValue([{ ts: '9.0', user: 'URAND', text: 'intruder', type: 'message' }]);
+      gatedApi.getUserInfo.mockResolvedValue({ handle: 'random.person', displayName: 'Random Person' });
+      await (gated as any).checkSlackWatch();
+      expect(sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('TC-S10: missing msg.user falls back to username, still delivered', async () => {
+      mockApi.getHistory.mockResolvedValue([{ ts: '11.0', username: 'webhook-bot', text: 'no user id', type: 'message' }]);
+      await (checker as any).checkSlackWatch();
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      const text = (sendMessage as any).mock.calls[0][4];
+      expect(text).toContain('=== SLACK from webhook-bot');
+      expect(mockApi.getUserInfo).not.toHaveBeenCalled();
+    });
+
+    it('TC-S11: userless message DROPPED when allowlist configured (fail-closed, no bypass)', async () => {
+      const gated = new FastChecker(createMockAgent(), paths, '/framework', {
+        slackWatch: {
+          channel: 'C1234567890',
+          intervalMs: 60000,
+          token: 'xoxb-test',
+          trustedSlackUsers: ['brittany.hunter'],
+        },
+      });
+      (gated as any).slackLastCheckedAt = 0;
+      const gatedApi = vi.mocked(SlackAPI).mock.results[vi.mocked(SlackAPI).mock.results.length - 1].value;
+      // App/webhook-style message with NO user id — must not bypass the allowlist.
+      gatedApi.getHistory.mockResolvedValue([{ ts: '12.0', username: 'webhook-bot', text: 'sneaky', type: 'message' }]);
+      await (gated as any).checkSlackWatch();
+      expect(sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('TC-S12: trusted message past the first 10 still delivered (gate before display cap)', async () => {
+      const gated = new FastChecker(createMockAgent(), paths, '/framework', {
+        slackWatch: {
+          channel: 'C1234567890',
+          intervalMs: 60000,
+          token: 'xoxb-test',
+          trustedSlackUsers: ['brittany.hunter'],
+          teamMembers: [{ name: 'Brittany Hunter', role: 'Ops', slack_handle: 'brittany.hunter', trust_level: 'owner' }],
+        },
+      });
+      (gated as any).slackLastCheckedAt = 0;
+      const gatedApi = vi.mocked(SlackAPI).mock.results[vi.mocked(SlackAPI).mock.results.length - 1].value;
+      // 10 untrusted messages, then a trusted one 11th. slackLastTs advances to
+      // the newest, so if the cap were applied to raw history the trusted msg
+      // would be permanently lost. Gating-before-cap must still deliver it.
+      const history = [];
+      for (let i = 0; i < 10; i++) history.push({ ts: `${i}.0`, user: 'URAND', text: `spam ${i}`, type: 'message' });
+      history.push({ ts: '11.0', user: 'UBRIT', text: 'real request', type: 'message' });
+      gatedApi.getHistory.mockResolvedValue(history);
+      gatedApi.getUserInfo.mockImplementation(async (id: string) =>
+        id === 'UBRIT'
+          ? { handle: 'brittany.hunter', displayName: 'Brittany Hunter' }
+          : { handle: 'random.person', displayName: 'Random Person' },
+      );
+      await (gated as any).checkSlackWatch();
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      const text = (sendMessage as any).mock.calls[0][4];
+      expect(text).toContain('real request');
+      expect(text).toContain('from Brittany Hunter (@brittany.hunter, owner)');
+      expect(text).not.toContain('spam');
     });
 
     it('TC-S3: cursor-based dedup — same message not processed twice', async () => {

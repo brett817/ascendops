@@ -60,4 +60,31 @@ export class SlackAPI {
     } catch { /* fall through */ }
     return userId;
   }
+
+  /**
+   * Resolve a user's Slack handle + display name via users.info.
+   * Returns null on ok:false or any error (never throws) so callers can
+   * treat lookup failure as "unresolved" and retry later.
+   */
+  async getUserInfo(
+    userId: string,
+  ): Promise<{ handle: string | null; displayName: string } | null> {
+    try {
+      const params = new URLSearchParams({ user: userId });
+      const response = await fetch(`${this.baseUrl}/users.info?${params}`, {
+        headers: { 'Authorization': `Bearer ${this.token}` },
+      });
+      const data = await response.json() as {
+        ok: boolean;
+        user?: { name?: string; real_name?: string; profile?: { display_name?: string } };
+      };
+      if (data.ok && data.user) {
+        const handle = data.user.name ?? null;
+        const displayName =
+          data.user.real_name ?? data.user.profile?.display_name ?? data.user.name ?? userId;
+        return { handle, displayName };
+      }
+    } catch { /* fall through */ }
+    return null;
+  }
 }

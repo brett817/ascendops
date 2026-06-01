@@ -1,6 +1,6 @@
 import { readdirSync, readFileSync, existsSync, mkdirSync, writeFileSync } from 'fs';
 import { join, relative } from 'path';
-import type { AgentConfig, AgentStatus, CtxEnv, BusPaths, WorkerStatus, TelegramMessage } from '../types/index.js';
+import type { AgentConfig, AgentStatus, CtxEnv, BusPaths, WorkerStatus, TelegramMessage, TeamMember } from '../types/index.js';
 import { AgentProcess } from './agent-process.js';
 import { WorkerProcess } from './worker-process.js';
 import { FastChecker } from './fast-checker.js';
@@ -323,7 +323,15 @@ export class AgentManager {
     // Slack inbound: prefer Socket Mode (real-time WSS) when an app-level token
     // (xapp-) is present; otherwise fall back to the legacy 60s poll. Tokens are
     // secrets and live in .env (parity with SLACK_BOT_TOKEN), not in config.json.
-    let slackWatchOption: { channel: string; intervalMs: number; token: string } | undefined;
+    let slackWatchOption:
+      | {
+          channel: string;
+          intervalMs: number;
+          token: string;
+          trustedSlackUsers?: string[];
+          teamMembers?: TeamMember[];
+        }
+      | undefined;
     let slackSocketConfig: { channel: string; botToken: string; appToken: string } | undefined;
     if (config.slack_watch?.channel) {
       let slackBotToken = '';
@@ -362,6 +370,8 @@ export class AgentManager {
           channel: decision.channel,
           intervalMs: decision.intervalMs,
           token: decision.botToken,
+          trustedSlackUsers: config.trusted_slack_users,
+          teamMembers: config.team_members,
         };
       } else {
         log(`Slack watch configured but ${decision.reason} in .env — skipping`);
@@ -475,6 +485,8 @@ export class AgentManager {
         agentName: name,
         paths,
         log,
+        trustedSlackUsers: config.trusted_slack_users,
+        teamMembers: config.team_members,
       });
       slackListener.start().catch(err => {
         log(`Slack Socket Mode listener failed to start: ${err}`);

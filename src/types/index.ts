@@ -211,6 +211,12 @@ export interface AgentConfig {
   };
   trusted_slack_users?: string[];
   slack_channels?: Record<string, string>;
+  /**
+   * Human team members for Slack identity/trust resolution (P2). Per-agent
+   * override; the canonical roster may also live on OrgContext.team_members.
+   * Used to resolve a Slack handle -> trust_level when enriching inbound.
+   */
+  team_members?: TeamMember[];
   /** Context window % at which to warn agent + user. Default: 70. Absent = observe-only. */
   ctx_warning_threshold?: number;
   /** Context window % at which to inject handoff prompt and hard-restart. Default: 80. */

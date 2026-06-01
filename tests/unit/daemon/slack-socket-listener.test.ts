@@ -6,18 +6,18 @@ vi.mock('../../../src/bus/message.js', async (importOriginal) => {
   return { ...actual, sendMessage: vi.fn() };
 });
 
-// Mock SlackAPI so getUserName is controllable per-test and no network happens.
-const getUserNameMock = vi.fn();
+// Mock SlackAPI so getUserInfo is controllable per-test and no network happens.
+const getUserInfoMock = vi.fn();
 vi.mock('../../../src/slack/api.js', () => ({
   SlackAPI: vi.fn().mockImplementation(function () {
-    return { getUserName: getUserNameMock };
+    return { getUserInfo: getUserInfoMock };
   }),
 }));
 
 import { SlackSocketListener } from '../../../src/daemon/slack-socket-listener.js';
 import { sendMessage } from '../../../src/bus/message.js';
 import type { SlackMessageEvent } from '../../../src/slack/slack-socket.js';
-import type { BusPaths } from '../../../src/types/index.js';
+import type { BusPaths, TeamMember } from '../../../src/types/index.js';
 
 const sendMessageMock = vi.mocked(sendMessage);
 
@@ -35,7 +35,10 @@ function makeEvent(overrides: Partial<SlackMessageEvent> = {}): SlackMessageEven
   };
 }
 
-function makeListener(log: (msg: string) => void = () => {}): SlackSocketListener {
+function makeListener(
+  log: (msg: string) => void = () => {},
+  extra: { trustedSlackUsers?: string[]; teamMembers?: TeamMember[] } = {},
+): SlackSocketListener {
   return new SlackSocketListener({
     appToken: 'xapp-test',
     botToken: 'xoxb-test',
@@ -43,23 +46,27 @@ function makeListener(log: (msg: string) => void = () => {}): SlackSocketListene
     agentName: 'collie',
     paths,
     log,
+    trustedSlackUsers: extra.trustedSlackUsers,
+    teamMembers: extra.teamMembers,
   });
 }
 
 describe('SlackSocketListener.handleMessage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    getUserNameMock.mockReset();
+    getUserInfoMock.mockReset();
+    // Default: identity resolves to a handle + display name, no network.
+    getUserInfoMock.mockResolvedValue({ handle: 'carlos.calel', displayName: 'Carlos Calel' });
   });
 
-  it('happy path: resolves display name and writes one inbox message', async () => {
-    getUserNameMock.mockResolvedValue('Carlos Calel');
+  it('happy path: resolves display name + handle and writes one inbox message', async () => {
+    getUserInfoMock.mockResolvedValue({ handle: 'carlos.calel', displayName: 'Carlos Calel' });
     const listener = makeListener();
 
     await listener.handleMessage(makeEvent());
 
     const expectedText =
-      '=== SLACK from Carlos Calel (channel:C123 ts:1700000000.000100) ===\n' +
+      '=== SLACK from Carlos Calel (@carlos.calel) (channel:C123 ts:1700000000.000100) ===\n' +
       'hello team\n' +
       'Reply using: cortextos bus send-slack C123 "<reply>"';
 
@@ -73,20 +80,63 @@ describe('SlackSocketListener.handleMessage', () => {
     );
     // Spot-check the load-bearing substrings.
     const actualText = sendMessageMock.mock.calls[0][4];
-    expect(actualText).toContain('from Carlos Calel');
+    expect(actualText).toContain('from Carlos Calel (@carlos.calel)');
     expect(actualText).toContain('ts:1700000000.000100');
     expect(actualText).toContain('channel:C123');
   });
 
+  it('enriched "from {name} (@handle, trust)" when team_members has the handle', async () => {
+    getUserInfoMock.mockResolvedValue({ handle: 'brittany.hunter', displayName: 'Brittany Hunter' });
+    const teamMembers: TeamMember[] = [
+      { name: 'Brittany Hunter', role: 'Ops', slack_handle: 'brittany.hunter', trust_level: 'owner' },
+    ];
+    const listener = makeListener(() => {}, { teamMembers });
+
+    await listener.handleMessage(makeEvent({ user: 'UBRIT' }));
+
+    expect(sendMessageMock).toHaveBeenCalledTimes(1);
+    const text = sendMessageMock.mock.calls[0][4] as string;
+    expect(text.split('\n')[0]).toBe(
+      '=== SLACK from Brittany Hunter (@brittany.hunter, owner) (channel:C123 ts:1700000000.000100) ===',
+    );
+  });
+
+  it('untrusted user dropped when allowlist configured + sender not listed', async () => {
+    getUserInfoMock.mockResolvedValue({ handle: 'random.person', displayName: 'Random Person' });
+    const logSpy = vi.fn();
+    const listener = makeListener(logSpy, { trustedSlackUsers: ['brittany.hunter'] });
+
+    await listener.handleMessage(makeEvent({ user: 'URAND' }));
+
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect(logSpy.mock.calls.some((c) => String(c[0]).includes('dropped (not in allowlist)'))).toBe(true);
+  });
+
+  it('loud-open warning logged once when trustedSlackUsers unset', async () => {
+    getUserInfoMock.mockResolvedValue({ handle: 'carlos.calel', displayName: 'Carlos Calel' });
+    const logSpy = vi.fn();
+    const listener = makeListener(logSpy); // no trustedSlackUsers
+
+    await listener.handleMessage(makeEvent());
+    await listener.handleMessage(makeEvent());
+
+    const warnCalls = logSpy.mock.calls.filter((c) =>
+      String(c[0]).includes('allowlist not configured'),
+    );
+    expect(warnCalls).toHaveLength(1);
+    // Both messages still delivered (open == allowed).
+    expect(sendMessageMock).toHaveBeenCalledTimes(2);
+  });
+
   it('exact formatted string shape: header, body line, reply line', async () => {
-    getUserNameMock.mockResolvedValue('Carlos Calel');
+    getUserInfoMock.mockResolvedValue({ handle: 'carlos.calel', displayName: 'Carlos Calel' });
     const listener = makeListener();
 
     await listener.handleMessage(makeEvent());
 
     const text = sendMessageMock.mock.calls[0][4] as string;
     const lines = text.split('\n');
-    expect(lines[0]).toBe('=== SLACK from Carlos Calel (channel:C123 ts:1700000000.000100) ===');
+    expect(lines[0]).toBe('=== SLACK from Carlos Calel (@carlos.calel) (channel:C123 ts:1700000000.000100) ===');
     expect(lines[1]).toBe('hello team');
     expect(lines[2]).toBe('Reply using: cortextos bus send-slack C123 "<reply>"');
   });
@@ -94,7 +144,7 @@ describe('SlackSocketListener.handleMessage', () => {
   // A captionless file/photo share has no text field — the body must be empty,
   // NOT the literal string "undefined".
   it('captionless share (no text) renders an empty body, never "undefined"', async () => {
-    getUserNameMock.mockResolvedValue('Carlos Calel');
+    getUserInfoMock.mockResolvedValue({ handle: 'carlos.calel', displayName: 'Carlos Calel' });
     const listener = makeListener();
 
     await listener.handleMessage(makeEvent({ text: undefined as unknown as string }));
@@ -102,40 +152,33 @@ describe('SlackSocketListener.handleMessage', () => {
     const text = sendMessageMock.mock.calls[0][4] as string;
     expect(text).not.toContain('undefined');
     const lines = text.split('\n');
-    expect(lines[0]).toBe('=== SLACK from Carlos Calel (channel:C123 ts:1700000000.000100) ===');
+    expect(lines[0]).toBe('=== SLACK from Carlos Calel (@carlos.calel) (channel:C123 ts:1700000000.000100) ===');
     expect(lines[1]).toBe('');
     expect(lines[2]).toBe('Reply using: cortextos bus send-slack C123 "<reply>"');
   });
 
-  it('getUserName rejecting falls back to the raw user id', async () => {
-    getUserNameMock.mockRejectedValue(new Error('slack api down'));
+  it('getUserInfo failing (null) falls back to the raw user id as display name', async () => {
+    getUserInfoMock.mockResolvedValue(null);
     const listener = makeListener();
 
     await listener.handleMessage(makeEvent({ user: 'U777' }));
 
     expect(sendMessageMock).toHaveBeenCalledTimes(1);
     const text = sendMessageMock.mock.calls[0][4] as string;
+    // No handle resolved -> bare display name (the user id), no "(@...)" token.
     expect(text).toContain('from U777');
     expect(text.startsWith('=== SLACK from U777 (channel:C123 ts:1700000000.000100) ===')).toBe(true);
   });
 
-  it('empty user falls back to "unknown"', async () => {
-    getUserNameMock.mockResolvedValue('');
-    const listener = makeListener();
-
-    await listener.handleMessage(makeEvent({ user: '' }));
-
-    const text = sendMessageMock.mock.calls[0][4] as string;
-    expect(text).toContain('from unknown');
-  });
-
   it('sendMessage throwing does not throw out of handleMessage and is logged', async () => {
-    getUserNameMock.mockResolvedValue('Carlos Calel');
+    getUserInfoMock.mockResolvedValue({ handle: 'carlos.calel', displayName: 'Carlos Calel' });
     sendMessageMock.mockImplementation(() => {
       throw new Error('disk full');
     });
     const logSpy = vi.fn();
-    const listener = makeListener(logSpy);
+    // Configure the allowlist (with this sender) so the loud-open warning does
+    // not also fire — isolating the write-failure log.
+    const listener = makeListener(logSpy, { trustedSlackUsers: ['carlos.calel'] });
 
     await expect(listener.handleMessage(makeEvent())).resolves.toBeUndefined();
 
