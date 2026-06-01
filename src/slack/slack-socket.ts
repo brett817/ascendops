@@ -410,6 +410,12 @@ export interface SlackMessageEvent {
   text: string;
   ts: string;
   thread_ts?: string;
+  /**
+   * Present when the message was authored by a bot (including messages this
+   * agent posts via its own bot token). Used by {@link shouldDeliverSlackMessage}
+   * to drop self-echoes.
+   */
+  bot_id?: string;
 }
 
 /**
@@ -426,11 +432,18 @@ export interface SlackMessageEvent {
  * that has text OR is a `file_share` (captioned or not). Contentless events
  * (edits/deletes/system joins with neither text nor a file_share) are not
  * delivered. Channel scoping is applied by the caller.
+ *
+ * Self-echo guard: bot-authored messages are never delivered. The `bot_message`
+ * subtype catches classic bot posts, but a message the agent posts itself via
+ * its bot token arrives as a NORMAL `message` event with `bot_id` set (and
+ * `user` = the app's own bot user id) and NO `bot_message` subtype — so it would
+ * pass the subtype check and loop straight back into our own inbox. Dropping any
+ * event carrying `bot_id` closes that self-echo path.
  */
 export function shouldDeliverSlackMessage(
-  event: { type?: string; subtype?: string; text?: string },
+  event: { type?: string; subtype?: string; text?: string; bot_id?: string },
 ): boolean {
-  if (event.type !== 'message' || event.subtype === 'bot_message') {
+  if (event.type !== 'message' || event.subtype === 'bot_message' || event.bot_id) {
     return false;
   }
   return !!event.text || event.subtype === 'file_share';

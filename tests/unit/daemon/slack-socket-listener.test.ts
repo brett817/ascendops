@@ -6,11 +6,13 @@ vi.mock('../../../src/bus/message.js', async (importOriginal) => {
   return { ...actual, sendMessage: vi.fn() };
 });
 
-// Mock SlackAPI so getUserInfo is controllable per-test and no network happens.
+// Mock SlackAPI so getUserInfo + getBotUserId are controllable per-test and no
+// network happens.
 const getUserInfoMock = vi.fn();
+const getBotUserIdMock = vi.fn();
 vi.mock('../../../src/slack/api.js', () => ({
   SlackAPI: vi.fn().mockImplementation(function () {
-    return { getUserInfo: getUserInfoMock };
+    return { getUserInfo: getUserInfoMock, getBotUserId: getBotUserIdMock };
   }),
 }));
 
@@ -55,8 +57,12 @@ describe('SlackSocketListener.handleMessage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     getUserInfoMock.mockReset();
+    getBotUserIdMock.mockReset();
     // Default: identity resolves to a handle + display name, no network.
     getUserInfoMock.mockResolvedValue({ handle: 'carlos.calel', displayName: 'Carlos Calel' });
+    // Default: own bot id unknown (auth.test "fails") -> own-id check skipped,
+    // so existing cases behave exactly as before the self-echo guard.
+    getBotUserIdMock.mockResolvedValue(null);
   });
 
   it('happy path: resolves display name + handle and writes one inbox message', async () => {
@@ -168,6 +174,42 @@ describe('SlackSocketListener.handleMessage', () => {
     // No handle resolved -> bare display name (the user id), no "(@...)" token.
     expect(text).toContain('from U777');
     expect(text.startsWith('=== SLACK from U777 (channel:C123 ts:1700000000.000100) ===')).toBe(true);
+  });
+
+  // Self-echo guard: the agent's own outbound posts arrive back as inbound with
+  // user = our own bot user id. They must be dropped (no inbox write), or any
+  // future auto-reply would loop infinitely.
+  it('drops a message authored by our own bot user id (self-echo)', async () => {
+    getBotUserIdMock.mockResolvedValue('UBOTSELF');
+    const logSpy = vi.fn();
+    const listener = makeListener(logSpy, { trustedSlackUsers: ['carlos.calel'] });
+
+    await listener.handleMessage(makeEvent({ user: 'UBOTSELF', text: 'my own reply' }));
+
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect(logSpy.mock.calls.some((c) => String(c[0]).includes('self-echo guard'))).toBe(true);
+  });
+
+  it('resolves own bot id once and caches it across messages (single auth.test)', async () => {
+    getBotUserIdMock.mockResolvedValue('UBOTSELF');
+    const listener = makeListener(() => {}, { trustedSlackUsers: ['carlos.calel'] });
+
+    await listener.handleMessage(makeEvent({ user: 'U999' }));
+    await listener.handleMessage(makeEvent({ user: 'U999' }));
+
+    // Own-id lookup happens once, not per-message.
+    expect(getBotUserIdMock).toHaveBeenCalledTimes(1);
+    // A normal sender is still delivered (guard does not over-block).
+    expect(sendMessageMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('auth.test unavailable (null own id) does not block a real user (graceful skip)', async () => {
+    getBotUserIdMock.mockResolvedValue(null);
+    const listener = makeListener(() => {}, { trustedSlackUsers: ['carlos.calel'] });
+
+    await listener.handleMessage(makeEvent({ user: 'U999' }));
+
+    expect(sendMessageMock).toHaveBeenCalledTimes(1);
   });
 
   it('sendMessage throwing does not throw out of handleMessage and is logged', async () => {

@@ -1384,6 +1384,46 @@ describe('FastChecker', () => {
       expect(text).toContain('human msg');
       expect(text).not.toContain('bot msg');
     });
+
+    it('TC-S13: self-echo dropped — bot_id present WITHOUT bot_message subtype', async () => {
+      // The agent's own outbound post via its bot token arrives as a NORMAL
+      // message (no bot_message subtype) carrying bot_id. The subtype filter
+      // alone would let it through and loop it back into our inbox.
+      mockApi.getHistory.mockResolvedValue([
+        { ts: '100.0', user: 'U123', text: 'human msg', type: 'message' },
+        { ts: '200.0', user: 'UBOTSELF', text: 'my own reply', type: 'message', bot_id: 'B001' },
+      ]);
+      mockApi.getUserInfo.mockResolvedValue({ handle: 'someone', displayName: 'Someone' });
+      await (checker as any).checkSlackWatch();
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      const text = (sendMessage as any).mock.calls[0][4];
+      expect(text).toContain('human msg');
+      expect(text).not.toContain('my own reply');
+    });
+
+    it('TC-S14: cursor advances to raw newest past a filtered bot_id message (no re-fetch stall)', async () => {
+      // Newest fetched event is the agent's own reply (bot_id) at ts 200. The
+      // cursor must advance to 200, NOT stick at the human msg (100) — otherwise
+      // the next poll re-fetches + re-drops the bot reply every cycle forever.
+      mockApi.getHistory.mockResolvedValue([
+        { ts: '100.0', user: 'U123', text: 'human msg', type: 'message' },
+        { ts: '200.0', user: 'UBOTSELF', text: 'my own reply', type: 'message', bot_id: 'B001' },
+      ]);
+      mockApi.getUserInfo.mockResolvedValue({ handle: 'someone', displayName: 'Someone' });
+      await (checker as any).checkSlackWatch();
+      expect((checker as any).slackLastTs).toBe('200.0');
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      expect((sendMessage as any).mock.calls[0][4]).toContain('human msg');
+    });
+
+    it('TC-S15: cursor advances even when ALL fetched messages are bot-authored (no stall)', async () => {
+      mockApi.getHistory.mockResolvedValue([
+        { ts: '300.0', user: 'UBOTSELF', text: 'echo', type: 'message', bot_id: 'B001' },
+      ]);
+      await (checker as any).checkSlackWatch();
+      expect((checker as any).slackLastTs).toBe('300.0');
+      expect(sendMessage).not.toHaveBeenCalled();
+    });
   });
 
   describe('resetWatchdogState — field coverage', () => {

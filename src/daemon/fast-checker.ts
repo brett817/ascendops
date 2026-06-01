@@ -1025,12 +1025,22 @@ export class FastChecker {
       return;
     }
 
-    // Filter out bot's own messages to prevent self-wake loops
-    messages = messages.filter(m => m.subtype !== 'bot_message');
     if (messages.length === 0) return;
+    // Advance the cursor to the RAW newest fetched message BEFORE filtering, so
+    // bot-authored (self-echo) messages never stall it. If filtering ran first,
+    // a poll whose newest/only event is the agent's own reply would drop it
+    // without advancing slackLastTs, then re-fetch + re-drop it every poll until
+    // a later human message arrived — and with limit:50, a run of bot messages
+    // could push an older human message out of the window and lose it. The trust
+    // gate below already relies on the cursor sitting past dropped messages.
+    this.slackLastTs = messages[messages.length - 1].ts;
 
-    const newest = messages[messages.length - 1];
-    this.slackLastTs = newest.ts;
+    // Filter out bot-authored messages to prevent self-wake / self-echo loops.
+    // `bot_message` subtype catches classic bot posts; `bot_id` catches messages
+    // the agent posts via its own bot token (which arrive as a normal message
+    // with bot_id set and no bot_message subtype) — the self-echo path.
+    messages = messages.filter(m => m.subtype !== 'bot_message' && !m.bot_id);
+    if (messages.length === 0) return;
 
     const slackApi = this.slackApi;
     // Gate the WHOLE batch first, then cap for display. The 10-item display cap

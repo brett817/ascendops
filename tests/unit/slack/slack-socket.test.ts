@@ -126,6 +126,21 @@ describe('shouldDeliverSlackMessage (parity with the legacy poll)', () => {
   it('drops non-message event types', () => {
     expect(shouldDeliverSlackMessage({ type: 'reaction_added', text: 'x' })).toBe(false);
   });
+
+  // Self-echo guard: a message the agent posts via its own bot token arrives as
+  // a NORMAL message (no bot_message subtype) but carries bot_id — it must be
+  // dropped, or our own outbound reply loops back into our inbox.
+  it('drops a bot-authored message carrying bot_id (self-echo, no subtype)', () => {
+    expect(
+      shouldDeliverSlackMessage({ type: 'message', bot_id: 'B0123', text: 'my own reply' }),
+    ).toBe(false);
+  });
+
+  it('drops a bot_id message even if it also looks like a file_share', () => {
+    expect(
+      shouldDeliverSlackMessage({ type: 'message', subtype: 'file_share', bot_id: 'B0123', text: 'echo' }),
+    ).toBe(false);
+  });
 });
 
 describe('SlackSocketClient — shutdown race on the restart path', () => {

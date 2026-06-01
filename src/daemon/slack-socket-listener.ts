@@ -49,6 +49,11 @@ export class SlackSocketListener {
   >();
   // Loudly-open warning is logged at most once per listener instance.
   private slackOpenWarned = false;
+  // Own bot user id (resolved once via auth.test) for the self-echo guard.
+  // `undefined` = not yet resolved; `null` = resolved-but-unavailable (auth.test
+  // failed), in which case the own-id check is skipped and shouldDeliverSlackMessage's
+  // bot_id guard still applies. A non-null value drops events authored by our own bot.
+  private ownBotUserId: string | null | undefined = undefined;
 
   constructor(opts: SlackSocketListenerOptions) {
     this.channel = opts.channel;
@@ -89,6 +94,20 @@ export class SlackSocketListener {
    */
   async handleMessage(event: SlackMessageEvent): Promise<void> {
     const userId = event.user;
+
+    // Self-echo guard (belt-and-suspenders alongside shouldDeliverSlackMessage's
+    // bot_id drop): never process our own bot user's messages. Resolve the own
+    // bot user id once via auth.test and cache it. If auth.test is unavailable
+    // (null), skip this check — the bot_id gate already covers the observed case,
+    // and a lookup failure must not kill inbound.
+    if (this.ownBotUserId === undefined) {
+      this.ownBotUserId = await this.slackApi.getBotUserId();
+    }
+    if (this.ownBotUserId && userId === this.ownBotUserId) {
+      this.log(`Slack message from own bot user ${userId} dropped (self-echo guard)`);
+      return;
+    }
+
     const identity = await resolveSlackIdentity(
       userId,
       (id) => this.slackApi.getUserInfo(id),

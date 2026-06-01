@@ -87,4 +87,26 @@ export class SlackAPI {
     } catch { /* fall through */ }
     return null;
   }
+
+  /**
+   * Resolve the authenticated bot's own user id via auth.test.
+   *
+   * Used by the inbound path to drop the agent's own outbound messages
+   * (self-echo guard). Returns null on ok:false or any error (never throws) so
+   * a failed lookup degrades to "own id unknown" — the caller skips the
+   * own-id check rather than killing inbound entirely.
+   */
+  async getBotUserId(): Promise<string | null> {
+    try {
+      const response = await fetch(`${this.baseUrl}/auth.test`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${this.token}` },
+      });
+      const data = await response.json() as { ok: boolean; user_id?: string };
+      if (data.ok && data.user_id) {
+        return data.user_id;
+      }
+    } catch { /* fall through */ }
+    return null;
+  }
 }
