@@ -1,0 +1,317 @@
+/**
+ * Cap readout source layer.
+ *
+ * Provides a unified, pluggable view of current Anthropic usage cap state
+ * (5-hour window + weekly window) with three sources tried in order:
+ *
+ *   1. headers    — rate-limit headers captured from the most recent Anthropic
+ *                   API response (preferred, freshest, no extra request)
+ *   2. dashboard  — direct HTTPS GET against the Anthropic usage summary
+ *                   endpoint using the active OAuth access token
+ *   3. estimate   — heuristic fallback derived from process uptime + a rough
+ *                   token-rate guess; exists only so `getCurrentCap` never
+ *                   returns null
+ *
+ * The OAuth refresh path (src/bus/oauth.ts) is currently broken (~32 days as
+ * of 2026-05-18). This module does NOT depend on a working refresh — each
+ * source fails gracefully and falls through to the next.
+ */
+
+import { existsSync, readFileSync } from 'fs';
+import { join } from 'path';
+import { homedir } from 'os';
+
+// --- Public types (frozen shape — do not change) ---
+
+export type CapSource = 'headers' | 'dashboard' | 'estimate';
+
+export type CapReadout = {
+  source: CapSource;
+  five_hour_pct: number;          // 0-100
+  weekly_pct: number;             // 0-100
+  timestamp: string;              // ISO 8601 UTC
+  agent: string;                  // agent name, or "fleet" for global
+  meta?: Record<string, unknown>;
+};
+
+export interface GetCurrentCapOpts {
+  agent?: string;
+  // Test/DI hooks — undocumented in public API.
+  ctxRoot?: string;
+  org?: string;
+  fetchImpl?: typeof fetch;
+  now?: () => number;
+  uptimeSecs?: () => number;
+}
+
+// --- Constants ---
+
+// Dashboard endpoint (parallels the usage path in oauth.ts: /api/oauth/usage).
+// Best guess at the cap-summary endpoint shape; falls through on 4xx.
+const DASHBOARD_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage_summary';
+
+// Rough heuristic: a "full" 5h window assumes ~10M tokens of activity.
+// Weekly window assumes ~5x that. These are deliberately conservative so the
+// estimate source never *under*-reports cap pressure.
+const ESTIMATE_5H_FULL_SECONDS = 5 * 60 * 60;
+const ESTIMATE_WEEKLY_FULL_SECONDS = 7 * 24 * 60 * 60;
+
+// --- Path helpers ---
+
+function resolveCtxRoot(opts?: GetCurrentCapOpts): string {
+  if (opts?.ctxRoot) return opts.ctxRoot;
+  const fromEnv = process.env.CTX_ROOT;
+  if (fromEnv) return fromEnv;
+  const instanceId = process.env.CTX_INSTANCE_ID || 'default';
+  return join(homedir(), '.cortextos', instanceId);
+}
+
+function resolveAgent(opts?: GetCurrentCapOpts): string {
+  return opts?.agent || process.env.CTX_AGENT_NAME || 'fleet';
+}
+
+function resolveOrg(opts?: GetCurrentCapOpts): string {
+  return opts?.org || process.env.CTX_ORG || '';
+}
+
+function headersCapturePath(opts?: GetCurrentCapOpts): string {
+  const ctxRoot = resolveCtxRoot(opts);
+  const org = resolveOrg(opts);
+  const agent = resolveAgent(opts);
+  // Spec requested path: $CTX_ROOT/orgs/$CTX_ORG/state/$CTX_AGENT_NAME/last-ratelimit-headers.json
+  return join(ctxRoot, 'orgs', org, 'state', agent, 'last-ratelimit-headers.json');
+}
+
+// --- Source 1: headers ---
+
+interface CapturedHeaders {
+  // Raw captured headers from the last Anthropic response.
+  // Keys may be canonical-cased or lower-cased; we normalise on read.
+  headers: Record<string, string | number>;
+  captured_at?: string;
+}
+
+/**
+ * Parse the captured rate-limit headers file. Returns null if missing or
+ * unparseable — caller falls through to dashboard.
+ */
+export async function readHeadersSource(opts?: GetCurrentCapOpts): Promise<CapReadout | null> {
+  const path = headersCapturePath(opts);
+  if (!existsSync(path)) return null;
+
+  let parsed: CapturedHeaders;
+  try {
+    parsed = JSON.parse(readFileSync(path, 'utf-8')) as CapturedHeaders;
+  } catch {
+    return null;
+  }
+
+  const h = lowercaseKeys(parsed.headers || {});
+
+  // Anthropic exposes limit + remaining (+ reset) per bucket. We treat the
+  // 5h-window proxy as the "tokens" or "input-tokens" bucket and the weekly
+  // window as a long-horizon bucket if present, otherwise 0.
+  const fiveHour = pctFromHeaders(h, [
+    ['anthropic-ratelimit-tokens-limit', 'anthropic-ratelimit-tokens-remaining'],
+    ['anthropic-ratelimit-input-tokens-limit', 'anthropic-ratelimit-input-tokens-remaining'],
+    ['anthropic-ratelimit-requests-limit', 'anthropic-ratelimit-requests-remaining'],
+  ]);
+
+  const weekly = pctFromHeaders(h, [
+    ['anthropic-ratelimit-weekly-tokens-limit', 'anthropic-ratelimit-weekly-tokens-remaining'],
+    ['anthropic-ratelimit-output-tokens-limit', 'anthropic-ratelimit-output-tokens-remaining'],
+  ]);
+
+  // If neither bucket yielded a number, the file is stale/malformed.
+  if (fiveHour === null && weekly === null) return null;
+
+  return {
+    source: 'headers',
+    five_hour_pct: fiveHour ?? 0,
+    weekly_pct: weekly ?? 0,
+    timestamp: new Date().toISOString(),
+    agent: resolveAgent(opts),
+    meta: {
+      captured_at: parsed.captured_at,
+      headers_path: path,
+    },
+  };
+}
+
+function lowercaseKeys(h: Record<string, string | number>): Record<string, string | number> {
+  const out: Record<string, string | number> = {};
+  for (const [k, v] of Object.entries(h)) out[k.toLowerCase()] = v;
+  return out;
+}
+
+function pctFromHeaders(
+  h: Record<string, string | number>,
+  pairs: Array<[string, string]>,
+): number | null {
+  for (const [limitKey, remainingKey] of pairs) {
+    const limit = toNum(h[limitKey]);
+    const remaining = toNum(h[remainingKey]);
+    if (limit !== null && remaining !== null && limit > 0) {
+      const used = Math.max(0, limit - remaining);
+      return clampPct((used / limit) * 100);
+    }
+  }
+  return null;
+}
+
+function toNum(v: string | number | undefined): number | null {
+  if (v === undefined || v === null) return null;
+  const n = typeof v === 'number' ? v : Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function clampPct(n: number): number {
+  if (!Number.isFinite(n)) return 0;
+  if (n < 0) return 0;
+  if (n > 100) return 100;
+  return n;
+}
+
+// --- Source 2: dashboard ---
+
+interface DashboardUsageResponse {
+  five_hour_utilization?: number;
+  seven_day_utilization?: number;
+  weekly_utilization?: number;
+  fiveHourUtilization?: number;
+  sevenDayUtilization?: number;
+  weeklyUtilization?: number;
+}
+
+/**
+ * Hit the Anthropic OAuth usage dashboard endpoint. Returns null on any 4xx
+ * (broken auth, wrong endpoint, etc.) so the caller falls through to estimate.
+ *
+ * Reads the OAuth token from the same sources oauth.ts uses, but does NOT
+ * trigger a refresh — broken refresh path is out of scope here.
+ */
+export async function readDashboardSource(opts?: GetCurrentCapOpts): Promise<CapReadout | null> {
+  const token = resolveAccessToken(opts);
+  if (!token) return null;
+
+  const fetchImpl = opts?.fetchImpl ?? (globalThis.fetch as typeof fetch | undefined);
+  if (!fetchImpl) return null;
+
+  let response: Response;
+  try {
+    response = await fetchImpl(DASHBOARD_USAGE_URL, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'anthropic-beta': 'oauth-2025-04-20',
+      },
+    });
+  } catch {
+    return null;
+  }
+
+  if (!response.ok) return null;
+
+  let data: DashboardUsageResponse;
+  try {
+    data = (await response.json()) as DashboardUsageResponse;
+  } catch {
+    return null;
+  }
+
+  const fiveHourRaw = data.five_hour_utilization ?? data.fiveHourUtilization;
+  const weeklyRaw =
+    data.weekly_utilization ??
+    data.weeklyUtilization ??
+    data.seven_day_utilization ??
+    data.sevenDayUtilization;
+
+  if (fiveHourRaw === undefined && weeklyRaw === undefined) return null;
+
+  return {
+    source: 'dashboard',
+    five_hour_pct: clampPct(normalizeUtil(fiveHourRaw)),
+    weekly_pct: clampPct(normalizeUtil(weeklyRaw)),
+    timestamp: new Date().toISOString(),
+    agent: resolveAgent(opts),
+    meta: { endpoint: DASHBOARD_USAGE_URL },
+  };
+}
+
+function normalizeUtil(v: number | undefined): number {
+  if (v === undefined || !Number.isFinite(v)) return 0;
+  // Accept either 0-1 fraction or 0-100 percent.
+  return v > 1 ? v : v * 100;
+}
+
+function resolveAccessToken(opts?: GetCurrentCapOpts): string | null {
+  // Prefer env (what agents actually run with) — matches oauth.ts fallback.
+  const envToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  if (envToken) return envToken;
+
+  // Fall back to accounts.json so server-side callers still work.
+  const ctxRoot = resolveCtxRoot(opts);
+  const accountsPath = join(ctxRoot, 'state', 'oauth', 'accounts.json');
+  if (!existsSync(accountsPath)) return null;
+  try {
+    const store = JSON.parse(readFileSync(accountsPath, 'utf-8')) as {
+      active?: string;
+      accounts?: Record<string, { access_token?: string }>;
+    };
+    if (!store.active || !store.accounts) return null;
+    return store.accounts[store.active]?.access_token ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// --- Source 3: estimate (last-resort heuristic) ---
+
+/**
+ * Synthesize a CapReadout from session uptime alone. Worst path: only fires
+ * when both real sources are unreachable. Marked clearly via `source` and
+ * `meta.confidence: 'low'` so callers can degrade UX accordingly.
+ */
+export function readEstimateSource(opts?: GetCurrentCapOpts): CapReadout {
+  const uptimeFn = opts?.uptimeSecs ?? (() => process.uptime());
+  const uptime = Math.max(0, uptimeFn());
+
+  const fiveHour = clampPct((uptime / ESTIMATE_5H_FULL_SECONDS) * 100);
+  const weekly = clampPct((uptime / ESTIMATE_WEEKLY_FULL_SECONDS) * 100);
+
+  return {
+    source: 'estimate',
+    five_hour_pct: fiveHour,
+    weekly_pct: weekly,
+    timestamp: new Date().toISOString(),
+    agent: resolveAgent(opts),
+    meta: {
+      confidence: 'low',
+      uptime_seconds: uptime,
+      note: 'heuristic-only — headers + dashboard both unavailable',
+    },
+  };
+}
+
+// --- Public entry point ---
+
+/**
+ * Resolve the current cap state. Tries headers → dashboard → estimate.
+ * Guaranteed to return a CapReadout; never throws, never returns null.
+ */
+export async function getCurrentCap(opts?: GetCurrentCapOpts): Promise<CapReadout> {
+  try {
+    const fromHeaders = await readHeadersSource(opts);
+    if (fromHeaders) return fromHeaders;
+  } catch {
+    // headers source must not throw — fall through
+  }
+
+  try {
+    const fromDashboard = await readDashboardSource(opts);
+    if (fromDashboard) return fromDashboard;
+  } catch {
+    // dashboard source must not throw — fall through
+  }
+
+  return readEstimateSource(opts);
+}

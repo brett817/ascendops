@@ -1,0 +1,91 @@
+node_modules/
+.claude/
+!.claude/commands/
+!.claude/commands/**
+!.claude/orchestration-cortextos-node/
+!.claude/skills/
+!.claude/skills/**
+# Include template .claude dirs (needed for agent settings.json)
+!templates/**/.claude/
+!templates/**/.claude/**
+dist/
+ecosystem.config.js
+
+# User-created org data (not part of the framework)
+orgs/
+# But community subdirectories ARE part of the framework
+!community/
+!community/**
+
+# Secrets
+.env
+.env.*
+!.env.example
+!**/.env.example
+secrets.env
+templates/*/.env
+.cortextos-env
+
+# Agent runtime data
+orgs/*/agents/*/memory/
+agents/*/local/
+agents/*/telegram-images/
+agents/*/memory/
+
+# macOS metadata
+.DS_Store
+
+# Test artifacts
+test-results/
+*.log
+# Spurious directory created when ${APPDATA} env var unexpanded during npm link on Windows
+${APPDATA}/
+
+# Knowledge base
+knowledge-base/venv/
+knowledge-base/__pycache__/
+knowledge-base/scripts/__pycache__/
+knowledge-base/scripts/_test_clients/__pycache__/
+# Python cache from programmatic-tools skill lib
+community/skills/programmatic-tools/lib/__pycache__/
+community/skills/programmatic-tools/examples/__pycache__/
+tests/playwright/dashboard-ui.spec.ts
+
+# Local ops docs (personal, not for public repo)
+docs/
+
+# orgs/ is fully ignored (line 15) — the public install repo ships ZERO real org
+# data. Operators create their own org during onboarding. The prior carve-outs
+# that re-included orgs/<org>/docs/durable/**, knowledge.md, and research-artifacts/
+# leaked AscendOps-internal confidential data (vendor PII, EIN, durable specs) into
+# this PUBLIC repo; removed 2026-06-02 (install fast-follow). If shipped reference
+# doctrine is wanted later, add a sanitized orgs/example/ — never a real org.
+
+# Internal developer/planning notes (not for public repo)
+KNOWN-ISSUES.md
+WINDOWS-IMPLEMENTATION-PLAN.md
+WINDOWS-SUPPORT-INVESTIGATION.md
+BRAINDUMP*.md
+AGENTS.md
+# But AGENTS.md inside templates/ is a static template file that must ship.
+!templates/**/AGENTS.md
+dashboard/screenshots/
+dashboard/test-*.py
+graphify-out/
+
+# Weekly tool-update generated logs
+logs/weekly-tool-update/*.md
+!logs/weekly-tool-update/.gitkeep
+
+# Local vendor research checkout — not runtime load-bearing
+vendor/everything-claude-code/
+
+# Pulled from public repo (David 2026-06-01): competitor/partner recon, internal
+# decisions log, and reverse-engineered PM API captures. Kept local, off public repo.
+orgs/*/docs/durable/pm-nexus-partner-recon-*.md
+orgs/*/docs/durable/competitive-pmdash-recon-*.md
+orgs/*/docs/durable/pm-september-conference-recon-*.md
+orgs/*/docs/durable/decisions-log.md
+orgs/*/docs/durable/pm-create-meld-in-and-merge-endpoint-capture-*.md
+orgs/*/docs/durable/pm-tenant-notes-endpoint-capture-*.md
+orgs/*/docs/durable/pm-phone-field-investigation-*.md
