@@ -651,8 +651,8 @@ try {
     console.error('  If you see C++ compilation errors, install build tools:');
     console.error('    sudo apt-get install -y build-essential');
   } else if (IS_WINDOWS) {
-    console.error('  If you see C++ compilation errors, install Visual C++ Build Tools:');
-    console.error('    npm install -g windows-build-tools  (run as Administrator)');
+    console.error('  If you see C++ compilation errors, install Visual C++ Build Tools (run as Administrator):');
+    console.error('    winget install Microsoft.VisualStudio.2022.BuildTools --override "--passive --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"');
   }
   process.exit(1);
 }
