@@ -2,8 +2,8 @@
 /**
  * AscendOps cross-platform installer
  *
- * Mac/Linux:   curl -fsSL https://raw.githubusercontent.com/noogalabs/ascendops-install/main/install.mjs | node
- * Windows:     node -e "$(irm https://raw.githubusercontent.com/noogalabs/ascendops-install/main/install.mjs)"
+ * Mac/Linux:   curl -fsSL https://raw.githubusercontent.com/noogalabs/ascendops/main/install.mjs | node
+ * Windows:     node -e "$(irm https://raw.githubusercontent.com/noogalabs/ascendops/main/install.mjs)"
  * Local test:  node install.mjs
  */
 
@@ -12,7 +12,7 @@ import { existsSync, mkdirSync, writeFileSync, readdirSync, statSync, chmodSync,
 import { join } from 'path';
 import { homedir, platform } from 'os';
 
-const REPO_URL = process.env.ASCENDOPS_REPO || process.env.CORTEXTOS_REPO || 'https://github.com/noogalabs/ascendops-install.git';
+const REPO_URL = process.env.ASCENDOPS_REPO || process.env.CORTEXTOS_REPO || 'https://github.com/noogalabs/ascendops.git';
 const INSTALL_DIR = process.env.ASCENDOPS_DIR || process.env.CORTEXTOS_DIR || join(homedir(), 'ascendops');
 
 // CORTEXTOS_BRANCH lets you install a specific branch instead of `main`. Useful
@@ -483,7 +483,7 @@ if (existsSync(INSTALL_DIR)) {
       // Check if origin points to canonical — if so, rename it to upstream
       let originUrl = '';
       try { originUrl = run('git remote get-url origin', { cwd: INSTALL_DIR }); } catch { /* no origin */ }
-      if (originUrl && (originUrl.includes('noogalabs/ascendops-install') || originUrl.includes('grandamenium/cortextos') || originUrl === REPO_URL)) {
+      if (originUrl && (originUrl.includes('noogalabs/ascendops') || originUrl.includes('grandamenium/cortextos') || originUrl === REPO_URL)) {
         log('Migrating git remotes: renaming origin → upstream...');
         try {
           run('git remote rename origin upstream', { cwd: INSTALL_DIR });
