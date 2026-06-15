@@ -92,6 +92,13 @@ AscendOps runs on Node.js. You need **version 20 or higher**.
    You should now see a version number. If it still says "not recognized," you're
    almost certainly in an old window — open a brand-new PowerShell and try once more.
 
+> **You just installed everything the agents need to run bash — no WSL required.**
+> The agents use small bash scripts under the hood. Git for Windows (what you just
+> installed) includes **Git Bash**, and AscendOps runs those scripts through it
+> automatically — you never open Git Bash yourself. If you've seen older notes
+> saying Windows needs **WSL** (Windows Subsystem for Linux), you don't: Git Bash
+> from this step covers it. WSL works too if you already have it, but it's optional.
+
 ---
 
 ## Step 4 — Install the Visual C++ Build Tools
