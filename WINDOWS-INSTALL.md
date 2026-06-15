@@ -156,7 +156,7 @@ Still in the **Developer PowerShell for VS 2022** (Administrator) window, run th
 one-line installer:
 
 ```powershell
-node -e "$(irm https://raw.githubusercontent.com/noogalabs/ascendops-install/main/install.mjs)"
+node -e "$(irm https://raw.githubusercontent.com/noogalabs/ascendops/main/install.mjs)"
 ```
 
 This will:
@@ -172,8 +172,8 @@ that's the most common cause.
 > **Already cloned it yourself?** If you forked and cloned AscendOps manually before
 > the call, tell the installer where it lives instead of letting it clone again:
 > ```powershell
-> $env:ASCENDOPS_DIR = "C:\path\to\your\ascendops-install"
-> node -e "$(irm https://raw.githubusercontent.com/noogalabs/ascendops-install/main/install.mjs)"
+> $env:ASCENDOPS_DIR = "C:\path\to\your\ascendops"
+> node -e "$(irm https://raw.githubusercontent.com/noogalabs/ascendops/main/install.mjs)"
 > ```
 > Otherwise it installs fresh to `~\ascendops` and your manual clone just sits unused.
 
