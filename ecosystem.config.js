@@ -8,32 +8,18 @@ module.exports = {
   apps: [
     {
       name: 'cortextos-daemon',
-      script: "/Users/davidhunter/cortextos/dist/daemon.js",
+      script: "/Users/seevirtualadmin/ascendops/dist/daemon.js",
       args: '--instance ' + (process.env.CTX_INSTANCE_ID || "default"),
-      cwd: "/Users/davidhunter/cortextos",
+      cwd: "/Users/seevirtualadmin/ascendops",
       env: {
         CTX_INSTANCE_ID: process.env.CTX_INSTANCE_ID || "default",
-        CTX_ROOT: process.env.CTX_ROOT || "/Users/davidhunter/.cortextos/default",
-        CTX_FRAMEWORK_ROOT: "/Users/davidhunter/cortextos",
-        CTX_PROJECT_ROOT: "/Users/davidhunter/cortextos",
+        CTX_ROOT: process.env.CTX_ROOT || "/Users/seevirtualadmin/.cortextos/default",
+        CTX_FRAMEWORK_ROOT: "/Users/seevirtualadmin/ascendops",
+        CTX_PROJECT_ROOT: "/Users/seevirtualadmin/ascendops",
         CTX_ORG: process.env.CTX_ORG || "ascendops",
       },
       max_restarts: 50,
-      restart_delay: 5000,
-      autorestart: true,
-    },
-    {
-      name: 'cortextos-dashboard',
-      script: 'npm',
-      args: 'run dev',
-      cwd: "/Users/davidhunter/cortextos/dashboard",
-      env: {
-        PORT: process.env.PORT || '3000',
-      },
-      // Dashboard reads its real config from dashboard/.env.local — populated
-      // by /onboarding Phase 7. PM2 just supervises the npm process.
-      max_restarts: 50,
-      restart_delay: 5000,
+      restart_delay: 15000,
       autorestart: true,
     },
   ],
