@@ -258,7 +258,7 @@ export const installCommand = new Command('install')
 
     // Voice transcription deps — whisper-cli + ffmpeg + GGML model.
     // Best-effort: failures degrade voice messages to path-only (no transcript)
-    // but never block install.
+    // but never block install. Disable entirely with CTX_TELEGRAM_NO_TRANSCRIBE=1.
     if (!commandExists('whisper-cli')) {
       console.log('  - whisper-cli: not found. Installing...');
       const installed = tryInstallWhisperCpp();
@@ -290,7 +290,8 @@ export const installCommand = new Command('install')
       console.log('  ✓ ffmpeg: installed');
     }
 
-    const modelScript = join(frameworkRoot, 'scripts', 'install-whisper-model.sh');
+    // GGML whisper model — idempotent download via shipped script.
+    const modelScript = join(process.cwd(), 'scripts', 'install-whisper-model.sh');
     if (existsSync(modelScript)) {
       const modelResult = spawnSync('bash', [modelScript], { stdio: 'inherit', timeout: 5 * 60 * 1000 });
       if (modelResult.status !== 0) {

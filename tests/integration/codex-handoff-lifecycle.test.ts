@@ -34,7 +34,7 @@ afterEach(() => {
 
 /** Mirror of CodexAppServerPTY.writeContextStatus output (frozen by PR 06 contract). */
 function writeCodexContextStatus(opts: {
-  currentWindowInputTokens: number;
+  totalTokens: number;
   inputTokens?: number;
   outputTokens?: number;
   cachedInputTokens?: number;
@@ -42,13 +42,13 @@ function writeCodexContextStatus(opts: {
   threadId: string;
 }): void {
   const cap = opts.modelContextWindow ?? 256000;
-  const usedPct = cap > 0 ? Math.min(100, Math.max(0, (opts.currentWindowInputTokens / cap) * 100)) : null;
+  const usedPct = cap > 0 ? Math.min(100, (opts.totalTokens / cap) * 100) : null;
   const payload = {
     used_percentage: usedPct,
     context_window_size: cap,
-    exceeds_200k_tokens: opts.currentWindowInputTokens > 200000,
+    exceeds_200k_tokens: opts.totalTokens > 200000,
     current_usage: {
-      input_tokens: opts.inputTokens ?? opts.currentWindowInputTokens,
+      input_tokens: opts.inputTokens ?? 0,
       output_tokens: opts.outputTokens ?? 0,
       cache_read_input_tokens: opts.cachedInputTokens ?? 0,
       cache_creation_input_tokens: 0,
@@ -93,7 +93,8 @@ function consumeHandoffMarker(handoffDocPath: string): string {
 describe('codex handoff lifecycle — schema parity with claude', () => {
   it('codex context_status.json carries the shape fast-checker reads', () => {
     writeCodexContextStatus({
-      currentWindowInputTokens: 150_000,
+      totalTokens: 150_000,
+      inputTokens: 100_000,
       outputTokens: 50_000,
       cachedInputTokens: 10_000,
       threadId: 'mock-thread-abc',
@@ -107,17 +108,17 @@ describe('codex handoff lifecycle — schema parity with claude', () => {
     expect(view!.written_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
   });
 
-  it('exceeds_200k_tokens flips when codex current-window input pushes over 200k', () => {
-    writeCodexContextStatus({ currentWindowInputTokens: 199_999, threadId: 'mock-thread-1' });
+  it('exceeds_200k_tokens flips when codex turn pushes total over 200k', () => {
+    writeCodexContextStatus({ totalTokens: 199_999, threadId: 'mock-thread-1' });
     expect(readContextStatusAsFastChecker()!.exceeds_200k_tokens).toBe(false);
 
-    writeCodexContextStatus({ currentWindowInputTokens: 200_001, threadId: 'mock-thread-1' });
+    writeCodexContextStatus({ totalTokens: 200_001, threadId: 'mock-thread-1' });
     expect(readContextStatusAsFastChecker()!.exceeds_200k_tokens).toBe(true);
   });
 
-  it('used_percentage clamps to 100 when current-window input exceeds modelContextWindow', () => {
+  it('used_percentage clamps to 100 when total exceeds modelContextWindow', () => {
     writeCodexContextStatus({
-      currentWindowInputTokens: 500_000,
+      totalTokens: 500_000,
       modelContextWindow: 256_000,
       threadId: 'mock-thread-overflow',
     });
@@ -125,10 +126,10 @@ describe('codex handoff lifecycle — schema parity with claude', () => {
   });
 
   it('session_id changes on new thread (fast-checker uses this to reset per-session state)', () => {
-    writeCodexContextStatus({ currentWindowInputTokens: 100, threadId: 'thread-a' });
+    writeCodexContextStatus({ totalTokens: 100, threadId: 'thread-a' });
     expect(readContextStatusAsFastChecker()!.session_id).toBe('thread-a');
 
-    writeCodexContextStatus({ currentWindowInputTokens: 200, threadId: 'thread-b' });
+    writeCodexContextStatus({ totalTokens: 200, threadId: 'thread-b' });
     expect(readContextStatusAsFastChecker()!.session_id).toBe('thread-b');
   });
 
@@ -153,7 +154,7 @@ describe('codex handoff lifecycle — schema parity with claude', () => {
 
   it('codex modelContextWindow drives context_window_size in the status file', () => {
     writeCodexContextStatus({
-      currentWindowInputTokens: 50_000,
+      totalTokens: 50_000,
       modelContextWindow: 1_000_000,
       threadId: 'thread-1m',
     });

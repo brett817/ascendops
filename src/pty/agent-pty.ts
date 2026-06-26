@@ -202,26 +202,83 @@ export class AgentPTY {
    * Default delegates to the configured vendor adapter (anthropic by default).
    */
   protected getBinaryName(): string {
-    const adapterBinary = loadAdapter(this.config.vendor).binary;
-    const isClaudeAdapter = adapterBinary === 'claude' || adapterBinary === 'claude.cmd';
-    if (platform() !== 'win32' || !isClaudeAdapter) {
-      return adapterBinary;
-    }
-
-    // Newer Windows Claude Code installs can ship only claude.exe with no
-    // claude.cmd shim. Probe PATH and prefer .exe when present.
+    if (platform() !== 'win32') return 'claude';
+    // The Claude Code Windows installer historically shipped a `claude.cmd`
+    // shim alongside `claude.exe`. Newer installers (e.g. when claude lives
+    // under `~/.local/bin`) ship only `claude.exe` and have no `.cmd` shim.
+    // Hardcoding `claude.cmd` causes node-pty/ConPTY to fail with an empty
+    // "File not found" error before the agent ever boots.
     //
-    // Loop order: outer = PATH dirs, inner = extensions. This preserves
-    // Windows command-resolution precedence (directory order first,
-    // PATHEXT order within each directory). The inverted form would return
-    // a later-PATH .exe over an earlier-PATH .cmd shim, which can launch
-    // the wrong binary on installs that intentionally use a .cmd wrapper.
+    // Probe PATH for whichever extension is present and prefer `.exe` —
+    // it spawns more cleanly under ConPTY than a `.cmd` wrapper, and matches
+    // what `where.exe claude` returns on current installs.
     const pathDirs = (process.env.PATH || '').split(';').filter(Boolean);
-    for (const dir of pathDirs) {
-      for (const ext of ['.exe', '.cmd']) {
+    for (const ext of ['.exe', '.cmd']) {
+      for (const dir of pathDirs) {
         if (existsSync(join(dir, `claude${ext}`))) {
           return `claude${ext}`;
         }
+      }
+    }
+    // Neither found on PATH — fall back to the legacy default so the error
+    // message from node-pty surfaces a recognizable filename for debugging.
+    return 'claude.cmd';
+  }
+
+  /**
+   * Build the claude CLI argument array.
+   * Returns args suitable for passing directly to node-pty spawn (no shell escaping needed).
+   * Protected so HermesPTY can override this for its own spawn args.
+   */
+  protected buildClaudeArgs(mode: 'fresh' | 'continue', prompt: string): string[] {
+    const args: string[] = [];
+
+    if (mode === 'continue') {
+      args.push('--continue');
+    }
+
+    // Skip Claude Code's permission system by default (back-compat: agents have
+    // historically run unattended). Set `dangerously_skip_permissions: false` in
+    // the agent config to KEEP the gate on — then Claude Code's PermissionRequest
+    // flow (and the hook-permission-telegram approval) actually engages. Without
+    // this flag the CLI override would suppress any settings.json permission mode.
+    // Only the literal boolean `false` disables the skip; warn on a non-boolean so
+    // a typo (e.g. the string "false") can't silently leave an agent ungated when
+    // the operator intended to engage the gate.
+    const skipPermissions = this.config.dangerously_skip_permissions;
+    if (skipPermissions !== undefined && typeof skipPermissions !== 'boolean') {
+      console.warn(
+        `[agent-pty] ${this.env.agentName}: dangerously_skip_permissions must be true or false ` +
+        `(got ${JSON.stringify(skipPermissions)}); defaulting to skip-on.`,
+      );
+    }
+    if (skipPermissions !== false) {
+      args.push('--dangerously-skip-permissions');
+    }
+
+    if (this.config.model) {
+      args.push('--model', this.config.model);
+    }
+
+    // Local override pattern (feat #20): concatenate {agentDir}/local/*.md files
+    // and append as system prompt. The local/ dir is gitignored so users can customize
+    // agent behavior without merge conflicts on framework updates.
+    const agentDir = this.env.agentDir;
+    if (agentDir) {
+      const localDir = join(agentDir, 'local');
+      if (existsSync(localDir)) {
+        try {
+          const mdFiles = readdirSync(localDir)
+            .filter(f => f.endsWith('.md'))
+            .sort()
+            .map(f => join(localDir, f));
+          if (mdFiles.length > 0) {
+            const localContent = mdFiles
+              .map(f => readFileSync(f, 'utf-8'))
+              .join('\n\n');
+            args.push('--append-system-prompt', localContent);
+          }
+        } catch { /* ignore read errors */ }
       }
     }
 
@@ -303,7 +360,9 @@ export class AgentPTY {
       'PATH', 'HOME', 'USER', 'SHELL', 'TERM', 'LANG', 'LC_ALL',
       'TMPDIR', 'TEMP', 'TMP', 'ANTHROPIC_API_KEY', 'CLAUDE_API_KEY',
       'NODE_PATH', 'COMSPEC', 'USERPROFILE',
-      // Windows path-expansion essentials.
+      // Windows path-expansion essentials. Stripping these causes phantom
+      // %SystemDrive% directories from inherited Search Indexer processes
+      // and Unity batchmode UPM IPC crashes (path.join(undefined,...)).
       'SystemDrive', 'SystemRoot', 'windir',
       'APPDATA', 'LOCALAPPDATA', 'ProgramData', 'ALLUSERSPROFILE',
       'ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432',

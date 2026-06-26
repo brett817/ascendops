@@ -24,7 +24,6 @@ export interface JsonRpcResponse<T = unknown> {
 
 type JsonRpcMessage = JsonRpcRequest | JsonRpcNotification | JsonRpcResponse;
 type MessageHandler = (message: JsonRpcMessage) => void;
-type DisconnectHandler = (err: Error) => void;
 
 interface PendingRequest {
   resolve: (message: JsonRpcResponse) => void;
@@ -33,27 +32,12 @@ interface PendingRequest {
 }
 
 /**
- * Endpoint variants for the WebSocket-framed JSON-RPC client.
+ * Minimal WebSocket-over-Unix JSON-RPC client.
  *
- * `socketPath`: connect over a Unix domain socket (codex app-server <0.118
- *   `unix://` transport). Kept for backward compatibility.
- * `host` + `port`: connect over TCP loopback (codex app-server >=0.118
- *   `ws://IP:PORT` transport — the unix-socket scheme was dropped).
- *
- * The WebSocket handshake and frame parsing layers above the raw socket are
- * transport-agnostic, so only the connect step branches.
- */
-export type RpcClientEndpoint = { socketPath: string } | { host: string; port: number };
-
-/**
- * Minimal WebSocket-over-socket JSON-RPC client.
- *
- * Codex app-server's WebSocket transport is the same on Unix sockets and TCP
- * loopback once the connection is established — same handshake, same frame
- * format, same newline-delimited JSON payloads. This helper picks the right
- * `createConnection` form based on the endpoint variant, then applies the
- * standard WS handshake and frame parsing using only Node built-ins (no
- * additional runtime deps).
+ * Codex app-server's `unix://` transport is WebSocket-framed. The JSON-RPC
+ * payloads inside text frames are newline-delimited, matching the stdio
+ * transport after the WebSocket layer is removed. This helper intentionally
+ * uses Node built-ins only so the app-server adapter adds no runtime deps.
  */
 export class WsUnixJsonRpcClient {
   private socket: Socket | null = null;
@@ -61,19 +45,13 @@ export class WsUnixJsonRpcClient {
   private nextId = 1;
   private pending = new Map<number | string, PendingRequest>();
   private handlers: MessageHandler[] = [];
-  private disconnectHandlers: DisconnectHandler[] = [];
-  private readonly endpoint: RpcClientEndpoint;
 
-  constructor(endpoint: string | RpcClientEndpoint) {
-    this.endpoint = typeof endpoint === 'string' ? { socketPath: endpoint } : endpoint;
-  }
+  constructor(private readonly socketPath: string) {}
 
   async connect(): Promise<void> {
     if (this.socket) return;
 
-    const socket = 'socketPath' in this.endpoint
-      ? createConnection(this.endpoint.socketPath)
-      : createConnection({ host: this.endpoint.host, port: this.endpoint.port });
+    const socket = createConnection(this.socketPath);
     await new Promise<void>((resolve, reject) => {
       socket.once('connect', resolve);
       socket.once('error', reject);
@@ -101,25 +79,17 @@ export class WsUnixJsonRpcClient {
     const expected = createHash('sha1')
       .update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
       .digest('base64');
-    // The Sec-WebSocket-Accept header is REQUIRED per RFC 6455 §4.1. The
-    // previous `if (accept && ...)` short-circuited when the header was
-    // absent, accepting the 101 anyway. A peer that returns 101 without
-    // the accept token (or the wrong one) is not actually doing the WS
-    // handshake — refuse the connection (Zone A H3).
-    if (!accept || accept !== expected) {
+    if (accept && accept !== expected) {
       socket.destroy();
-      throw new Error(
-        accept
-          ? 'WebSocket handshake failed: Sec-WebSocket-Accept mismatch'
-          : 'WebSocket handshake failed: Sec-WebSocket-Accept header missing',
-      );
+      throw new Error('WebSocket handshake failed: Sec-WebSocket-Accept mismatch');
     }
 
     this.socket = socket;
     socket.on('data', (chunk) => this.parseFrames(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
-    socket.on('error', (err) => this.handleDisconnect(err));
+    socket.on('error', (err) => this.rejectAll(err));
     socket.on('close', () => {
-      this.handleDisconnect(new Error('WebSocket Unix socket closed'));
+      this.rejectAll(new Error('WebSocket Unix socket closed'));
+      this.socket = null;
     });
 
     if (leftover.length > 0) {
@@ -129,6 +99,7 @@ export class WsUnixJsonRpcClient {
 
   close(): void {
     const socket = this.socket;
+    this.socket = null;
     if (socket && !socket.destroyed) {
       try {
         socket.end(this.encodeFrame('', 0x8));
@@ -136,20 +107,13 @@ export class WsUnixJsonRpcClient {
         socket.destroy();
       }
     }
-    this.handleDisconnect(new Error('WebSocket Unix socket closed'));
+    this.rejectAll(new Error('WebSocket Unix socket closed'));
   }
 
   onMessage(handler: MessageHandler): () => void {
     this.handlers.push(handler);
     return () => {
       this.handlers = this.handlers.filter((h) => h !== handler);
-    };
-  }
-
-  onDisconnect(handler: DisconnectHandler): () => void {
-    this.disconnectHandlers.push(handler);
-    return () => {
-      this.disconnectHandlers = this.disconnectHandlers.filter((h) => h !== handler);
     };
   }
 
@@ -193,49 +157,26 @@ export class WsUnixJsonRpcClient {
     this.socket.write(this.encodeFrame(`${JSON.stringify(message)}\n`));
   }
 
-  private readHandshake(socket: Socket, timeoutMs = 5000): Promise<{ header: string; leftover: Buffer }> {
+  private readHandshake(socket: Socket): Promise<{ header: string; leftover: Buffer }> {
     return new Promise((resolve, reject) => {
       let buffer = Buffer.alloc(0);
-      // A peer that accepts the TCP connection but never speaks the HTTP
-      // upgrade response would have wedged this method indefinitely before.
-      // Time out after `timeoutMs` so the caller's retry loop can recover
-      // (Zone A H3).
-      const timer = setTimeout(() => {
-        socket.off('data', onData);
-        socket.off('error', onError);
-        socket.off('close', onClose);
-        socket.off('end', onClose);
-        reject(new Error(`WebSocket handshake timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
-      const settle = () => {
-        clearTimeout(timer);
-        socket.off('data', onData);
-        socket.off('error', onError);
-        socket.off('close', onClose);
-        socket.off('end', onClose);
-      };
-      const onClose = () => {
-        settle();
-        reject(new Error('WebSocket handshake socket closed before response'));
-      };
       const onData = (chunk: Buffer) => {
         buffer = Buffer.concat([buffer, chunk]);
         const end = buffer.indexOf('\r\n\r\n');
         if (end === -1) return;
-        settle();
+        socket.off('data', onData);
+        socket.off('error', onError);
         resolve({
           header: buffer.subarray(0, end).toString('utf-8'),
           leftover: buffer.subarray(end + 4),
         });
       };
       const onError = (err: Error) => {
-        settle();
+        socket.off('data', onData);
         reject(err);
       };
       socket.on('data', onData);
       socket.once('error', onError);
-      socket.once('close', onClose);
-      socket.once('end', onClose);
     });
   }
 
@@ -301,7 +242,7 @@ export class WsUnixJsonRpcClient {
       if (opcode === 0x1) {
         this.parseTextPayload(payload.toString('utf-8'));
       } else if (opcode === 0x8) {
-        this.handleDisconnect(new Error('WebSocket Unix socket closed'));
+        this.close();
         return;
       }
     }
@@ -347,18 +288,5 @@ export class WsUnixJsonRpcClient {
       pending.reject(err);
     }
     this.pending.clear();
-  }
-
-  private handleDisconnect(err: Error): void {
-    const socket = this.socket;
-    if (!socket) return;
-    this.socket = null;
-    if (socket && !socket.destroyed) {
-      socket.destroy();
-    }
-    this.rejectAll(err);
-    for (const handler of this.disconnectHandlers) {
-      handler(err);
-    }
   }
 }

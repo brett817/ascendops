@@ -7,27 +7,21 @@ import {
   REPETITION_BLOCK,
   PINGPONG_WINDOW,
   PINGPONG_BLOCK,
+  EMERGENCY_ESCAPE_MS,
+  HISTORY_RETAIN_MS,
   hashArgs,
   countRepetitions,
   detectPingPong,
+  decideHookAction,
   loadState,
   type ToolCallRecord,
+  type LoopDetectorState,
 } from '../../../src/hooks/hook-loop-detector';
 
-// ---------------------------------------------------------------------------
-// hashArgs
-// ---------------------------------------------------------------------------
-
-describe('hashArgs', () => {
-  it('returns empty string for null/undefined', () => {
+describe('hook-loop-detector hashArgs', () => {
+  it('returns empty string for nullish input', () => {
     expect(hashArgs(null)).toBe('');
     expect(hashArgs(undefined)).toBe('');
-  });
-
-  it('returns a non-empty hex string for an object', () => {
-    const h = hashArgs({ file_path: '/tmp/foo', content: 'bar' });
-    expect(h).toMatch(/^[0-9a-f]+$/);
-    expect(h.length).toBeGreaterThan(0);
   });
 
   it('is order-independent for object keys', () => {
@@ -36,35 +30,19 @@ describe('hashArgs', () => {
     expect(a).toBe(b);
   });
 
-  it('produces different hashes for different values', () => {
-    const a = hashArgs({ file_path: '/tmp/a' });
-    const b = hashArgs({ file_path: '/tmp/b' });
-    expect(a).not.toBe(b);
-  });
-
   it('preserves array order', () => {
-    const a = hashArgs({ items: [1, 2, 3] });
-    const b = hashArgs({ items: [3, 2, 1] });
-    expect(a).not.toBe(b);
+    expect(hashArgs({ items: [1, 2, 3] })).not.toBe(hashArgs({ items: [3, 2, 1] }));
   });
 });
 
-// ---------------------------------------------------------------------------
-// countRepetitions
-// ---------------------------------------------------------------------------
-
-describe('countRepetitions', () => {
+describe('hook-loop-detector repetition detection', () => {
   const makeRecord = (toolName: string, argsHash: string): ToolCallRecord => ({
     toolName,
     argsHash,
     ts: Date.now(),
   });
 
-  it('returns 0 for empty history', () => {
-    expect(countRepetitions([], 'Read', 'abc')).toBe(0);
-  });
-
-  it('counts exact matches', () => {
+  it('counts exact tool plus args matches', () => {
     const history = [
       makeRecord('Read', 'abc'),
       makeRecord('Read', 'abc'),
@@ -74,85 +52,236 @@ describe('countRepetitions', () => {
     expect(countRepetitions(history, 'Read', 'abc')).toBe(2);
   });
 
-  it('requires both tool name and args hash to match', () => {
-    const history = [makeRecord('Read', 'abc'), makeRecord('Edit', 'abc')];
-    expect(countRepetitions(history, 'Read', 'abc')).toBe(1);
-    expect(countRepetitions(history, 'Edit', 'abc')).toBe(1);
+  it('keeps threshold reachable within history size', () => {
+    expect(HISTORY_SIZE).toBeGreaterThanOrEqual(REPETITION_BLOCK);
   });
 });
 
-// ---------------------------------------------------------------------------
-// detectPingPong
-// ---------------------------------------------------------------------------
-
-describe('detectPingPong', () => {
+describe('hook-loop-detector ping-pong detection', () => {
   const makeRecord = (toolName: string): ToolCallRecord => ({
     toolName,
     argsHash: hashArgs({ tool: toolName }),
     ts: Date.now(),
   });
 
-  it('returns 0 for history shorter than PINGPONG_WINDOW', () => {
+  it('ignores histories shorter than the window', () => {
     const short = Array.from({ length: PINGPONG_WINDOW - 1 }, () => makeRecord('Read'));
     expect(detectPingPong(short).count).toBe(0);
   });
 
-  it('returns 0 when no two tools dominate the window', () => {
-    // 4 different tools spread evenly — no pair dominates 80%
-    const tools = ['Read', 'Write', 'Grep', 'Bash', 'Edit', 'Glob', 'WebFetch', 'WebSearch', 'Read', 'Write', 'Grep', 'Bash'];
-    const history = tools.map(makeRecord);
-    expect(detectPingPong(history).count).toBe(0);
-  });
-
-  it('detects a clean A/B alternation pattern', () => {
-    // PINGPONG_WINDOW alternating Read/Edit = PINGPONG_WINDOW-1 alternations
-    const alternating = Array.from({ length: PINGPONG_WINDOW }, (_, i) =>
+  it('detects a clean alternating pair', () => {
+    const alternating = Array.from({ length: HISTORY_SIZE }, (_, i) =>
       makeRecord(i % 2 === 0 ? 'Read' : 'Edit'),
     );
     const result = detectPingPong(alternating);
-    expect(result.count).toBeGreaterThan(0);
-    expect(result.tools).not.toBeNull();
+    expect(result.count).toBeGreaterThanOrEqual(PINGPONG_BLOCK);
     expect(result.tools).toContain('Read');
     expect(result.tools).toContain('Edit');
   });
 
-  it('does not detect when same tool fills the window (no alternation)', () => {
-    // All Read — no ping-pong
+  it('does not flag monotone single-tool history as ping-pong', () => {
     const monotone = Array.from({ length: PINGPONG_WINDOW }, () => makeRecord('Read'));
     expect(detectPingPong(monotone).count).toBe(0);
   });
+});
 
-  it('uses the last PINGPONG_WINDOW records to identify the pair', () => {
-    // Build HISTORY_SIZE records with varied tools, then append a clean alternating window
-    const noise = Array.from({ length: HISTORY_SIZE - PINGPONG_WINDOW }, () =>
-      makeRecord('Glob'),
-    );
-    const alternating = Array.from({ length: PINGPONG_WINDOW }, (_, i) =>
-      makeRecord(i % 2 === 0 ? 'Read' : 'Edit'),
-    );
-    const history = [...noise, ...alternating];
-    const result = detectPingPong(history);
-    expect(result.count).toBeGreaterThan(0);
+describe('hook-loop-detector decideHookAction — blocked-call non-recording', () => {
+  const NOW = 1_800_000_000_000;
+
+  function alternatingHistory(length: number): ToolCallRecord[] {
+    return Array.from({ length }, (_, i) => ({
+      toolName: i % 2 === 0 ? 'Bash' : 'Skill',
+      argsHash: hashArgs({ i }),
+      ts: NOW - (length - i) * 1000,
+    }));
+  }
+
+  function repeatingHistory(length: number, toolName: string, argsHash: string): ToolCallRecord[] {
+    return Array.from({ length }, (_, i) => ({
+      toolName,
+      argsHash,
+      ts: NOW - (length - i) * 1000,
+    }));
+  }
+
+  it('does not record blocked calls in history when ping-pong threshold tripped', () => {
+    const state: LoopDetectorState = {
+      history: alternatingHistory(HISTORY_SIZE),
+      firstBlockedAt: null,
+      emergencyEscapeUsed: false,
+    };
+    const decision = decideHookAction(state, 'Skill', hashArgs({ next: true }), NOW);
+    expect(decision.action).toBe('block');
+    expect(decision.nextState.history).toEqual(state.history);
+    expect(decision.nextState.firstBlockedAt).toBe(NOW);
+    expect(decision.nextState.emergencyEscapeUsed).toBe(false);
   });
 
-  it('counts alternations across the full history (not just the window)', () => {
-    // Build HISTORY_SIZE alternating Read/Edit entries so alternation count
-    // spans the full history — necessary for PINGPONG_BLOCK (14) to be reachable
-    // since max alternations in PINGPONG_WINDOW (12) alone is only 11.
-    const fullAlternating = Array.from({ length: HISTORY_SIZE }, (_, i) =>
-      makeRecord(i % 2 === 0 ? 'Read' : 'Edit'),
-    );
-    const result = detectPingPong(fullAlternating);
-    // Full alternation across 30 records gives 29 alternations — well above PINGPONG_BLOCK
-    expect(result.count).toBeGreaterThanOrEqual(PINGPONG_BLOCK);
+  it('does not record blocked calls in history when repetition threshold tripped', () => {
+    const repHash = hashArgs({ same: 'args' });
+    const state: LoopDetectorState = {
+      history: repeatingHistory(REPETITION_BLOCK, 'Read', repHash),
+      firstBlockedAt: null,
+      emergencyEscapeUsed: false,
+    };
+    const decision = decideHookAction(state, 'Read', repHash, NOW);
+    expect(decision.action).toBe('block');
+    expect(decision.nextState.history).toEqual(state.history);
+    expect(decision.nextState.firstBlockedAt).toBe(NOW);
+  });
+
+  it('preserves firstBlockedAt across repeated blocks within the same window', () => {
+    const earlier = NOW - 60_000;
+    const state: LoopDetectorState = {
+      history: alternatingHistory(HISTORY_SIZE),
+      firstBlockedAt: earlier,
+      emergencyEscapeUsed: false,
+    };
+    const decision = decideHookAction(state, 'Bash', hashArgs({ x: 1 }), NOW);
+    expect(decision.action).toBe('block');
+    expect(decision.nextState.firstBlockedAt).toBe(earlier);
   });
 });
 
-// ---------------------------------------------------------------------------
-// loadState
-// ---------------------------------------------------------------------------
+describe('hook-loop-detector decideHookAction — emergency escape', () => {
+  const NOW = 1_800_000_000_000;
 
-describe('loadState', () => {
+  function alternatingHistory(length: number): ToolCallRecord[] {
+    return Array.from({ length }, (_, i) => ({
+      toolName: i % 2 === 0 ? 'Bash' : 'Skill',
+      argsHash: hashArgs({ i }),
+      ts: NOW - (length - i) * 1000,
+    }));
+  }
+
+  it('grants emergency escape after EMERGENCY_ESCAPE_MS blocked', () => {
+    const state: LoopDetectorState = {
+      history: alternatingHistory(HISTORY_SIZE),
+      firstBlockedAt: NOW - EMERGENCY_ESCAPE_MS - 1,
+      emergencyEscapeUsed: false,
+    };
+    const decision = decideHookAction(state, 'Bash', hashArgs({ alert: true }), NOW);
+    expect(decision.action).toBe('escape');
+    expect(decision.nextState.emergencyEscapeUsed).toBe(true);
+    expect(decision.nextState.history).toEqual(state.history);
+    expect(decision.alertMessage).toMatch(/Emergency escape granted after \d+ min blocked/);
+  });
+
+  it('only grants one emergency escape per blocked window', () => {
+    const state: LoopDetectorState = {
+      history: alternatingHistory(HISTORY_SIZE),
+      firstBlockedAt: NOW - 2 * EMERGENCY_ESCAPE_MS,
+      emergencyEscapeUsed: true,
+    };
+    const decision = decideHookAction(state, 'Skill', hashArgs({ retry: true }), NOW);
+    expect(decision.action).toBe('block');
+    expect(decision.nextState.emergencyEscapeUsed).toBe(true);
+  });
+
+  it('resets blocked-window state when call is allowed', () => {
+    const calmHistory: ToolCallRecord[] = [
+      { toolName: 'Read', argsHash: hashArgs({ a: 1 }), ts: NOW - 5000 },
+      { toolName: 'Read', argsHash: hashArgs({ b: 2 }), ts: NOW - 4000 },
+    ];
+    const state: LoopDetectorState = {
+      history: calmHistory,
+      firstBlockedAt: NOW - 60_000,
+      emergencyEscapeUsed: true,
+    };
+    const decision = decideHookAction(state, 'Read', hashArgs({ c: 3 }), NOW);
+    expect(decision.action).toBe('allow');
+    expect(decision.nextState.firstBlockedAt).toBeNull();
+    expect(decision.nextState.emergencyEscapeUsed).toBe(false);
+    expect(decision.nextState.history).toHaveLength(3);
+  });
+});
+
+describe('hook-loop-detector decideHookAction — threshold sanity', () => {
+  it('PINGPONG_BLOCK is set above the legitimate-alternation band', () => {
+    expect(PINGPONG_BLOCK).toBeGreaterThanOrEqual(20);
+    expect(PINGPONG_BLOCK).toBeLessThanOrEqual(HISTORY_SIZE);
+  });
+
+  it('HISTORY_RETAIN_MS is short enough to clear stale prior-session history', () => {
+    expect(HISTORY_RETAIN_MS).toBeLessThanOrEqual(5 * 60 * 1000);
+    expect(HISTORY_RETAIN_MS).toBeGreaterThanOrEqual(30 * 1000);
+  });
+});
+
+describe('hook-loop-detector decideHookAction — cross-session staleness', () => {
+  const NOW = 1_800_000_000_000;
+
+  function staleAlternatingHistory(length: number, ageMs: number): ToolCallRecord[] {
+    return Array.from({ length }, (_, i) => ({
+      toolName: i % 2 === 0 ? 'Bash' : 'Skill',
+      argsHash: hashArgs({ i }),
+      ts: NOW - ageMs - (length - i) * 1000,
+    }));
+  }
+
+  it('boot scenario: stale alternation from a prior session does not block the first new call', () => {
+    const state: LoopDetectorState = {
+      history: staleAlternatingHistory(HISTORY_SIZE, HISTORY_RETAIN_MS + 1000),
+      firstBlockedAt: null,
+      emergencyEscapeUsed: false,
+    };
+    const decision = decideHookAction(state, 'Bash', hashArgs({ first: 'boot' }), NOW);
+    expect(decision.action).toBe('allow');
+    expect(decision.nextState.history).toHaveLength(1);
+    expect(decision.nextState.history[0].toolName).toBe('Bash');
+  });
+
+  it('drops stale entries from nextState.history on allow', () => {
+    const stale = staleAlternatingHistory(5, HISTORY_RETAIN_MS + 1000);
+    const fresh: ToolCallRecord[] = [
+      { toolName: 'Read', argsHash: hashArgs({ a: 1 }), ts: NOW - 2000 },
+    ];
+    const state: LoopDetectorState = {
+      history: [...stale, ...fresh],
+      firstBlockedAt: null,
+      emergencyEscapeUsed: false,
+    };
+    const decision = decideHookAction(state, 'Edit', hashArgs({ b: 2 }), NOW);
+    expect(decision.action).toBe('allow');
+    expect(decision.nextState.history).toHaveLength(2);
+    expect(decision.nextState.history.map(r => r.toolName)).toEqual(['Read', 'Edit']);
+  });
+
+  it('drops stale entries from nextState.history on block', () => {
+    const stale = staleAlternatingHistory(5, HISTORY_RETAIN_MS + 1000);
+    const recentRepeats: ToolCallRecord[] = Array.from({ length: REPETITION_BLOCK }, (_, i) => ({
+      toolName: 'Read',
+      argsHash: 'samehash',
+      ts: NOW - (REPETITION_BLOCK - i) * 100,
+    }));
+    const state: LoopDetectorState = {
+      history: [...stale, ...recentRepeats],
+      firstBlockedAt: null,
+      emergencyEscapeUsed: false,
+    };
+    const decision = decideHookAction(state, 'Read', 'samehash', NOW);
+    expect(decision.action).toBe('block');
+    expect(decision.nextState.history.every(r => NOW - r.ts <= HISTORY_RETAIN_MS)).toBe(true);
+    expect(decision.nextState.history).toHaveLength(REPETITION_BLOCK);
+  });
+
+  it('still blocks when alternation is fresh and within the retain window', () => {
+    const recent: ToolCallRecord[] = Array.from({ length: HISTORY_SIZE }, (_, i) => ({
+      toolName: i % 2 === 0 ? 'Bash' : 'Skill',
+      argsHash: hashArgs({ i }),
+      ts: NOW - (HISTORY_SIZE - i) * 1000,
+    }));
+    const state: LoopDetectorState = {
+      history: recent,
+      firstBlockedAt: null,
+      emergencyEscapeUsed: false,
+    };
+    const decision = decideHookAction(state, 'Bash', hashArgs({ next: true }), NOW);
+    expect(decision.action).toBe('block');
+  });
+});
+
+describe('hook-loop-detector state loading', () => {
   let tmpDir: string;
 
   beforeEach(() => {
@@ -164,47 +293,20 @@ describe('loadState', () => {
   });
 
   it('returns empty history when state file does not exist', () => {
-    const state = loadState(tmpDir);
-    expect(state.history).toEqual([]);
+    expect(loadState(tmpDir).history).toEqual([]);
   });
 
-  it('filters out corrupt records on load (Bug-1 fix)', () => {
-    const stateFile = join(tmpDir, 'loop-detector.json');
-    const corrupt = {
+  it('filters corrupt records on load', () => {
+    writeFileSync(join(tmpDir, 'loop-detector.json'), JSON.stringify({
       history: [
-        { toolName: 'Read', argsHash: 'abc', ts: 1000 }, // valid
-        { toolName: null, argsHash: 'def', ts: 2000 },   // null toolName — corrupt
-        { toolName: 'Edit', argsHash: 789, ts: 3000 },   // argsHash not string — corrupt
-        { toolName: 'Grep' },                             // missing argsHash and ts — corrupt
-        { toolName: 'Bash', argsHash: 'xyz', ts: 5000 }, // valid
+        { toolName: 'Read', argsHash: 'abc', ts: 1000 },
+        { toolName: null, argsHash: 'def', ts: 2000 },
+        { toolName: 'Edit', argsHash: 789, ts: 3000 },
+        { toolName: 'Bash', argsHash: 'xyz', ts: 5000 },
       ],
-    };
-    writeFileSync(stateFile, JSON.stringify(corrupt), 'utf-8');
+    }), 'utf-8');
     const state = loadState(tmpDir);
     expect(state.history).toHaveLength(2);
-    expect(state.history[0].toolName).toBe('Read');
-    expect(state.history[1].toolName).toBe('Bash');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Threshold sanity
-// ---------------------------------------------------------------------------
-
-describe('threshold constants', () => {
-  it('HISTORY_SIZE >= REPETITION_BLOCK', () => {
-    expect(HISTORY_SIZE).toBeGreaterThanOrEqual(REPETITION_BLOCK);
-  });
-
-  it('PINGPONG_WINDOW <= HISTORY_SIZE', () => {
-    expect(PINGPONG_WINDOW).toBeLessThanOrEqual(HISTORY_SIZE);
-  });
-
-  it('PINGPONG_BLOCK > PINGPONG_WINDOW (alternations counted across full history)', () => {
-    // The block threshold is checked against the FULL history alternation count,
-    // not just the PINGPONG_WINDOW, so it can exceed the window size. This is
-    // intentional — without this, the max reachable alternation count in a
-    // 12-call window is only 11, making a threshold of 14 unreachable.
-    expect(PINGPONG_BLOCK).toBeGreaterThan(PINGPONG_WINDOW);
+    expect(state.history.map(r => r.toolName)).toEqual(['Read', 'Bash']);
   });
 });

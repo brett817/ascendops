@@ -46,9 +46,6 @@ knowledge-base/venv/
 knowledge-base/__pycache__/
 knowledge-base/scripts/__pycache__/
 knowledge-base/scripts/_test_clients/__pycache__/
-# Python cache from programmatic-tools skill lib
-community/skills/programmatic-tools/lib/__pycache__/
-community/skills/programmatic-tools/examples/__pycache__/
 tests/playwright/dashboard-ui.spec.ts
 
 # Local ops docs (personal, not for public repo)
@@ -94,21 +91,8 @@ AGENTS.md
 !templates/**/AGENTS.md
 dashboard/screenshots/
 dashboard/test-*.py
-graphify-out/
 
-# Weekly tool-update generated logs
-logs/weekly-tool-update/*.md
-!logs/weekly-tool-update/.gitkeep
-
-# Local vendor research checkout — not runtime load-bearing
-vendor/everything-claude-code/
-
-# Pulled from public repo (David 2026-06-01): competitor/partner recon, internal
-# decisions log, and reverse-engineered PM API captures. Kept local, off public repo.
-orgs/*/docs/durable/pm-nexus-partner-recon-*.md
-orgs/*/docs/durable/competitive-pmdash-recon-*.md
-orgs/*/docs/durable/pm-september-conference-recon-*.md
-orgs/*/docs/durable/decisions-log.md
-orgs/*/docs/durable/pm-create-meld-in-and-merge-endpoint-capture-*.md
-orgs/*/docs/durable/pm-tenant-notes-endpoint-capture-*.md
-orgs/*/docs/durable/pm-phone-field-investigation-*.md
+# Public community agent templates may intentionally include their own docs,
+# AGENTS.md, memory skill, and scaffold files.
+!community/agents/research-agent/
+!community/agents/research-agent/**

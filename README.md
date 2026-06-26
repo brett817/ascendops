@@ -57,13 +57,12 @@ Not built for:
 
 ## Features
 
-- 🤖 **Persistent agents** — Claude Code runs 24/7 in PTY sessions, auto-restarting on crash or after 71-hour context rotation.
-- 🔀 **Multi-agent orchestration** — orchestrator, analyst, and specialist agents coordinate via a shared file bus. Tasks, blockers, and approvals flow automatically.
-- 📱 **Telegram + iOS control** — send commands, approve actions, get reports from anywhere.
-- 🌐 **Multi-runtime** — run agents on `claude-code` (default), OpenAI's `codex-app-server`, or Hermes. All runtimes share the same bus, crons, dashboard, and Telegram integration; pick per-agent.
-- 🪝 **Hook framework** — fire-block-escalate event pipeline for custom routing and telemetry.
-- 🌙 **Autoresearch (theta wave)** — agents run autonomous experiments overnight and surface findings for your morning review.
-- 📊 **Web dashboard** — Next.js UI for tasks, approvals, experiments, and fleet health.
+- **Persistent agents** — Claude Code runs 24/7 in PTY sessions, auto-restarting on crash or after 71-hour context rotation.
+- **Multi-agent orchestration** — Orchestrator, Analyst, and specialist agents coordinate via a shared file bus. Tasks, blockers, and approvals flow automatically.
+- **Multi-runtime** — Run agents on `claude-code` (default) or OpenAI's `codex-app-server`. Both runtimes share the same bus, crons, dashboard, and Telegram integration; pick per-agent.
+- **Telegram + iOS control** — Send commands, approve actions, and get reports from anywhere. Native iOS app coming soon.
+- **Web dashboard** — Full-featured Next.js UI for tasks, approvals, experiments, analytics, and agent fleet health.
+- **Autoresearch (theta wave)** — Agents run autonomous experiments overnight, evaluate results, and surface findings for your review.
 
 ---
 
@@ -115,7 +114,19 @@ claude ~/ascendops
 
 If you joined via the Skool community and want the two reference personas (Maintenance Director + Leasing Coordinator) running in 30 minutes, follow [SKOOL-INSTALL.md](./SKOOL-INSTALL.md) instead of the install script above. It's a linear happy-path guide with all credentials pre-listed.
 
-More setup details in [CONTRIBUTING.md](./CONTRIBUTING.md) and the environment variable reference in [README.envs.md](./README.envs.md).
+# Add Telegram credentials for each agent
+cat > orgs/myorg/agents/boss/.env << EOF
+BOT_TOKEN=<your-bot-token>
+CHAT_ID=<your-chat-id>
+ALLOWED_USER=<your-telegram-user-id>
+EOF
+
+cortextos ecosystem                        # Generate PM2 config
+pm2 start ecosystem.config.js && pm2 save && pm2 startup
+
+# Windows: pm2 startup is unsupported. Use Task Scheduler instead:
+#   powershell -ExecutionPolicy Bypass -File scripts\install-windows-pm2-startup.ps1
+```
 
 ---
 
@@ -123,13 +134,22 @@ More setup details in [CONTRIBUTING.md](./CONTRIBUTING.md) and the environment v
 
 | Template | Best for |
 |---|---|
-| `orchestrator` | Your "boss" agent. Coordinates the fleet, runs morning + evening reviews, gates approvals. |
-| `analyst` | System health, metrics, theta-wave autoresearch. |
-| `agent` | General-purpose worker. Base for specialist agents. |
+| Node.js 20+ | [nodejs.org](https://nodejs.org) |
+| macOS, Linux, or Windows 10/11 | Windows uses Task Scheduler for reboot persistence — see `scripts/install-windows-pm2-startup.ps1` |
+| Claude Code | `npm install -g @anthropic-ai/claude-code` + `claude login` |
+| PM2 | `npm install -g pm2` |
+| Telegram bot token | Create via @BotFather |
+
+---
+
+## Templates
+
+| Template | Description |
+|---|---|
+| `orchestrator` | Coordinates agents, manages goals, handles morning/evening reviews, approves actions |
+| `analyst` | System health, metrics, theta-wave autoresearch, analytics |
+| `agent` | General-purpose worker — use this as the base for specialist agents |
 | `agent-codex` | Codex-runtime worker, scaffolds with `runtime: codex-app-server` and `model: gpt-5-codex` (see `templates/agent-codex/`) |
-| `agent-maintenance-director` | PM persona — work-order triage, vendor dispatch coordination, resident comms, follow-up tracking. Shipped with the Skool release. |
-| `agent-leasing-coordinator` | PM persona — prospect intake, showings, applications, lease docs, move-in coordination. Shipped with the Skool release. |
-| `property-management/agent` | Pre-configured for PropertyMeld + maintenance ops. |
 
 Add a codex agent the same way you add a claude agent:
 
@@ -137,6 +157,36 @@ Add a codex agent the same way you add a claude agent:
 cortextos add-agent reindexer --template agent-codex --org myorg
 # or, equivalently, with the runtime flag on the default template:
 cortextos add-agent reindexer --runtime codex-app-server --org myorg
+```
+
+Codex agents share the same bus, crons, and dashboard surfaces as claude agents — they only differ in which model handles each turn.
+
+### The `runtime` field
+
+Every agent's `config.json` carries an explicit `runtime` field that the daemon dispatches on. Valid values:
+
+| Runtime | Adapter | Default model | Skills location |
+|---|---|---|---|
+| `claude-code` | `ClaudePTY` (default) | claude-sonnet-4-6 | `.claude/skills/<skill>/SKILL.md` |
+| `codex-app-server` | `CodexAppServerPTY` | `gpt-5-codex` | `plugins/cortextos-agent-skills/skills/<skill>/SKILL.md` (linked into `~/.codex/skills/<agent>__<skill>`) |
+| `hermes` | `HermesPTY` (experimental) | model per `config.json` | hermes-specific |
+
+Pass `--runtime <kind>` on `add-agent` to set it at scaffold time, or edit the field in `config.json` and restart the agent. The default is `claude-code`. Today only `--template agent` (and the alias `--template agent-codex`) supports `--runtime codex-app-server` — pairing the codex runtime with `--template orchestrator`/`analyst`/`m2c1-worker`/`hermes` errors with a clean message until codex variants of those templates ship.
+
+---
+
+## CLI Reference
+
+```bash
+cortextos install            # Set up state directories
+cortextos init <org>         # Create an organization
+cortextos add-agent <name>   # Add an agent (--template, --org, --runtime)
+cortextos enable <name>      # Enable agent in daemon
+cortextos ecosystem          # Generate PM2 config
+cortextos status             # Agent health table
+cortextos doctor             # Check prerequisites
+cortextos list-agents        # List agents
+cortextos dashboard          # Start web dashboard (--port 3000)
 ```
 
 Codex agents share the same bus, crons, and dashboard surfaces as claude agents — they only differ in which model handles each turn.

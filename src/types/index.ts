@@ -161,25 +161,21 @@ export interface AgentConfig {
   startup_delay?: number;
   max_session_seconds?: number;
   max_crashes_per_day?: number;
+  /**
+   * Sliding-window crash-loop detector. When N crashes occur within the window,
+   * the agent auto-pauses (status: 'halted') instead of retrying. Absent = legacy
+   * daily counter only.
+   */
+  crash_window?: { seconds: number; max_crashes?: number };
   model?: string;
   /**
-   * Cost tier for model routing: 'haiku' | 'sonnet' | 'opus'.
-   * Ignored when `model` is set (explicit model takes precedence).
-   * Resolved to a concrete model ID via model_tiers (or DEFAULT_MODEL_TIERS).
+   * Whether to launch Claude Code with `--dangerously-skip-permissions`.
+   * Defaults to true (back-compat: agents run unattended). Set to false to keep
+   * Claude Code's permission system engaged so the PermissionRequest hook
+   * (hook-permission-telegram) gates tool use instead of everything auto-running.
+   * Only applies to the claude-code runtime (Hermes never passes the flag).
    */
-  tier?: 'haiku' | 'sonnet' | 'opus';
-  /**
-   * Per-agent overrides for the tier→model ID mapping.
-   * Merges on top of DEFAULT_MODEL_TIERS — only specify the tiers you want to override.
-   */
-  model_tiers?: { haiku?: string; sonnet?: string; opus?: string };
-  /**
-   * How long to pause (seconds) when an Anthropic rate-limit exit is detected,
-   * before restarting the agent. Defaults to 18000 (5 hours) — the standard
-   * Anthropic rolling rate-limit window. Rate-limit pauses do NOT count toward
-   * max_crashes_per_day and do NOT trigger the git watchdog.
-   */
-  rate_limit_pause_seconds?: number;
+  dangerously_skip_permissions?: boolean;
   working_directory?: string;
   enabled?: boolean;
   crons?: CronEntry[];
@@ -230,6 +226,12 @@ export interface AgentConfig {
    */
   codex_context_cap?: number;
   /**
+   * Fallback context window cap (tokens) for codex-app-server agents when the
+   * server's `thread/tokenUsage/updated` event reports `modelContextWindow=null`.
+   * Defaults to 256000 when unset. Only applied to the codex-app-server runtime.
+   */
+  codex_context_cap?: number;
+  /**
    * Agent runtime. Defaults to 'claude-code' when absent.
    * 'hermes' selects the HermesPTY spawn path (Python persistent REPL,
    * NousResearch/hermes-agent) with Hermes-specific bootstrap, session
@@ -237,18 +239,11 @@ export interface AgentConfig {
    */
   runtime?: 'claude-code' | 'hermes' | 'codex-app-server';
   /**
-   * Vendor adapter for the underlying CLI binary. Defaults to 'anthropic'
-   * when absent (which spawns the `claude` CLI). MVP supports anthropic only;
-   * 'openai' and 'google' adapters land in subsequent migration steps.
-   * Only meaningful when `runtime` is unset or 'claude-code' — Hermes runtime
-   * uses its own override path in HermesPTY.
-   */
-  vendor?: 'anthropic' | 'openai' | 'google';
-  /**
    * Whether this agent runs a Telegram poller. Defaults to true when absent
    * (preserves existing behaviour). Set to false on specialist agents that
    * should not own a Telegram bot — only the designated orchestrator agent
-   * should poll.
+   * should poll. Requires BOT_TOKEN + CHAT_ID to already be unset or the
+   * poller will be skipped regardless.
    */
   telegram_polling?: boolean;
 }

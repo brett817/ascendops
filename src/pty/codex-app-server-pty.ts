@@ -2,7 +2,6 @@ import { appendFileSync, existsSync, readFileSync, unlinkSync, writeFileSync } f
 import { join } from 'path';
 import { homedir } from 'os';
 import { randomBytes } from 'crypto';
-import { createServer, createConnection } from 'net';
 import type { AgentConfig, CtxEnv } from '../types/index.js';
 import { OutputBuffer } from './output-buffer.js';
 import type { TelegramAPI } from '../telegram/api.js';
@@ -36,9 +35,7 @@ interface ThreadState {
 }
 
 interface SocketPointer {
-  socketPath?: string;
-  host?: string;
-  port?: number;
+  socketPath: string;
   fallback: boolean;
   reason?: string;
   updatedAt: string;
@@ -109,10 +106,6 @@ export class CodexAppServerPTY {
   private _spawnFn: SpawnFn | null = null;
   private _appServerPty: IPty | null = null;
   private _rpc: WsUnixJsonRpcClient | null = null;
-  private _rpcMessageUnsubscribe: (() => void) | null = null;
-  private _rpcDisconnectUnsubscribe: (() => void) | null = null;
-  private _pidPollTimer: ReturnType<typeof setInterval> | null = null;
-  private _exitFinalized = false;
   private _onExitHandler: ((exitCode: number, signal?: number) => void) | null = null;
   private _outputBuffer: OutputBuffer;
   private _env: CtxEnv;
@@ -122,7 +115,6 @@ export class CodexAppServerPTY {
   private _socketPath: string;
   private _socketListenArg: string;
   private _socketCwd: string;
-  private _rpcEndpoint: { host: string; port: number } | { socketPath: string } | null = null;
   private _threadStatePath: string;
   private _socketPointerPath: string;
   private _threadId: string | null = null;
@@ -150,7 +142,6 @@ export class CodexAppServerPTY {
     }
 
     ensureDir(this._stateDir);
-    this._exitFinalized = false;
     this._alive = true;
 
     try {
@@ -190,15 +181,24 @@ export class CodexAppServerPTY {
   }
 
   kill(): void {
-    const pty = this._appServerPty;
-    this.finalizeExit(0, undefined, 'kill');
-    if (pty) {
+    this._alive = false;
+    this._turnQueue = [];
+    this.rejectTurnCompletion(new Error('Codex app-server stopped'));
+    if (this._rpc) {
+      this._rpc.close();
+      this._rpc = null;
+    }
+    if (this._appServerPty) {
       try {
-        pty.kill();
+        this._appServerPty.kill();
       } catch {
         // Ignore shutdown errors.
       }
+      this._appServerPty = null;
     }
+    this.removeSocket();
+    this._onExitHandler?.(0, undefined);
+    this._onExitHandler = null;
   }
 
   isAlive(): boolean {
@@ -220,54 +220,6 @@ export class CodexAppServerPTY {
   setTelegramHandle(api: TelegramAPI, chatId: string): void {
     this._telegramApi = api;
     this._chatId = chatId;
-  }
-
-  private finalizeExit(exitCode: number, signal?: number, reason?: string): void {
-    if (this._exitFinalized) return;
-    this._exitFinalized = true;
-    this._alive = false;
-    this._executing = false;
-    this._writeBuffer = '';
-    this._turnQueue = [];
-    this.rejectTurnCompletion(new Error(reason ? `Codex app-server stopped: ${reason}` : 'Codex app-server stopped'));
-    this.stopPidPoll();
-    this._rpcMessageUnsubscribe?.();
-    this._rpcMessageUnsubscribe = null;
-    this._rpcDisconnectUnsubscribe?.();
-    this._rpcDisconnectUnsubscribe = null;
-    if (this._rpc) {
-      this._rpc.close();
-      this._rpc = null;
-    }
-    this._appServerPty = null;
-    this._rpcEndpoint = null;
-    this.removeSocket();
-    const onExit = this._onExitHandler;
-    this._onExitHandler = null;
-    onExit?.(exitCode, signal);
-  }
-
-  private startPidPoll(pid: number): void {
-    this.stopPidPoll();
-    if (!(pid > 0)) return;
-    this._pidPollTimer = setInterval(() => {
-      if (!this._alive || this._exitFinalized) return;
-      let alive = true;
-      try {
-        process.kill(pid, 0);
-      } catch (err) {
-        alive = (err as NodeJS.ErrnoException).code === 'EPERM';
-      }
-      if (!alive) {
-        this.finalizeExit(1, undefined, `pid ${pid} no longer exists`);
-      }
-    }, 30000);
-  }
-
-  private stopPidPoll(): void {
-    if (!this._pidPollTimer) return;
-    clearInterval(this._pidPollTimer);
-    this._pidPollTimer = null;
   }
 
   private async handleInput(content: string): Promise<void> {
@@ -367,11 +319,14 @@ export class CodexAppServerPTY {
   }
 
   private buildMediaPayload(mediaType: string, beforeReply: string): string | null {
-    const captionMatch = beforeReply.match(/caption:\s*\n```(?:[a-zA-Z0-9_-]+)?\n([\s\S]*?)\n```/);
-    const caption = captionMatch?.[1]?.trim() ?? '';
+    // Match a dynamically-sized fence (3+ backticks): wrapFenceSafe grows the
+    // fence to outlast any backtick run in the body, so the close must be the
+    // same length as the open (backreference \1). Group 2 is the body.
+    const captionMatch = beforeReply.match(/caption:\s*\n(`{3,})(?:[a-zA-Z0-9_-]+)?\n([\s\S]*?)\n\1/);
+    const caption = captionMatch?.[2]?.trim() ?? '';
 
-    const transcriptMatch = beforeReply.match(/transcript:\s*\n```(?:[a-zA-Z0-9_-]+)?\n([\s\S]*?)\n```/);
-    const transcript = transcriptMatch?.[1]?.trim() ?? '';
+    const transcriptMatch = beforeReply.match(/transcript:\s*\n(`{3,})(?:[a-zA-Z0-9_-]+)?\n([\s\S]*?)\n\1/);
+    const transcript = transcriptMatch?.[2]?.trim() ?? '';
 
     const localFileMatch = beforeReply.match(/^local_file:\s*(.+)$/m);
     const localFile = localFileMatch?.[1]?.trim() ?? '';
@@ -456,44 +411,18 @@ export class CodexAppServerPTY {
     throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
   }
 
-  private async startAppServer(): Promise<void> {
-    if (!this._spawnFn) {
-      const nodePty = require('node-pty');
-      this._spawnFn = nodePty.spawn;
-    }
-
-    // codex-cli 0.118.0 dropped `unix://` --listen support. Allocate a free
-    // ephemeral TCP port on loopback and spawn with `--listen ws://127.0.0.1:<port>`.
-    // The WebSocket frame parsing in WsUnixJsonRpcClient is transport-agnostic;
-    // only the connect path differs.
-    const port = await allocateFreePort();
-    const listenArg = `ws://127.0.0.1:${port}`;
-    this._socketListenArg = listenArg;
-    this._rpcEndpoint = { host: '127.0.0.1', port };
-    try {
-      const pointer: SocketPointer = {
-        host: '127.0.0.1',
-        port,
-        fallback: false,
-        updatedAt: new Date().toISOString(),
-      };
-      ensureDir(this._stateDir);
-      writeFileSync(this._socketPointerPath, `${JSON.stringify(pointer, null, 2)}\n`, 'utf-8');
-    } catch {
-      // Non-fatal — pointer is informational.
-    }
-
+  private startAppServer(): Promise<void> {
     return new Promise<void>((resolve, reject) => {
-      // Note: PR-#369 originally passed `--enable goals` to opt into the
-      // goal-tracking feature, but codex-cli 0.118.0 reports
-      // `Error: Unknown feature flag: goals` because this feature is not yet
-      // present in the local codex build. Drop the flag for compatibility;
-      // /goal RPC calls degrade to a clean error if codex doesn't expose
-      // them. Re-enable once codex-cli ships goal support.
+      if (!this._spawnFn) {
+        const nodePty = require('node-pty');
+        this._spawnFn = nodePty.spawn;
+      }
+
       const spawnFn = this._spawnFn!;
       const pty = spawnFn('codex', [
         'app-server',
-        '--listen', listenArg,
+        '--enable', 'goals',
+        '--listen', this._socketListenArg,
       ], {
         name: 'xterm-256color',
         cols: 200,
@@ -503,7 +432,6 @@ export class CodexAppServerPTY {
       });
 
       this._appServerPty = pty;
-      this.startPidPoll(pty.pid);
       pty.onData((data) => {
         this._outputBuffer.push(data);
         if (data.includes('Error:')) {
@@ -512,25 +440,14 @@ export class CodexAppServerPTY {
       });
       pty.onExit(({ exitCode, signal }) => {
         if (this._appServerPty !== pty) return;
-        this.finalizeExit(exitCode, signal, 'pty exit');
+        this._appServerPty = null;
+        this._alive = false;
+        this.rejectTurnCompletion(new Error('Codex app-server exited'));
+        this._onExitHandler?.(exitCode, signal);
       });
 
-      this.waitForPort(port).then(resolve, reject);
+      this.waitForSocket().then(resolve, reject);
     });
-  }
-
-  private async waitForPort(port: number, timeoutMs = 10000): Promise<void> {
-    const start = Date.now();
-    while (Date.now() - start < timeoutMs) {
-      const ok = await new Promise<boolean>((res) => {
-        const probe = createConnection({ host: '127.0.0.1', port });
-        probe.once('connect', () => { probe.destroy(); res(true); });
-        probe.once('error', () => { probe.destroy(); res(false); });
-      });
-      if (ok) return;
-      await sleep(100);
-    }
-    throw new Error(`Timed out waiting for app-server port: 127.0.0.1:${port}`);
   }
 
   private async waitForSocket(timeoutMs = 10000): Promise<void> {
@@ -543,15 +460,8 @@ export class CodexAppServerPTY {
   }
 
   private async connectRpc(): Promise<void> {
-    // Prefer the TCP endpoint allocated in startAppServer(). Fall back to the
-    // legacy unix-socket path if no endpoint was set (e.g. tests using the
-    // older constructor flow).
-    const endpoint = this._rpcEndpoint ?? { socketPath: this._socketPath };
-    this._rpc = new WsUnixJsonRpcClient(endpoint);
-    this._rpcMessageUnsubscribe = this._rpc.onMessage((message) => this.handleRpcMessage(message));
-    this._rpcDisconnectUnsubscribe = this._rpc.onDisconnect((err) => {
-      this.finalizeExit(1, undefined, err.message || 'rpc disconnect');
-    });
+    this._rpc = new WsUnixJsonRpcClient(this._socketPath);
+    this._rpc.onMessage((message) => this.handleRpcMessage(message));
     await this._rpc.connect();
   }
 
@@ -568,25 +478,25 @@ export class CodexAppServerPTY {
   }
 
   private async startOrResumeThread(mode: 'fresh' | 'continue'): Promise<void> {
-    if (mode === 'continue') {
-      const persisted = this.readThreadState();
-      if (persisted) {
-        try {
-          const resumed = await this.request<ThreadResponse>('thread/resume', {
-            threadId: persisted.threadId,
-            cwd: this._cwd,
-            ...THREAD_PERMISSION_OVERRIDES,
-            config: { features: { goals: true } },
-            excludeTurns: true,
-            persistExtendedHistory: true,
-          });
-          this.setThreadId(resumed.result?.thread.id || persisted.threadId);
-          return;
-        } catch (err) {
-          this._outputBuffer.push(`[codex-app-server] persisted resume failed: ${err}\n`);
-        }
+    const persisted = this.readThreadState();
+    if (persisted) {
+      try {
+        const resumed = await this.request<ThreadResponse>('thread/resume', {
+          threadId: persisted.threadId,
+          cwd: this._cwd,
+          ...THREAD_PERMISSION_OVERRIDES,
+          config: { features: { goals: true } },
+          excludeTurns: true,
+          persistExtendedHistory: true,
+        });
+        this.setThreadId(resumed.result?.thread.id || persisted.threadId);
+        return;
+      } catch (err) {
+        this._outputBuffer.push(`[codex-app-server] persisted resume failed: ${err}\n`);
       }
+    }
 
+    if (mode === 'continue') {
       const latest = await this.findLatestThreadForCwd();
       if (latest) {
         const resumed = await this.request<ThreadResponse>('thread/resume', {
@@ -873,42 +783,34 @@ export class CodexAppServerPTY {
    * monitor. Writes atomically; failures are non-fatal (observability only).
    *
    * Mapping (per codex schema ThreadTokenUsageUpdatedNotification):
-   *   - used_percentage = last.inputTokens / cap * 100  (clamped to [0, 100])
+   *   - used_percentage = total.totalTokens / cap * 100  (clamped to [0, 100])
    *   - context_window_size = modelContextWindow ?? config.codex_context_cap ?? 256000
-   *   - exceeds_200k_tokens = last.inputTokens > 200000
-   *   - current_usage.{input,output,cache_read} from last.{input,output,cachedInput}Tokens
+   *   - exceeds_200k_tokens = total.totalTokens > 200000
+   *   - current_usage.{input,output,cache_read} from total.{input,output,cachedInput}Tokens
    *   - session_id = current threadId
    */
   private writeContextStatus(params: Record<string, unknown>): void {
     const tokenUsage = isRecord(params.tokenUsage) ? params.tokenUsage : null;
     if (!tokenUsage) return;
-    const last = isRecord(tokenUsage.last) ? tokenUsage.last : null;
-    if (!last) return;
-    const currentWindowInputTokens = typeof last.inputTokens === 'number' ? last.inputTokens : null;
-    if (currentWindowInputTokens === null) return;
+    const total = isRecord(tokenUsage.total) ? tokenUsage.total : null;
+    if (!total) return;
+    const totalTokens = typeof total.totalTokens === 'number' ? total.totalTokens : null;
+    if (totalTokens === null) return;
 
     const modelContextWindow = typeof tokenUsage.modelContextWindow === 'number'
       ? tokenUsage.modelContextWindow
       : null;
     const cap = modelContextWindow ?? this._config.codex_context_cap ?? 256000;
-    const usedPct = cap > 0
-      ? Math.min(100, Math.max(0, (currentWindowInputTokens / cap) * 100))
-      : null;
+    const usedPct = cap > 0 ? Math.min(100, (totalTokens / cap) * 100) : null;
 
-    const inputTokens = currentWindowInputTokens;
-    const outputTokens = typeof last.outputTokens === 'number' ? last.outputTokens : 0;
-    // Codex invariant, verified from rollout samples and live notification
-    // payloads: last.inputTokens is the full current-window size and already
-    // includes cachedInputTokens. cachedInputTokens is a subset of inputTokens
-    // (cached <= input), while total tokens = input + output. Do not add
-    // cachedInputTokens to this metric; unlike Anthropic cache_read semantics,
-    // that would double-count the cached subset and trigger premature handoffs.
-    const cachedInputTokens = typeof last.cachedInputTokens === 'number' ? last.cachedInputTokens : 0;
+    const inputTokens = typeof total.inputTokens === 'number' ? total.inputTokens : 0;
+    const outputTokens = typeof total.outputTokens === 'number' ? total.outputTokens : 0;
+    const cachedInputTokens = typeof total.cachedInputTokens === 'number' ? total.cachedInputTokens : 0;
 
     const payload = JSON.stringify({
       used_percentage: usedPct,
       context_window_size: cap,
-      exceeds_200k_tokens: currentWindowInputTokens > 200000,
+      exceeds_200k_tokens: totalTokens > 200000,
       current_usage: {
         input_tokens: inputTokens,
         output_tokens: outputTokens,
@@ -1003,15 +905,6 @@ export class CodexAppServerPTY {
   }
 
   private cleanupSpawnAttempt(): void {
-    this.stopPidPoll();
-    this._rpcMessageUnsubscribe?.();
-    this._rpcMessageUnsubscribe = null;
-    this._rpcDisconnectUnsubscribe?.();
-    this._rpcDisconnectUnsubscribe = null;
-    if (this._rpc) {
-      this._rpc.close();
-      this._rpc = null;
-    }
     const pty = this._appServerPty;
     this._appServerPty = null;
     if (pty) {
@@ -1021,7 +914,6 @@ export class CodexAppServerPTY {
         // Ignore failed attempt cleanup errors.
       }
     }
-    this._rpcEndpoint = null;
     this.removeSocket();
   }
 
@@ -1103,30 +995,4 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/**
- * Ask the kernel for an unused TCP port on loopback.
- *
- * `createServer().listen(0)` lets the OS pick a free ephemeral port; we read it
- * back from the bound address, then close the server so codex app-server can
- * claim it. There is a small TOCTOU window between close and codex bind, but
- * collisions are vanishingly rare on loopback ephemeral ports — and a fresh
- * spawn attempt will reallocate via the existing retry loop if it does happen.
- */
-function allocateFreePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const server = createServer();
-    server.unref();
-    server.once('error', reject);
-    server.listen(0, '127.0.0.1', () => {
-      const addr = server.address();
-      if (typeof addr === 'object' && addr && 'port' in addr) {
-        const port = addr.port;
-        server.close(() => resolve(port));
-      } else {
-        server.close(() => reject(new Error('Failed to allocate ephemeral port')));
-      }
-    });
-  });
 }

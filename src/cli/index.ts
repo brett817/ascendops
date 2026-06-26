@@ -6,6 +6,7 @@ import { initCommand } from './init.js';
 import { addAgentCommand } from './add-agent.js';
 import { startCommand } from './start.js';
 import { stopCommand } from './stop.js';
+import { restartCommand } from './restart.js';
 import { statusCommand } from './status.js';
 import { doctorCommand } from './doctor.js';
 import { busCommand } from './bus.js';
@@ -24,8 +25,7 @@ import { setupCommand } from './setup.js';
 import { configureCommand } from './configure.js';
 import { spawnWorkerCommand, terminateWorkerCommand, listWorkersCommand, injectWorkerCommand } from './workers.js';
 import { importAgentCommand } from './import-agent.js';
-import { botCommand } from './bot.js';
-import { finalizeProcess } from './_finalize.js';
+import { updateCommand } from './update.js';
 
 const program = new Command();
 
@@ -39,6 +39,7 @@ program.addCommand(installCommand);
 program.addCommand(addAgentCommand);
 program.addCommand(startCommand);
 program.addCommand(stopCommand);
+program.addCommand(restartCommand);
 program.addCommand(statusCommand);
 program.addCommand(doctorCommand);
 program.addCommand(busCommand);
@@ -60,7 +61,7 @@ program.addCommand(terminateWorkerCommand);
 program.addCommand(listWorkersCommand);
 program.addCommand(injectWorkerCommand);
 program.addCommand(importAgentCommand);
-program.addCommand(botCommand);
+program.addCommand(updateCommand);
 
 // crash-alert: SessionEnd hook — cross-platform replacement for crash-alert.sh
 const crashAlertCommand = new Command('crash-alert')

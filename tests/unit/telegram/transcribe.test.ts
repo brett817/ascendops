@@ -68,8 +68,11 @@ describe('transcribeVoice', () => {
     writeFileSync(oggPath, 'fake-audio');
     writeFileSync(fakeModel, 'fake-model');
     process.env.CTX_WHISPER_MODEL = fakeModel;
-    process.env.CTX_FFMPEG_BIN = 'true';
+    process.env.CTX_FFMPEG_BIN = 'true'; // exit 0, do nothing
     process.env.CTX_WHISPER_BIN = '/nonexistent/path/whisper-cli-does-not-exist';
+    // ffmpeg "true" succeeds without producing wav, but the path returned still
+    // gets handed to whisper which fails on missing-binary. Either branch
+    // yields null — both are valid graceful-fallback outcomes.
     expect(await transcribeVoice(oggPath)).toBeNull();
   });
 
@@ -79,7 +82,7 @@ describe('transcribeVoice', () => {
     writeFileSync(oggPath, 'fake-audio');
     writeFileSync(fakeModel, 'fake-model');
     process.env.CTX_WHISPER_MODEL = fakeModel;
-    process.env.CTX_FFMPEG_BIN = 'sleep';
+    process.env.CTX_FFMPEG_BIN = 'sleep'; // never returns within timeout
     const start = Date.now();
     const result = await transcribeVoice(oggPath, { timeoutMs: 100 });
     const elapsed = Date.now() - start;

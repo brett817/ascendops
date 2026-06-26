@@ -7,7 +7,6 @@
 import { appendFileSync, readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { logEvent } from '../bus/event.js';
-import { stripControlChars } from '../utils/validate.js';
 import type { BusPaths, TelegramMessage } from '../types/index.js';
 
 /**
@@ -79,7 +78,12 @@ export function logInboundMessage(
 /**
  * Persist an inbound Telegram message to the daemon's JSONL archive AND
  * emit a `message/telegram_received` bus event so dashboards and
- * experiment cycles can count fleet-wide inbound traffic.
+ * experiment cycles can count fleet-wide inbound traffic. Symmetric with
+ * `telegram_sent` emitted from the outbound path in `cortextos bus
+ * send-telegram`.
+ *
+ * Wrapped: a logEvent failure (e.g. unwritable analytics dir) must not
+ * break message processing — the logged inbound JSONL still goes through.
  */
 export function recordInboundTelegram(
   paths: BusPaths,
@@ -90,7 +94,7 @@ export function recordInboundTelegram(
   msg: TelegramMessage,
   log?: (m: string) => void,
 ): void {
-  const text = stripControlChars((msg.text || msg.caption || '').toString());
+  const text = (msg.text || msg.caption || '').toString();
   logInboundMessage(ctxRoot, agentName, {
     message_id: msg.message_id,
     from: msg.from?.id,

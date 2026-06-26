@@ -140,12 +140,9 @@ describe('PR-12: send-telegram normalizes literal \\n / \\t (codex agent fix)', 
     // Verbatim shape from /Users/cortextos/.cortextos/default/logs/codex-research/
     // outbound-messages.jsonl (2026-05-08 16:48Z) — proves the patch covers the
     // production-observed bug.
-    // Pass --explicit-naming because the message intentionally contains an
-    // agent name ("codex-research"); the Telegram lint (added 2026-05-22)
-    // otherwise blocks agent names by default per the locked plain-talk rule.
     const codexShape = "Hey James! I'm codex-research.\\n\\nA few quick questions";
     await busCommand.parseAsync(
-      ['send-telegram', '12345', codexShape, '--explicit-naming'],
+      ['send-telegram', '12345',codexShape],
       { from: 'user' },
     );
 

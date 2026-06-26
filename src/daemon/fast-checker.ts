@@ -15,11 +15,7 @@ import {
   formatSlackOriginator,
 } from '../slack/slack-identity.js';
 import { KEYS } from '../pty/inject.js';
-import { stripControlChars, validateOrgName } from '../utils/validate.js';
-import { resolve as pathResolve } from 'path';
-// added 2026-04-29 by collie via dane dispatch — RFC #15 Day-1 dispatcher integration; Piece 3 (handler-type wiring) deferred to Day-2
-import { loadHookRegistry, matchHooks, dispatchHook, type HookRegistry } from '../bus/hooks.js';
-import { registerBuiltInHandlers } from '../bus/hook-handlers/index.js';
+import { stripControlChars, sanitizeForPtyInjection, wrapFenceSafe } from '../utils/validate.js';
 
 type LogFn = (msg: string) => void;
 
@@ -1266,11 +1262,16 @@ export class FastChecker {
    */
   private formatInboxMessage(msg: InboxMessage): string {
     const replyNote = msg.reply_to ? ` [reply_to: ${msg.reply_to}]` : '';
-    return `=== AGENT MESSAGE from ${msg.from}${replyNote} [msg_id: ${msg.id}] ===
-\`\`\`
-${msg.text}
-\`\`\`
-Reply using: cortextos bus send-message ${msg.from} normal '<your reply>' ${msg.id}
+    // msg.text/from are externally influenced (a body can carry its own
+    // fence/header markers; --body-stdin/--body-file made arbitrary bodies easy
+    // to send). The body is wrapped with wrapFenceSafe — a dynamically-sized
+    // fence the body cannot close, with the body left byte-exact so pasted code
+    // blocks stay readable. The inline `from` is collapse-sanitized (it sits in
+    // the header line, not a fence).
+    const safeFrom = sanitizeForPtyInjection(msg.from);
+    return `=== AGENT MESSAGE from ${safeFrom}${replyNote} [msg_id: ${msg.id}] ===
+${wrapFenceSafe(msg.text)}
+Reply using: cortextos bus send-message ${safeFrom} normal '<your reply>' ${msg.id}
 
 `;
   }
@@ -1288,29 +1289,37 @@ Reply using: cortextos bus send-message ${msg.from} normal '<your reply>' ${msg.
     lastSentText?: string,
     recentHistory?: string,
   ): string {
+    // Every externally-influenced field below is untrusted (the sender controls
+    // text/display-name; reply-context, last-sent and recent-history are built
+    // from prior external messages). Sanitize each so none can escape the fence
+    // or forge a containment header. Unfenced context fields (reply/history) are
+    // the weakest surface — they sit raw in [Replying to: "..."] / [Recent ...].
     let replyCx = '';
     if (replyToText) {
-      replyCx = `[Replying to: "${replyToText.slice(0, 500)}"]\n`;
+      replyCx = `[Replying to: "${sanitizeForPtyInjection(replyToText.slice(0, 500))}"]\n`;
     }
 
     let lastSentCtx = '';
     if (lastSentText) {
-      lastSentCtx = `[Your last message: "${lastSentText.slice(0, 500)}"]\n`;
+      lastSentCtx = `[Your last message: "${sanitizeForPtyInjection(lastSentText.slice(0, 500))}"]\n`;
     }
 
     let historyCx = '';
     if (recentHistory) {
-      historyCx = `[Recent conversation:]\n${recentHistory}\n`;
+      historyCx = `[Recent conversation:]\n${sanitizeForPtyInjection(recentHistory)}\n`;
     }
 
     // Use [USER: ...] wrapper to prevent prompt injection via crafted display names
     // Slash commands (text starting with /) are NOT wrapped in backticks so Claude Code
     // can recognize and invoke them via the Skill tool (e.g. /loop, /commit, /restart).
-    const isSlashCommand = /^\/[a-zA-Z]/.test(text.trim());
+    // Non-slash bodies use wrapFenceSafe: an unescapable dynamically-sized fence
+    // that leaves the body byte-exact (legit code blocks preserved). Slash commands
+    // get control-char strip + header-quote only (no fence — must stay invokable).
+    const isSlashCommand = /^\/[a-zA-Z]/.test(stripControlChars(text).trim());
     const body = isSlashCommand
-      ? text.trim()
-      : `\`\`\`\n${text}\n\`\`\``;
-    return `=== TELEGRAM from [USER: ${from}] (chat_id:${chatId}) ===
+      ? sanitizeForPtyInjection(text).trim()
+      : wrapFenceSafe(text);
+    return `=== TELEGRAM from [USER: ${sanitizeForPtyInjection(from)}] (chat_id:${chatId}) ===
 ${replyCx}${historyCx}${body}
 ${lastSentCtx}Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
 
@@ -1358,11 +1367,9 @@ ${lastSentCtx}Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     caption: string,
     imagePath: string,
   ): string {
-    return `=== TELEGRAM PHOTO from ${from} (chat_id:${chatId}) ===
+    return `=== TELEGRAM PHOTO from ${sanitizeForPtyInjection(from)} (chat_id:${chatId}) ===
 caption:
-\`\`\`
-${caption}
-\`\`\`
+${wrapFenceSafe(caption)}
 local_file: ${imagePath}
 Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
 
@@ -1380,13 +1387,11 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     filePath: string,
     fileName: string,
   ): string {
-    return `=== TELEGRAM DOCUMENT from ${from} (chat_id:${chatId}) ===
+    return `=== TELEGRAM DOCUMENT from ${sanitizeForPtyInjection(from)} (chat_id:${chatId}) ===
 caption:
-\`\`\`
-${caption}
-\`\`\`
+${wrapFenceSafe(caption)}
 local_file: ${filePath}
-file_name: ${fileName}
+file_name: ${sanitizeForPtyInjection(fileName)}
 Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
 
 `;
@@ -1410,9 +1415,9 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
   ): string {
     const dur = duration !== undefined ? duration : 'unknown';
     const transcriptBlock = transcript && transcript.trim()
-      ? `transcript:\n\`\`\`\n${transcript.trim()}\n\`\`\`\n`
+      ? `transcript:\n${wrapFenceSafe(transcript.trim())}\n`
       : '';
-    return `=== TELEGRAM VOICE from ${from} (chat_id:${chatId}) ===
+    return `=== TELEGRAM VOICE from ${sanitizeForPtyInjection(from)} (chat_id:${chatId}) ===
 duration: ${dur}s
 local_file: ${filePath}
 ${transcriptBlock}Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
@@ -1433,14 +1438,12 @@ ${transcriptBlock}Reply using: cortextos bus send-telegram ${chatId} '<your repl
     duration: number | undefined,
   ): string {
     const dur = duration !== undefined ? duration : 'unknown';
-    return `=== TELEGRAM VIDEO from ${from} (chat_id:${chatId}) ===
+    return `=== TELEGRAM VIDEO from ${sanitizeForPtyInjection(from)} (chat_id:${chatId}) ===
 caption:
-\`\`\`
-${caption}
-\`\`\`
+${wrapFenceSafe(caption)}
 duration: ${dur}s
 local_file: ${filePath}
-file_name: ${fileName}
+file_name: ${sanitizeForPtyInjection(fileName)}
 Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
 
 `;
@@ -1821,7 +1824,28 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       return;
     }
 
-    this.log(`Unhandled callback data: ${data}`);
+    // Inject unhandled callbacks as a Telegram message so the agent can process custom button flows.
+    // senderName (Telegram first_name) and callback_data are untrusted: sanitize both against
+    // PTY-injection before interpolating, matching the text path (sanitizeForPtyInjection at the
+    // `=== TELEGRAM from [USER: ...]` header). This block predates #592; #592's hardening was never
+    // retrofitted here, leaving forged `=== AGENT MESSAGE`/fence-breakout headers un-neutralized.
+    if (chatId && this.agent) {
+      const senderName = sanitizeForPtyInjection(query.from?.first_name || 'User');
+      const safeData = sanitizeForPtyInjection(data);
+      const msg = [
+        `=== TELEGRAM from [USER: ${senderName}] (chat_id:${chatId}) ===`,
+        `callback_data: ${safeData}`,
+        `message_id: ${messageId}`,
+        `Reply using: cortextos bus send-telegram ${chatId} '<your reply>'`,
+      ].join('\n');
+      const injected = this.agent.injectMessage(msg);
+      if (injected && this.telegramApi) {
+        try { await this.telegramApi.answerCallbackQuery(callbackQueryId, 'Got it'); } catch { /* ignore */ }
+      }
+      this.log(`Injected unhandled callback to agent: ${data.slice(0, 60)}`);
+    } else {
+      this.log(`Unhandled callback data (no agent/chatId): ${data}`);
+    }
   }
 
   /**
@@ -1912,9 +1936,11 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
         this.log(`Urgent signal detected: ${content}`);
         unlinkSync(urgentPath);
 
-        // Inject the urgent message
+        // Inject the urgent message — fence the body unescapably (#592 follow-up)
+        // so a signal payload carrying its own fence can't break out and forge
+        // daemon containment headers.
         if (content) {
-          const urgentMsg = `=== URGENT SIGNAL ===\n\`\`\`\n${content}\n\`\`\`\n\n`;
+          const urgentMsg = `=== URGENT SIGNAL ===\n${wrapFenceSafe(content)}\n\n`;
           this.agent.injectMessage(urgentMsg);
         }
       } catch (err) {

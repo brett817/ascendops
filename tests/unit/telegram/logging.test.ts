@@ -83,7 +83,7 @@ describe('Telegram Logging', () => {
       };
     }
 
-    it('writes both the inbound JSONL row and the telegram_received bus event', () => {
+    it('writes both the inbound JSONL row AND the telegram_received bus event', () => {
       const paths = buildPaths(testDir, 'spark');
       mkdirSync(paths.stateDir, { recursive: true });
 
@@ -154,6 +154,8 @@ describe('Telegram Logging', () => {
       const paths = buildPaths(testDir, 'spark');
       mkdirSync(paths.stateDir, { recursive: true });
 
+      // Force a logEvent failure: writing to a path under a regular file
+      // (not a dir) makes mkdirSync recursive throw with EEXIST/ENOTDIR.
       writeFileSync(join(testDir, 'analytics'), 'i am a regular file, not a dir', 'utf-8');
 
       const msg: TelegramMessage = {
@@ -165,13 +167,17 @@ describe('Telegram Logging', () => {
       };
 
       const logSpy = vi.fn();
+      // Must not throw
       expect(() => {
         recordInboundTelegram(paths, testDir, 'spark', 'eros-os', 'Eros', msg, logSpy);
       }).not.toThrow();
 
+      // JSONL still written.
       const inboundPath = join(testDir, 'logs', 'spark', 'inbound-messages.jsonl');
       const inboundEntry = JSON.parse(readFileSync(inboundPath, 'utf-8').trim());
       expect(inboundEntry.text).toBe('hi');
+
+      // Failure surfaced through the log callback.
       expect(logSpy).toHaveBeenCalled();
     });
   });

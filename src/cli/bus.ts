@@ -3,7 +3,7 @@ import { spawnSync, execFileSync } from 'child_process';
 import { existsSync, readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
-import { validateAgentName } from '../utils/validate.js';
+import { validateAgentName, validateTaskId } from '../utils/validate.js';
 import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
@@ -38,6 +38,9 @@ import type { Priority, Task, TaskStatus, EventCategory, EventSeverity, Approval
  * Returns an error message if the transition should be blocked, or null if allowed.
  */
 function checkDeliverableRequirement(taskId: string, frameworkRoot: string, org: string, taskDir: string): string | null {
+  // Reject a traversal task id before it builds the task-file path below — this
+  // runs ahead of updateTask/completeTask, so it can't rely on findTaskFile's guard.
+  validateTaskId(taskId);
   // Read org context to check require_deliverables setting
   const contextPath = join(frameworkRoot, 'orgs', org, 'context.json');
   if (!existsSync(contextPath)) return null;
@@ -1256,14 +1259,11 @@ busCommand
   .option('--image <path>', 'Send a photo with caption')
   .option('--file <path>', 'Send a document/file with caption (any file type)')
   .option('--plain-text', 'Skip Telegram Markdown parsing entirely. Use this when the message contains unescaped _, *, backtick, or [ that would otherwise trip the Markdown parser. Without this flag, sendMessage still retries once with parse_mode disabled on a parse-entity error — so it is purely an opt-in to save the retry roundtrip.', false)
-  .option('--skip-lint', 'Skip outbound comms lint (for quoting/post-mortems only)', false)
-  .option('--explicit-naming', 'Allow agent names in the message body (e.g. when David explicitly asked which agent did something)', false)
-  .action(async (chatId: string, message: string, opts: { image?: string; file?: string; plainText?: boolean; skipLint?: boolean; explicitNaming?: boolean }) => {
+  .action(async (chatId: string, message: string, opts: { image?: string; file?: string; plainText?: boolean }) => {
     // Codex agents emit literal '\n'/'\t' inside single-quoted bash where bash
     // does not expand escapes, so they arrive at argv as 2-char literals and
     // Telegram renders them as visible text. Normalize before send + log.
     message = message.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
-    enforceTelegramLintOrExit(message, opts.skipLint, opts.explicitNaming);
     // Resolve bot token: agent .env first, then process.env
     const env = resolveEnv();
     let botToken = '';
@@ -1326,6 +1326,54 @@ busCommand
       console.log('Message sent');
     } catch (err: any) {
       console.error(`Failed to send: ${err.message || err}`);
+      process.exit(1);
+    }
+  });
+
+busCommand
+  .command('react-telegram')
+  .description("Set the bot's reaction on a Telegram message (single emoji ack)")
+  .argument('<chat-id>', 'Telegram chat ID')
+  .argument('<message-id>', 'ID of the message to react to')
+  .argument('[emoji]', 'Reaction emoji (default: 👍). Pass an empty string to clear.', '👍')
+  .action(async (chatId: string, messageIdRaw: string, emoji: string) => {
+    const messageId = Number(messageIdRaw);
+    if (!Number.isFinite(messageId) || messageId <= 0) {
+      console.error(`Invalid message-id '${messageIdRaw}'. Must be a positive integer.`);
+      process.exit(1);
+    }
+
+    // Resolve bot token: agent .env first, then process.env (same flow as
+    // send-telegram so the agent identity / personality of the reaction
+    // matches the agent that owns the conversation).
+    const env = resolveEnv();
+    let botToken = '';
+    if (env.agentDir) {
+      const { readFileSync, existsSync } = require('fs');
+      const { join } = require('path');
+      const agentEnv = join(env.agentDir, '.env');
+      if (existsSync(agentEnv)) {
+        const content = readFileSync(agentEnv, 'utf-8');
+        const match = content.match(/^BOT_TOKEN=(.+)$/m);
+        if (match && match[1].trim()) botToken = match[1].trim();
+      }
+    }
+    if (!botToken) botToken = process.env.BOT_TOKEN || '';
+    if (!botToken) {
+      console.error('Error: BOT_TOKEN not configured. Set it in your agent .env file or as an environment variable to enable Telegram.');
+      process.exit(1);
+    }
+
+    const api = new TelegramAPI(botToken);
+    try {
+      // Empty string clears the reaction; otherwise send a single-emoji array.
+      // Telegram limits bots to one reaction per message; we treat that as the
+      // primitive here. Multi-emoji is a future feature if/when needed.
+      const emojis = emoji === '' ? [] : [emoji];
+      await api.setMessageReaction(chatId, messageId, emojis);
+      console.log(emojis.length > 0 ? `Reacted ${emoji}` : 'Reaction cleared');
+    } catch (err: any) {
+      console.error(`Failed to react: ${err.message || err}`);
       process.exit(1);
     }
   });
@@ -1935,11 +1983,9 @@ busCommand
   .argument('<agent>', 'Agent name sending the reply')
   .argument('<reply>', 'Reply text')
   .argument('[msg-id]', 'Inbox message ID to ACK')
-  .option('--skip-lint', 'Skip outbound comms lint (for quoting/post-mortems only)', false)
-  .action((agent: string, reply: string, msgId?: string, opts?: { skipLint?: boolean }) => {
+  .action((agent: string, reply: string, msgId?: string) => {
     // Same literal '\n'/'\t' normalize as send-telegram (codex agent fix).
     reply = reply.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
-    enforceOutboundLintOrExit(reply, opts?.skipLint);
     const { mkdirSync, appendFileSync } = require('fs');
     const { join } = require('path');
     const env = resolveEnv();
@@ -2952,72 +2998,9 @@ busCommand
   .action(() => runHook('hook-idle-flag'));
 
 busCommand
-  .command('hook-extract-facts')
-  .description('PreCompact hook: extracts and stores session summary as structured fact entry for cross-session memory')
-  .action(() => runHook('hook-extract-facts'));
-
-busCommand
-  .command('hook-session-restore')
-  .description('SessionStart hook: injects the most recent compaction snapshot as additionalContext to restore working state')
-  .action(() => runHook('hook-session-restore'));
-
-busCommand
   .command('hook-loop-detector')
-  .description('PreToolUse hook: detects and blocks repeated tool loops (repetition and ping-pong patterns)')
+  .description('PreToolUse hook: detects and blocks repeated tool loops (same-args repetition + ping-pong alternation)')
   .action(() => runHook('hook-loop-detector'));
-
-busCommand
-  .command('hook-skill-autopr')
-  .description('PostToolUse hook: auto-stages community skill writes and opens a draft PR against grandamenium/cortextos')
-  .action(() => runHook('hook-skill-autopr'));
-
-busCommand
-  .command('create-skill-pr')
-  .description('Background worker: commits and draft-PRs a community skill (called by hook-skill-autopr)')
-  .argument('<skill-name>', 'Skill directory name under community/skills/')
-  .action(async (skillName: string) => {
-    if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(skillName)) {
-      console.error(`create-skill-pr: invalid skill name "${skillName}" — must be a lowercase alphanumeric slug`);
-      process.exit(1);
-    }
-    try {
-      await createSkillPr(skillName);
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`create-skill-pr failed: ${msg}`);
-      process.exit(1);
-    }
-  });
-
-// --- Brand name command ---
-
-busCommand
-  .command('set-brand-name')
-  .description('Set the business name shown in the dashboard sidebar (written to dashboard-settings.json)')
-  .argument('<name>', 'Business or team name to display (max 100 characters, use empty string "" to clear)')
-  .action((name: string) => {
-    const trimmed = name.trim().slice(0, 100);
-    const env = resolveEnv();
-    const settingsPath = join(env.ctxRoot, 'config', 'dashboard-settings.json');
-    try {
-      let current: Record<string, unknown> = {};
-      if (existsSync(settingsPath)) {
-        try { current = JSON.parse(readFileSync(settingsPath, 'utf-8')); } catch { /* ignore corrupt file */ }
-      }
-      if (trimmed) {
-        current.brand_name = trimmed;
-      } else {
-        delete current.brand_name;
-      }
-      // Atomic write — prevents corrupt file on crash or concurrent access
-      atomicWriteSync(settingsPath, JSON.stringify(current, null, 2));
-      console.log(trimmed ? `Brand name set to: ${trimmed}` : 'Brand name cleared');
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`set-brand-name failed: ${msg}`);
-      process.exit(1);
-    }
-  });
 
 // --- OAuth token rotation commands ---
 

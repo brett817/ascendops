@@ -9,6 +9,11 @@
  * Disable entirely with CTX_TELEGRAM_NO_TRANSCRIBE=1.
  * Override binaries / model with CTX_WHISPER_BIN, CTX_FFMPEG_BIN,
  * CTX_WHISPER_MODEL.
+ * Override transcription language with CTX_WHISPER_LANG (passed via
+ * whisper-cli's `-l` flag). Default is 'auto' (auto-detect). Note: `.en`
+ * models (e.g. ggml-tiny.en.bin) are English-only — the lang flag has no
+ * effect there. Use a multilingual model (no `.en` suffix) for non-English
+ * audio.
  */
 import { spawn } from 'child_process';
 import * as fs from 'fs';
@@ -24,6 +29,10 @@ function resolveModelPath(): string {
 
 function resolveBin(envVar: string, fallback: string): string {
   return process.env[envVar] || fallback;
+}
+
+function resolveLang(): string {
+  return process.env.CTX_WHISPER_LANG || 'auto';
 }
 
 export interface TranscribeOptions {
@@ -47,6 +56,7 @@ export async function transcribeVoice(
   const modelPath = opts.modelPath || resolveModelPath();
   const ffmpegBin = resolveBin('CTX_FFMPEG_BIN', 'ffmpeg');
   const whisperBin = resolveBin('CTX_WHISPER_BIN', 'whisper-cli');
+  const lang = resolveLang();
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
   if (!fs.existsSync(modelPath)) {
@@ -55,20 +65,20 @@ export async function transcribeVoice(
   }
 
   const wavPath = oggPath.replace(/\.ogg$/i, '.wav');
-  try {
-    const ffmpegOk = await runProcess(
-      ffmpegBin,
-      ['-y', '-i', oggPath, '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le', wavPath],
-      timeoutMs,
-    );
-    if (!ffmpegOk.ok) {
-      log(`[transcribe] ffmpeg failed (${ffmpegOk.reason}) — skipping`);
-      return null;
-    }
+  const ffmpegOk = await runProcess(
+    ffmpegBin,
+    ['-y', '-i', oggPath, '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le', wavPath],
+    timeoutMs,
+  );
+  if (!ffmpegOk.ok) {
+    log(`[transcribe] ffmpeg failed (${ffmpegOk.reason}) — skipping`);
+    return null;
+  }
 
+  try {
     const whisper = await runProcess(
       whisperBin,
-      ['-m', modelPath, '-f', wavPath, '-nt', '-np'],
+      ['-m', modelPath, '-f', wavPath, '-l', lang, '-nt', '-np'],
       timeoutMs,
       true,
     );
