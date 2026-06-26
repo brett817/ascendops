@@ -26,6 +26,7 @@ import { configureCommand } from './configure.js';
 import { spawnWorkerCommand, terminateWorkerCommand, listWorkersCommand, injectWorkerCommand } from './workers.js';
 import { importAgentCommand } from './import-agent.js';
 import { updateCommand } from './update.js';
+import { finalizeProcess } from './_finalize.js';
 
 const program = new Command();
 
