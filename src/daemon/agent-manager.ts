@@ -402,6 +402,30 @@ export class AgentManager {
       }
     }
 
+    // Resolve Slack Socket Mode config from agent .env (SLACK_BOT_TOKEN, SLACK_APP_TOKEN, SLACK_CHANNEL).
+    // Returns null when Slack is not configured or Socket Mode is unavailable on this runtime.
+    let slackSocketConfig: { appToken: string; botToken: string; channel: string } | null = null;
+    if (existsSync(agentEnvFile)) {
+      const envContent = stripBom(readFileSync(agentEnvFile, 'utf-8'));
+      const slackBotToken = envContent.match(/^SLACK_BOT_TOKEN=(.+)$/m)?.[1]?.trim();
+      const slackAppToken = envContent.match(/^SLACK_APP_TOKEN=(.+)$/m)?.[1]?.trim();
+      const slackChannel = envContent.match(/^SLACK_CHANNEL=(.+)$/m)?.[1]?.trim();
+      if (slackBotToken && slackAppToken && slackChannel) {
+        const decision = resolveSlackInboundMode({
+          botToken: slackBotToken,
+          appToken: slackAppToken,
+          channel: slackChannel,
+          intervalMs: 60000,
+          webSocketAvailable: typeof WebSocket !== 'undefined',
+        });
+        if (decision.mode === 'socket') {
+          slackSocketConfig = { appToken: decision.appToken, botToken: decision.botToken, channel: decision.channel };
+        } else if (decision.mode === 'poll' && decision.reason) {
+          log(`Slack Socket Mode unavailable: ${decision.reason}`);
+        }
+      }
+    }
+
     const agentProcess = new AgentProcess(name, env, config, log);
     // Issue #330: pass the Telegram handle into AgentProcess so CodexAppServerPTY
     // can emit sendChatAction directly from the JSONL stream. Has no effect for

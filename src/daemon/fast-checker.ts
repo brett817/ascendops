@@ -1,6 +1,6 @@
 import { readdirSync, readFileSync, existsSync, writeFileSync, unlinkSync, statSync, openSync, readSync, closeSync, watch, type FSWatcher } from 'fs';
 import { execFile } from 'child_process';
-import { join } from 'path';
+import { join, resolve as pathResolve } from 'path';
 import { createHash } from 'crypto';
 import { hardRestart } from '../bus/system.js';
 import type { InboxMessage, BusPaths, TelegramMessage, TelegramCallbackQuery, Event, TeamMember } from '../types/index.js';
@@ -15,7 +15,9 @@ import {
   formatSlackOriginator,
 } from '../slack/slack-identity.js';
 import { KEYS } from '../pty/inject.js';
-import { stripControlChars, sanitizeForPtyInjection, wrapFenceSafe } from '../utils/validate.js';
+import { stripControlChars, sanitizeForPtyInjection, wrapFenceSafe, validateOrgName } from '../utils/validate.js';
+import { loadHookRegistry, matchHooks } from '../bus/hooks.js';
+import { registerBuiltInHandlers } from '../bus/hook-handlers/index.js';
 
 type LogFn = (msg: string) => void;
 
