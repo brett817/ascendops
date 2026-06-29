@@ -418,11 +418,12 @@ Always include `msg_id` as reply_to — this auto-ACKs the original. Un-ACK'd me
 
 ## Crons
 
-Crons are **daemon-managed**. The daemon reads `${CTX_ROOT}/state/${CTX_AGENT_NAME}/crons.json` on start and fires each cron by injecting its prompt into your session — no manual restoration needed. You do NOT run CronList/CronCreate or `/loop` to restore crons on boot.
+Crons are **daemon-managed**. The daemon reads `${CTX_ROOT}/.cortextOS/state/agents/${CTX_AGENT_NAME}/crons.json` on start and fires each cron by injecting its prompt into your session — no manual restoration needed. You do NOT run CronList/CronCreate or `/loop` to restore crons on boot.
 
 **View:** `cortextos bus list-crons $CTX_AGENT_NAME`
 **Add a recurring cron:** `cortextos bus add-cron $CTX_AGENT_NAME <name> "<interval-or-cron>" "<prompt>"` (`<interval-or-cron>` is an interval like `6h`/`30m`/`1d` or a 5-field cron expr like `0 8 * * *`; `--desc` optional). Daemon-managed; survives restarts. Do NOT use `/loop` for persistent crons — `/loop` is session-only and will not survive a restart.
 **Remove:** `cortextos bus remove-cron $CTX_AGENT_NAME <name>`
+**One-shot reminder** (for "remind me at X" requests): `cortextos bus create-reminder <fire-at-ISO-8601-UTC> "<prompt>"` — a persistent reminder that survives hard restarts. Do NOT use CronCreate.
 
 On every session start, do NOT recreate crons — they auto-load. Just verify with `cortextos bus list-crons $CTX_AGENT_NAME`, and never tell the user a cron is active without confirming it there.
 
