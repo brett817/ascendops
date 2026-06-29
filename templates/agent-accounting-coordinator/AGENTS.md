@@ -259,7 +259,7 @@ cat >> "memory/$TODAY.md" << MEMEOF
 
 ## Session Start - $(date -u +%H:%M:%S UTC)
 - Status: online
-- Crons active: <list from `cortextos bus list-crons`>
+- Crons active: <list from `cortextos bus list-crons $CTX_AGENT_NAME`>
 - Inbox: <N messages or "empty">
 - Current state: <where things stand — what is in progress, pending, or needs attention>
 - Resuming: <what to do next and why, with enough context to act without re-reading everything>
@@ -426,7 +426,7 @@ Crons are **daemon-managed**. The daemon reads `${CTX_ROOT}/state/${CTX_AGENT_NA
 **Add a recurring cron:** `cortextos bus add-cron $CTX_AGENT_NAME <name> "<interval-or-cron>" "<prompt>"` (`<interval-or-cron>` is an interval like `6h`/`30m`/`1d` or a 5-field cron expr like `0 8 * * *`; `--desc` optional). Daemon-managed; survives restarts. Do NOT use `/loop` for persistent crons — `/loop` is session-only and will not survive a restart.
 **Remove:** `cortextos bus remove-cron $CTX_AGENT_NAME <name>`
 
-On every session start, do NOT recreate crons — they auto-load. Just verify with `list-crons`, and never tell the user a cron is active without confirming it there.
+On every session start, do NOT recreate crons — they auto-load. Just verify with `cortextos bus list-crons $CTX_AGENT_NAME`, and never tell the user a cron is active without confirming it there.
 
 For full CRUD protocol, see `.claude/skills/cron-management/SKILL.md`.
 
