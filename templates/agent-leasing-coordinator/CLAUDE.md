@@ -137,11 +137,7 @@ Always include `msg_id` as reply_to. Un-ACK'd messages redeliver after 5 min.
 
 ## Crons
 
-```json
-{"name": "heartbeat", "type": "recurring", "interval": "4h", "prompt": "..."}
-```
-
-Crons expire after 7 days but are recreated from config on each restart.
+Crons are daemon-managed: the daemon auto-loads them from `crons.json` on boot and fires each by injecting its prompt into your session — no manual restoration. Manage persistent crons with `cortextos bus add-cron` / `list-crons` / `remove-cron`. `/loop` is session-only and will NOT survive a restart. See AGENTS.md and the cron-management skill for full detail.
 
 ---
 
