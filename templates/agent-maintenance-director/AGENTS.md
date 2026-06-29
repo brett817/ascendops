@@ -423,7 +423,7 @@ Crons are **daemon-managed**. The daemon reads `${CTX_ROOT}/.cortextOS/state/age
 **View:** `cortextos bus list-crons $CTX_AGENT_NAME`
 **Add a recurring cron:** `cortextos bus add-cron $CTX_AGENT_NAME <name> "<interval-or-cron>" "<prompt>"` (`<interval-or-cron>` is an interval like `6h`/`30m`/`1d` or a 5-field cron expr like `0 8 * * *`; `--desc` optional). Daemon-managed; survives restarts. Do NOT use `/loop` for persistent crons — `/loop` is session-only and will not survive a restart.
 **Remove:** `cortextos bus remove-cron $CTX_AGENT_NAME <name>`
-**One-shot reminder** (for "remind me at X" requests): `cortextos bus create-reminder <fire-at-ISO-8601-UTC> "<prompt>"` — a persistent reminder that survives hard restarts. Do NOT use CronCreate.
+**One-shot reminder** (persists across restarts): `cortextos bus create-reminder <fire-at-ISO-8601-UTC> "<prompt>"` — surfaces the prompt on the agent's NEXT boot once the fire-time has passed (a boot-time reminder, injected into the boot prompt when overdue — not a live alert that fires mid-session). Do NOT use CronCreate.
 
 On every session start, do NOT recreate crons — they auto-load. Just verify with `cortextos bus list-crons $CTX_AGENT_NAME`, and never tell the user a cron is active without confirming it there.
 
