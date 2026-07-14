@@ -19,7 +19,7 @@ export default function LoginPage() {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [showSplash, setShowSplash] = useState(false);
-  const [brand, setBrand] = useState({ name: 'cortextOS', shortName: 'cortextOS', initials: 'cO' });
+  const [brand, setBrand] = useState({ name: 'Agentic PM', shortName: 'Agentic PM', initials: 'APM' });
 
   // Redirect to setup if no users exist
   useEffect(() => {

@@ -21,9 +21,7 @@ const jetbrainsMono = JetBrains_Mono({
 // without needing a dashboard rebuild when org context.json changes.
 export async function generateMetadata(): Promise<Metadata> {
   const brand = getDefaultBrand();
-  const descriptionSuffix = brand.isOrgBrand
-    ? `${brand.name} agent orchestration dashboard`
-    : "cortextOS agent orchestration dashboard";
+  const descriptionSuffix = `${brand.name} agent orchestration dashboard`;
   return {
     title: `${brand.name} Dashboard`,
     description: descriptionSuffix,
