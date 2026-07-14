@@ -14,10 +14,12 @@ interface DashboardShellProps {
   orgs: string[];
   brandName?: string;
   children: React.ReactNode;
+  publicMode?: boolean;
 }
 
-export function DashboardShell({ orgs, brandName, children }: DashboardShellProps) {
+export function DashboardShell({ orgs, brandName, children, publicMode = false }: DashboardShellProps) {
   const [currentOrg, setCurrentOrg] = useState<string>(() => {
+    if (publicMode) return 'all';
     if (typeof window !== 'undefined') {
       // URL is authoritative: if ?org= is present, use it so server and client agree.
       // Fall back to localStorage for the common case of navigating without a param.
@@ -32,8 +34,9 @@ export function DashboardShell({ orgs, brandName, children }: DashboardShellProp
 
   // Persist org selection to localStorage
   useEffect(() => {
+    if (publicMode) return;
     localStorage.setItem('cortextos-org', currentOrg);
-  }, [currentOrg]);
+  }, [currentOrg, publicMode]);
 
   return (
     <OrgContext.Provider value={{ currentOrg, setCurrentOrg, orgs }}>
@@ -56,6 +59,7 @@ export function DashboardShell({ orgs, brandName, children }: DashboardShellProp
             currentOrg={currentOrg}
             onOrgChange={setCurrentOrg}
             onMenuClick={() => setSidebarOpen(true)}
+            publicMode={publicMode}
           />
           <main className="flex-1 overflow-auto p-4 pb-20 md:pb-5 md:p-5 lg:p-6 bg-background">
             {children}
