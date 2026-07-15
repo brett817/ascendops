@@ -488,7 +488,19 @@ export function collectTelegramCommands(scanDirs: string[]): { command: string; 
       if (!cmd || seen.has(cmd)) continue;
       seen.add(cmd);
 
-      const description = (parsed.description || `Skill: ${name}`).slice(0, 256);
+      // Telegram documents a 256-byte-per-description limit, but empirically
+      // rejects setMyCommands with BOT_COMMANDS_TOO_MUCH well before that once
+      // an agent has 30-40+ skills, even though each individual description is
+      // within the documented limit — there's an undocumented cap on total
+      // payload size. 80 bytes/description leaves enough headroom for agents
+      // with 40+ skills (see incident: boss/erkel/claudia all failed at the
+      // 256-byte cap; verified OK at 80 bytes against their real skill counts).
+      //
+      // Also: the byte budget must be enforced in UTF-8 bytes, not JS string
+      // length — descriptions with multi-byte chars (em dashes, etc.) can
+      // exceed the byte limit even when under the character-count limit, and
+      // a single oversized entry fails the *entire* setMyCommands batch.
+      const description = truncateToUtf8Bytes(parsed.description || `Skill: ${name}`, 80);
       commands.push({ command: cmd, description });
     }
   }
@@ -660,4 +672,21 @@ function deriveNameFromPath(filePath: string): string {
 
 function sanitizeCommand(name: string): string {
   return name.toLowerCase().replace(/-/g, '_').replace(/[^a-z0-9_]/g, '').slice(0, 32);
+}
+
+// Telegram's BotCommand.description limit is enforced in UTF-8 bytes, not JS
+// string length. A plain `.slice(0, maxBytes)` can leave multi-byte characters
+// (em dashes, smart quotes, etc.) that push the encoded description past the
+// byte limit.
+function truncateToUtf8Bytes(str: string, maxBytes: number): string {
+  if (Buffer.byteLength(str, 'utf-8') <= maxBytes) return str;
+  const chars = Array.from(str);
+  let lo = 0, hi = chars.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    const candidate = chars.slice(0, mid).join('');
+    if (Buffer.byteLength(candidate, 'utf-8') <= maxBytes) lo = mid;
+    else hi = mid - 1;
+  }
+  return chars.slice(0, lo).join('');
 }
