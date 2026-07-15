@@ -49,15 +49,6 @@ function getAllowedOrigin(requestOrigin: string | null): string | null {
   return null;
 }
 
-function nextWithCors(request: NextRequest, pathname: string, corsOrigin: string): NextResponse {
-  const requestHeaders = new Headers(request.headers);
-  requestHeaders.set('x-dashboard-pathname', pathname);
-  const response = NextResponse.next({ request: { headers: requestHeaders } });
-  response.headers.set('Access-Control-Allow-Origin', corsOrigin);
-  response.headers.set('Vary', 'Origin');
-  return response;
-}
-
 export async function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
   const requestOrigin = request.headers.get('origin');
@@ -90,13 +81,14 @@ export async function middleware(request: NextRequest) {
     pathname.startsWith('/api/auth') ||
     pathname === '/api/brand' ||
     pathname.startsWith('/_next') ||
-    pathname === '/sops' ||
-    pathname.startsWith('/sops/') ||
-    pathname === '/wiki' ||
     pathname === '/favicon.ico' ||
-    pathname === '/api/workflows/health'
+    pathname === '/api/workflows/health' ||
+    pathname.startsWith('/owner/status/')
   ) {
-    return nextWithCors(request, pathname, corsOrigin);
+    const response = NextResponse.next();
+    response.headers.set('Access-Control-Allow-Origin', corsOrigin);
+    response.headers.set('Vary', 'Origin');
+    return response;
   }
 
   // GAP-0030: Verify the NextAuth session token. Previous implementation only
@@ -182,7 +174,9 @@ export async function middleware(request: NextRequest) {
     return NextResponse.redirect(loginUrl);
   }
 
-  const response = nextWithCors(request, pathname, corsOrigin);
+  const response = NextResponse.next();
+  response.headers.set('Access-Control-Allow-Origin', corsOrigin);
+  response.headers.set('Vary', 'Origin');
   // Standard security headers
   response.headers.set('X-Frame-Options', 'DENY');
   response.headers.set('X-Content-Type-Options', 'nosniff');

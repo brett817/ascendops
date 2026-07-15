@@ -37,7 +37,7 @@ const DEFAULT_CONTEXT: OrgContext = {
 const FRAMEWORK_BRAND: Brand = {
   name: 'Agentic PM',
   shortName: 'Agentic PM',
-  initials: 'APM',
+  initials: 'AP',
   isOrgBrand: false,
 };
 
@@ -171,7 +171,7 @@ export function getOrgBrand(org: string): Brand {
  * Selection:
  *   1. If `CTX_DEFAULT_ORG` env var is set and that org exists, use its brand
  *   2. If exactly one org exists, use its brand
- *   3. Otherwise return the framework default (Agentic PM)
+ *   3. Otherwise return the product-brand default (Agentic PM)
  *
  * This runs at request time server-side, so it picks up org changes without
  * a dashboard rebuild.
