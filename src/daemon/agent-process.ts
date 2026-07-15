@@ -15,8 +15,6 @@ import {
   findGitRoot,
   recordFailure,
   markHealthy,
-  shouldRollback,
-  performRollback,
   readRecoveryNote,
   deleteRecoveryNote,
   MIN_HEALTHY_SECONDS,
@@ -776,19 +774,10 @@ export class AgentProcess {
       return;
     }
 
-    // Watchdog: record this crash against the current commit, then check
-    // whether the commit has been crashing repeatedly and needs a rollback.
+    // Watchdog: record this crash against the current commit for diagnostics.
+    // Destructive rollback (shouldRollback/performRollback) removed — a crash
+    // loop caused unbounded git reset --hard regression on 2026-07-14.
     recordFailure(stateDir, this.repoRoot);
-
-    if (this.repoRoot && shouldRollback(stateDir, this.repoRoot)) {
-      this.log(`Watchdog: commit unstable after ${this.crashCount} crashes — performing git rollback`);
-      const result = performRollback(stateDir, this.repoRoot);
-      if (result.success) {
-        this.log(`Watchdog: rolled back to ${result.rolledBackTo.slice(0, 12)}${result.stashRef ? `, stash: ${result.stashRef}` : ''}`);
-      } else {
-        this.log(`Watchdog: rollback failed — ${result.reason}`);
-      }
-    }
 
     // Exponential backoff restart
     const backoff = Math.min(5000 * Math.pow(2, this.crashCount - 1), 300000);
