@@ -254,16 +254,23 @@ export function isClaudeDirOperation(
   // thing left to vet.
   const canonAgentDir = canonicalizePath(resolve(base));
   const claudeRoot = join(canonAgentDir, '.claude');
-  const target = resolve(canonAgentDir, filePath);
+  const target = canonicalizePath(resolve(canonAgentDir, filePath));
 
   // Lexical containment within the agent's own .claude/.
   if (target !== claudeRoot && !target.startsWith(claudeRoot + sep)) return false;
+
+  try {
+    if (lstatSync(claudeRoot).isSymbolicLink()) return false;
+  } catch {
+    // Non-existent .claude roots are handled lexically below; this permits the
+    // first Write that creates a file under a trusted agent's .claude tree.
+  }
 
   // Reject if any component at or below .claude is a symlink — live OR dangling.
   // A planted symlink could otherwise redirect an "inside .claude" write out of
   // the tree. We lstat each component because realpathSync can't observe a
   // *dangling* symlink (it throws, and canonicalize would fall back to lexical).
-  return !hasSymlinkComponent(canonAgentDir, target);
+  return !hasSymlinkComponent(claudeRoot, target);
 }
 
 /**

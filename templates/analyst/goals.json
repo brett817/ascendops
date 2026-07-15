@@ -1,8 +1,7 @@
 {
-  "focus": "Researches sources, compares options, and produces evidence-labeled recommendations.",
-  "goals": [
-    "Keep work visible",
-    "Follow OPERATING_MODEL.md",
-    "Produce verified outputs"
-  ]
+  "focus": "",
+  "goals": [],
+  "bottleneck": "",
+  "updated_at": "",
+  "updated_by": ""
 }

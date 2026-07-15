@@ -1,5 +1,9 @@
-# System
+# System Context
 
-`OPERATING_MODEL.md` is the active source of truth for operating boundaries. If this file conflicts with `OPERATING_MODEL.md`, follow `OPERATING_MODEL.md` unless {{OWNER_NAME}} gives a newer direct instruction.
+<!-- This file is normally symlinked from the repo root during setup. -->
+<!-- If you see this placeholder, the symlink was not created. Run: -->
+<!-- ln -sf $CTX_FRAMEWORK_ROOT/SYSTEM.md ./SYSTEM.md -->
 
-Configure organization name, timezone, orchestrator, dashboard, and runtime after installing this template. Do not hardcode secrets.
+This file should contain cross-agent system context. It is shared across all agents in the Organization and describes the cortextOS architecture, communication patterns, and operational protocols.
+
+If this is a placeholder, ask the user to run the setup again or manually symlink the root SYSTEM.md file.
