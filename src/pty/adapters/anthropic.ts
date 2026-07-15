@@ -19,7 +19,14 @@ export const anthropicAdapter: VendorAdapter = {
       args.push('--continue');
     }
 
-    args.push('--dangerously-skip-permissions');
+    const skipPerms = ctx.config.dangerously_skip_permissions;
+    if (skipPerms !== false) {
+      if (skipPerms !== undefined && skipPerms !== true) {
+        // Non-boolean value (e.g. the string "false") — fail safe: keep the flag and warn.
+        console.warn(`[cortextos] dangerously_skip_permissions must be a boolean; got ${JSON.stringify(skipPerms)}. Defaulting to skip (flag included).`);
+      }
+      args.push('--dangerously-skip-permissions');
+    }
 
     const model = resolveModel(ctx.config);
     if (model) {

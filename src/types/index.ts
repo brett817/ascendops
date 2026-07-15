@@ -260,6 +260,14 @@ export interface AgentConfig {
    * max_crashes_per_day and do NOT trigger the git watchdog.
    */
   rate_limit_pause_seconds?: number;
+  /**
+   * Whether to launch Claude Code with `--dangerously-skip-permissions`.
+   * Defaults to true (back-compat: agents run unattended). Set to false to keep
+   * Claude Code's permission system engaged so the PermissionRequest hook
+   * (hook-permission-telegram) gates tool use instead of everything auto-running.
+   * Only applies to the claude-code runtime (Hermes never passes the flag).
+   */
+  dangerously_skip_permissions?: boolean;
   working_directory?: string;
   enabled?: boolean;
   crons?: CronEntry[];
