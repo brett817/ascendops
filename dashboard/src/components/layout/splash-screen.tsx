@@ -8,7 +8,7 @@ interface SplashScreenProps {
 
 export function SplashScreen({ onComplete }: SplashScreenProps) {
   const [phase, setPhase] = useState<'enter' | 'hold' | 'fade'>('enter');
-  const [brand, setBrand] = useState({ name: 'Agentic PM', initials: 'APM' });
+  const [brand, setBrand] = useState({ name: 'Agentic PM', initials: 'AP' });
 
   useEffect(() => {
     let cancelled = false;
@@ -18,7 +18,7 @@ export function SplashScreen({ onComplete }: SplashScreenProps) {
         if (cancelled || !data) return;
         setBrand({
           name: data.name ?? 'Agentic PM',
-          initials: data.initials ?? 'APM',
+          initials: data.initials ?? 'AP',
         });
       })
       .catch(() => { /* keep default */ });
