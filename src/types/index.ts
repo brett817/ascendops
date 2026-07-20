@@ -247,6 +247,9 @@ export interface AgentConfig {
    * Defaults to true (back-compat: agents run unattended). Set to false to keep
    * Claude Code's permission system engaged so the PermissionRequest hook
    * (hook-permission-telegram) gates tool use instead of everything auto-running.
+   * An explicitly present config field wins over the install-level consent
+   * record in both directions. The record supplies this value only when the
+   * field is omitted.
    * Only applies to the claude-code runtime (Hermes never passes the flag).
    */
   dangerously_skip_permissions?: boolean;
@@ -984,11 +987,11 @@ export const VALID_TRUST_LEVELS: TrustLevel[] = ['owner', 'manager', 'member'];
  * Stored in org config or agent config under team_members.
  */
 export interface TeamMember {
-  /** Display name (e.g. "Brittany Hunter") */
+  /** Display name (e.g. "Morgan Reed") */
   name: string;
   /** Job role or title (e.g. "Operations Manager") */
   role: string;
-  /** Slack handle without @ (e.g. "brittany.hunter") */
+  /** Slack handle without @ (e.g. "morgan.reed") */
   slack_handle: string;
   /** Trust level — determines how the agent treats messages from this person */
   trust_level: TrustLevel;

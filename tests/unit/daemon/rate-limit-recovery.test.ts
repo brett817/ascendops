@@ -52,6 +52,15 @@ vi.mock('../../../src/utils/paths.js', () => ({
   resolvePaths: vi.fn().mockReturnValue({}),
 }));
 
+const mockExecFileSync = vi.fn();
+vi.mock('child_process', async () => {
+  const actual = await vi.importActual<typeof import('child_process')>('child_process');
+  return {
+    ...actual,
+    execFileSync: mockExecFileSync,
+  };
+});
+
 const mockWriteFileSync = vi.fn();
 const mockExistsSync = vi.fn().mockReturnValue(false);
 const mockReadFileSync = vi.fn().mockReturnValue('');
@@ -72,6 +81,9 @@ const mockRecordFailure = vi.fn();
 const mockMarkHealthy = vi.fn();
 const mockShouldRollback = vi.fn().mockReturnValue(false);
 const mockPerformRollback = vi.fn();
+const mockIsWatchdogRollbackEnabled = vi.fn().mockReturnValue(false);
+const mockWatchdogRollbackMaxResets = vi.fn().mockReturnValue(1);
+const mockWatchdogRollbackFloorRef = vi.fn().mockReturnValue(undefined);
 const mockReadRecoveryNote = vi.fn().mockReturnValue(null);
 const mockDeleteRecoveryNote = vi.fn();
 const mockFindGitRoot = vi.fn().mockReturnValue(null);
@@ -81,6 +93,9 @@ vi.mock('../../../src/daemon/watchdog.js', () => ({
   markHealthy: mockMarkHealthy,
   shouldRollback: mockShouldRollback,
   performRollback: mockPerformRollback,
+  isWatchdogRollbackEnabled: mockIsWatchdogRollbackEnabled,
+  watchdogRollbackMaxResets: mockWatchdogRollbackMaxResets,
+  watchdogRollbackFloorRef: mockWatchdogRollbackFloorRef,
   readRecoveryNote: mockReadRecoveryNote,
   deleteRecoveryNote: mockDeleteRecoveryNote,
   findGitRoot: mockFindGitRoot,
@@ -110,13 +125,18 @@ beforeEach(() => {
   mockPty.getOutputBuffer.mockClear();
   mockOutputBuffer.hasRateLimitSignature.mockClear();
   mockWriteFileSync.mockClear();
+  mockExecFileSync.mockClear();
   mockExistsSync.mockReturnValue(false);
   mockReadFileSync.mockReturnValue('');
   mockRecordFailure.mockClear();
   mockShouldRollback.mockReturnValue(false);
   mockPerformRollback.mockClear();
+  mockIsWatchdogRollbackEnabled.mockReturnValue(false);
+  mockWatchdogRollbackMaxResets.mockReturnValue(1);
+  mockWatchdogRollbackFloorRef.mockReturnValue(undefined);
   mockReadRecoveryNote.mockReturnValue(null);
   mockDeleteRecoveryNote.mockClear();
+  mockFindGitRoot.mockReturnValue(null);
 });
 
 describe('AgentProcess - rate-limit recovery', () => {
