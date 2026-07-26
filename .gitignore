@@ -23,6 +23,7 @@ orgs/
 !.env.example
 !**/.env.example
 secrets.env
+/secrets/
 templates/*/.env
 .cortextos-env
 .claude-consent.json
