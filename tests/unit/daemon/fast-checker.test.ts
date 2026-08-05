@@ -1838,6 +1838,23 @@ describe('FastChecker', () => {
     });
   });
 
+  // F10/F11 fixtures. IMPORTANT: every fixture containing the genuine survey
+  // phrase is built by STRING CONCATENATION so this test source never
+  // contains the matchable contiguous phrase verbatim — an agent cat-ing this
+  // file must not trigger its own watchdog.
+  //
+  // Faithful genuine render, transcribed from live boss stdout.log bytes
+  // ~29931800 (2026-08-01).
+  const GENUINE_SURVEY_RENDER =
+    '\x1b[36m●\x1b[3G\x1b[39m\x1b[1mHow is Claude doing this session?' +
+    ' (optional)\r\x1b[1B\x1b[22m \x1b[3G\x1b[36m1\x1b[39m: Bad    \x1b[36m2\x1b[39m: Fine   ' +
+    '\x1b[36m3\x1b[39m: Good   \x1b[36m0\x1b[39m: Dismiss\r\n';
+  // Class-E negative fixtures (real observed shapes):
+  const BARE_QUESTION_ECHO = 'How is Claude doing this session?'; // brief.md / grep-command echo
+  const QUOTED_IN_PROSE =
+    'the stale "How is Claude doing this session?"' +
+    ' survey string is still in the un-rotated stdout scan region'; // boss offset 27356417 analysis prose
+
   describe('preserveRecentHandoffDoc — watchdog (path A) handoff preservation', () => {
     function makeAgentWithDir(agentDir: string) {
       return {
@@ -1896,14 +1913,15 @@ describe('FastChecker', () => {
         const start = 1_780_580_000_000;
         nowSpy.mockReturnValue(start);
         const stdoutPath = join(paths.logDir, 'stdout.log');
-        const firstSurvey = 'How is Claude doing this session?';
+        // Multi-byte fixture (U+25CF): assert byte size via statSync, not .length.
+        const firstSurvey = GENUINE_SURVEY_RENDER;
         writeFileSync(stdoutPath, firstSurvey, 'utf-8');
 
         const firstTelegram = createMockTelegramApi();
         const firstAgent = makeAgentWithDir(join(testDir, 'agent-first'));
         firstAgent.hardRestartSelf.mockImplementation(async () => {
           const marker = JSON.parse(readFileSync(join(paths.stateDir, '.watchdog-restart-at'), 'utf-8'));
-          expect(marker).toEqual({ restartedAt: start, stdoutHighWater: firstSurvey.length });
+          expect(marker).toEqual({ restartedAt: start, stdoutHighWater: statSync(stdoutPath).size });
         });
         const firstChecker = new FastChecker(firstAgent, paths, '/framework', {
           telegramApi: firstTelegram,
@@ -1917,7 +1935,7 @@ describe('FastChecker', () => {
         expect(firstTelegram.sendMessage).toHaveBeenCalledTimes(1);
         expect(JSON.parse(readFileSync(join(paths.stateDir, '.watchdog-restart-at'), 'utf-8'))).toEqual({
           restartedAt: start,
-          stdoutHighWater: firstSurvey.length,
+          stdoutHighWater: statSync(stdoutPath).size,
         });
 
         nowSpy.mockReturnValue(start + 5_000);
@@ -1941,7 +1959,7 @@ describe('FastChecker', () => {
         expect(secondAgent.hardRestartSelf).not.toHaveBeenCalled();
         expect(secondTelegram.sendMessage).not.toHaveBeenCalled();
 
-        writeFileSync(stdoutPath, `${firstSurvey}\nnew output\nHow is Claude doing this session?`, 'utf-8');
+        writeFileSync(stdoutPath, `${firstSurvey}\nnew output\n${firstSurvey}`, 'utf-8');
         secondChecker.watchdogCheck();
 
         expect(secondAgent.hardRestartSelf).toHaveBeenCalledTimes(1);
@@ -1951,10 +1969,98 @@ describe('FastChecker', () => {
       }
     });
 
+    it('consumes cooldown-window stdout so a replayed survey frame cannot fire a second restart after cooldown lift', () => {
+      const nowSpy = vi.spyOn(Date, 'now');
+      try {
+        const start = 1_780_580_000_000;
+        nowSpy.mockReturnValue(start);
+        const stdoutPath = join(paths.logDir, 'stdout.log');
+        writeFileSync(stdoutPath, GENUINE_SURVEY_RENDER, 'utf-8');
+
+        const firstAgent = makeAgentWithDir(join(testDir, 'agent-f10-first'));
+        const firstChecker = new FastChecker(firstAgent, paths, '/framework') as any;
+        firstChecker.bootstrappedAt = start - firstChecker.BOOTSTRAP_GRACE_MS - 1;
+
+        firstChecker.watchdogCheck();
+
+        expect(firstAgent.hardRestartSelf).toHaveBeenCalledTimes(1);
+        const markerAfterFirst = JSON.parse(readFileSync(join(paths.stateDir, '.watchdog-restart-at'), 'utf-8'));
+        expect(markerAfterFirst).toEqual({ restartedAt: start, stdoutHighWater: statSync(stdoutPath).size });
+
+        // Simulate the --continue replay: the fresh TUI re-renders the dying
+        // session's final frame, appending a byte-faithful copy of the survey
+        // PAST the highwater persisted at restart-fire time.
+        writeFileSync(stdoutPath, GENUINE_SURVEY_RENDER + GENUINE_SURVEY_RENDER, 'utf-8');
+        expect(statSync(stdoutPath).size).toBeGreaterThan(markerAfterFirst.stdoutHighWater);
+
+        const secondAgent = makeAgentWithDir(join(testDir, 'agent-f10-second'));
+        const secondChecker = new FastChecker(secondAgent, paths, '/framework') as any;
+        secondChecker.resetWatchdogState();
+        secondChecker.bootstrappedAt = start - secondChecker.BOOTSTRAP_GRACE_MS - 1;
+
+        // Still inside the 15-min cooldown: F10 must consume (advance) the
+        // marker to the current stdout size without firing a restart.
+        nowSpy.mockReturnValue(start + 60_000);
+        secondChecker.watchdogCheck();
+
+        expect(secondAgent.hardRestartSelf).not.toHaveBeenCalled();
+        const markerMidCooldown = JSON.parse(readFileSync(join(paths.stateDir, '.watchdog-restart-at'), 'utf-8'));
+        expect(markerMidCooldown.stdoutHighWater).toBe(statSync(stdoutPath).size);
+        expect(markerMidCooldown.stdoutHighWater).toBeGreaterThan(markerAfterFirst.stdoutHighWater);
+
+        // Cooldown lifted: the replayed survey (already consumed) must NOT
+        // fire a second restart. This is the brief's required assertion.
+        nowSpy.mockReturnValue(start + secondChecker.HARD_RESTART_COOLDOWN_MS + 1);
+        secondChecker.watchdogCheck();
+
+        expect(secondAgent.hardRestartSelf).not.toHaveBeenCalled();
+
+        // Genuine detection survives the fix: a NEW exhaustion after lift
+        // still fires exactly once.
+        writeFileSync(stdoutPath, GENUINE_SURVEY_RENDER + GENUINE_SURVEY_RENDER + GENUINE_SURVEY_RENDER, 'utf-8');
+        secondChecker.watchdogCheck();
+
+        expect(secondAgent.hardRestartSelf).toHaveBeenCalledTimes(1);
+      } finally {
+        nowSpy.mockRestore();
+      }
+    });
+
+    it('does not fire Signal 1 on bare survey-question echoes or prose quotes', () => {
+      const stdoutPath = join(paths.logDir, 'stdout.log');
+
+      const bareAgent = makeAgentWithDir(join(testDir, 'agent-bare-echo'));
+      const bareChecker = new FastChecker(bareAgent, paths, '/framework') as any;
+      bareChecker.bootstrappedAt = Date.now() - bareChecker.BOOTSTRAP_GRACE_MS - 1;
+      writeFileSync(stdoutPath, BARE_QUESTION_ECHO, 'utf-8');
+
+      bareChecker.watchdogCheck();
+      expect(bareAgent.hardRestartSelf).not.toHaveBeenCalled();
+
+      const proseAgent = makeAgentWithDir(join(testDir, 'agent-prose-quote'));
+      const proseChecker = new FastChecker(proseAgent, paths, '/framework') as any;
+      proseChecker.bootstrappedAt = Date.now() - proseChecker.BOOTSTRAP_GRACE_MS - 1;
+      writeFileSync(stdoutPath, QUOTED_IN_PROSE, 'utf-8');
+
+      proseChecker.watchdogCheck();
+      expect(proseAgent.hardRestartSelf).not.toHaveBeenCalled();
+    });
+
+    it('fires Signal 1 on the genuine ANSI survey render', () => {
+      const agent = makeAgentWithDir(join(testDir, 'agent-genuine-ansi-render'));
+      const checker = new FastChecker(agent, paths, '/framework') as any;
+      checker.bootstrappedAt = Date.now() - checker.BOOTSTRAP_GRACE_MS - 1;
+      writeFileSync(join(paths.logDir, 'stdout.log'), `prior output\n${GENUINE_SURVEY_RENDER}`, 'utf-8');
+
+      checker.watchdogCheck();
+
+      expect(agent.hardRestartSelf).toHaveBeenCalledTimes(1);
+    });
+
     it('detects a new survey even when more than 20KB of output follows it', () => {
       const stdoutPath = join(paths.logDir, 'stdout.log');
       const priorOutput = 'handled survey from previous session';
-      const survey = 'How is Claude doing this session?';
+      const survey = GENUINE_SURVEY_RENDER;
       const trailingOutput = 'x'.repeat(21000);
       writeFileSync(
         join(paths.stateDir, '.watchdog-restart-at'),
@@ -1997,7 +2103,7 @@ describe('FastChecker', () => {
 
     it('treats corrupt persisted watchdog cooldown state as no active cooldown', () => {
       writeFileSync(join(paths.stateDir, '.watchdog-restart-at'), 'not-a-timestamp', 'utf-8');
-      writeFileSync(join(paths.logDir, 'stdout.log'), 'How is Claude doing this session?', 'utf-8');
+      writeFileSync(join(paths.logDir, 'stdout.log'), GENUINE_SURVEY_RENDER, 'utf-8');
 
       const agent = makeAgentWithDir(join(testDir, 'agent-corrupt-cooldown'));
       const checker = new FastChecker(agent, paths, '/framework') as any;
@@ -2015,7 +2121,7 @@ describe('FastChecker', () => {
         JSON.stringify({ restartedAt: start, stdoutHighWater: 50000 }),
         'utf-8',
       );
-      writeFileSync(stdoutPath, 'How is Claude doing this session?', 'utf-8');
+      writeFileSync(stdoutPath, GENUINE_SURVEY_RENDER, 'utf-8');
 
       const agent = makeAgentWithDir(join(testDir, 'agent-rotated-stdout'));
       const checker = new FastChecker(agent, paths, '/framework') as any;

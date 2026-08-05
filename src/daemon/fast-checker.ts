@@ -861,7 +861,31 @@ export class FastChecker {
   private watchdogCheck(): void {
     const now = Date.now();
     const restartMarker = this.readWatchdogRestartMarker();
-    if (restartMarker.restartedAt > 0 && now - restartMarker.restartedAt < this.HARD_RESTART_COOLDOWN_MS) return;
+    if (restartMarker.restartedAt > 0 && now - restartMarker.restartedAt < this.HARD_RESTART_COOLDOWN_MS) {
+      // F10: consume the stdout scan region while the hard-restart cooldown is
+      // active. A hard restart relaunches the agent with --continue, and the
+      // fresh TUI (plus the dying session's final flushes) re-renders the
+      // previous screen frame — including a byte-FAITHFUL copy of the survey
+      // prompt that triggered the restart — into stdout PAST the highwater
+      // persisted at fire time (observed live: boss marker highWater=29927189
+      // with full survey frames at 29931921 and 29938007, 2026-08-01). Because
+      // the replay is a perfect render, no textual anchor can reject it; the
+      // only discriminator is TEMPORAL. So while the cooldown gate holds, each
+      // poll advances the persisted highwater to the current stdout size,
+      // attributing everything written in the window to the restart
+      // transition. At cooldown-lift the Signal 1 scan starts at the last
+      // consumed offset — a stale/replayed survey can never fire restart 2.
+      // Without this, every genuine Signal-1 restart deterministically
+      // re-fired at exactly T+15min (pairs/triples in restarts.log since
+      // 07-16, all agents). ACCEPTED RESIDUAL: a session that GENUINELY
+      // exhausts context again within 15min of the restart is consumed too and
+      // will not fire at lift; Signal 2 (frozen-stdout), Signal 3 (ctx
+      // threshold) and the ctx-monitor tiers remain as backstops for that
+      // far-fetched case — judged acceptable against a guaranteed spurious
+      // restart on EVERY genuine fire.
+      this.consumeCooldownStdout(restartMarker);
+      return;
+    }
     if (this.watchdogTriggered) return;
     if (this.bootstrappedAt === 0 || now - this.bootstrappedAt < this.BOOTSTRAP_GRACE_MS) return;
     if (this.lastHardRestartAt > 0 && now - this.lastHardRestartAt < this.HARD_RESTART_COOLDOWN_MS) return;
@@ -911,7 +935,28 @@ export class FastChecker {
           surveyTail = buf.toString('utf-8');
         }
       } catch { /* non-critical */ }
-      if (surveyTail && /How is Claude doing this session\?/.test(surveyTail)) {
+      // F11: anchor Signal 1 to the genuine survey RENDER, not the bare
+      // question. The real prompt renders the question in bold followed by an
+      // "(optional)" suffix on the same line, then the numbered options row —
+      // verified against 24/24 genuine renders in live agent stdout corpora
+      // (boss/claudia, 2026-08-01). Bare-question occurrences WITHOUT the
+      // suffix were, in every observed case, prose or command echoes (a brief
+      // quoting the string, a grep command line, an agent analyzing this very
+      // code) — the class that initiated claudia's 08-01 restart triple. We
+      // strip ANSI first (PTY redraws can fragment a line with cursor-column
+      // escapes, and stripping can collapse tokens to ZERO separation — the
+      // Signal 3 F8 lesson), then require the suffix with a zero-or-more
+      // same-line gap. [^\S\n] not \s: the suffix must sit on the question's
+      // own line. The regex source spells "session\?" so an agent cat-ing
+      // this file does not emit a matchable phrase. ACCEPTED RESIDUAL: a
+      // faithful quote that includes the suffix still matches (one restart,
+      // chain then broken by F10) — same residual class as Signal 3's F9
+      // faithful-quote note. RESIDUAL RISK: if a future Claude Code build
+      // drops the suffix from the survey render, Signal 1 goes silent —
+      // re-check against a live render on CLI upgrades (Signals 2/3 and the
+      // ctx monitor remain independent backstops).
+      const surveyStripped = surveyTail.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
+      if (surveyStripped && /How is Claude doing this session\?[^\S\n]*\(optional\)/.test(surveyStripped)) {
         this.log('WATCHDOG: ctx-exhaustion survey prompt detected — hard-restarting');
         this.triggerHardRestart('ctx exhaustion: session survey prompt in stdout', size);
         return;
@@ -1034,6 +1079,25 @@ export class FastChecker {
       this.log(`WATCHDOG: stdout frozen for ${stalledSec}s while active — hard-restarting`);
       this.triggerHardRestart(`frozen: stdout unchanged ${stalledSec}s while active`);
     }
+  }
+
+  /**
+   * F10 companion: while the watchdog hard-restart cooldown is active, advance
+   * the persisted stdoutHighWater to the current stdout size so bytes written
+   * during the window (--continue replay frames, final flushes of the dying
+   * session) are never scanned by Signal 1 after the cooldown lifts. Failure
+   * is non-fatal: worst case the marker stays behind and Signal 1 rescans the
+   * cooldown window — exactly the pre-F10 behavior.
+   */
+  private consumeCooldownStdout(marker: WatchdogRestartMarker): void {
+    try {
+      const stdoutPath = join(this.paths.logDir, 'stdout.log');
+      if (!existsSync(stdoutPath)) return;
+      const size = statSync(stdoutPath).size;
+      if (size !== marker.stdoutHighWater) {
+        this.persistWatchdogRestartMarker(marker.restartedAt, size);
+      }
+    } catch { /* non-critical */ }
   }
 
   private triggerHardRestart(reason: string, stdoutHighWater?: number): void {
