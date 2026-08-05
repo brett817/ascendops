@@ -116,6 +116,37 @@ describe('Bus System', () => {
       expect(report.staged).toContain('readme.md');
     });
 
+    it('does not false-positive on ordinary words containing bare token prefixes', () => {
+      // Regression: `sk-` matched inside "ask-state"/"task-management"/"risk-review" and the
+      // placeholder literal "xoxb-test" tripped the scanner, silently blocking daily auto-commit
+      // (root-caused on the watchdog fix's test file). These must now stage cleanly.
+      writeFileSync(join(gitDir, 'state-ref.txt'), "const p = join(dir, 'ask-state.json');");
+      writeFileSync(join(gitDir, 'task-note.md'), 'task-management and risk-review notes');
+      writeFileSync(join(gitDir, 'slack-fixture.txt'), "slackWatch: { token: 'xoxb-test' }");
+
+      const report = autoCommit(gitDir, true);
+      expect(report.staged).toContain('state-ref.txt');
+      expect(report.staged).toContain('task-note.md');
+      expect(report.staged).toContain('slack-fixture.txt');
+      expect(report.blocked.some(b => b.includes('credential'))).toBe(false);
+    });
+
+    it('still blocks real credential tokens after the false-positive fix', () => {
+      // Detection preserved: genuine tokens clear both gates (non-alnum boundary before + >=8-char body).
+      // Fixtures are concatenation-broken so THIS source file carries no contiguous credential literal
+      // and therefore never trips the auto-commit scanner itself — the very FP class this task fixes.
+      writeFileSync(join(gitDir, 'leak1.txt'), "OPENAI_KEY='sk-" + "proj-abcd1234efgh5678'");
+      writeFileSync(join(gitDir, 'leak2.txt'), 'gh: ghp_' + '0123456789abcdefghij0123456789abcd');
+      writeFileSync(join(gitDir, 'leak3.txt'), "slack: 'xoxb-" + "2101-0987654321-abcdefghij'");
+      writeFileSync(join(gitDir, 'leak4.txt'), 'db config token' + '=supersecretvalue');
+
+      const report = autoCommit(gitDir, true);
+      expect(report.blocked.some(b => b.includes('leak1.txt') && b.includes('credential'))).toBe(true);
+      expect(report.blocked.some(b => b.includes('leak2.txt') && b.includes('credential'))).toBe(true);
+      expect(report.blocked.some(b => b.includes('leak3.txt') && b.includes('credential'))).toBe(true);
+      expect(report.blocked.some(b => b.includes('leak4.txt') && b.includes('credential'))).toBe(true);
+    });
+
     it('allows script files even with credential-like patterns', () => {
       writeFileSync(join(gitDir, 'deploy.sh'), '#!/bin/bash\ntoken=get_from_env');
       writeFileSync(join(gitDir, 'app.py'), 'password=input("Enter:")');

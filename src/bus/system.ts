@@ -43,7 +43,16 @@ const EXCLUDED_DIR_PREFIXES = [
   '.venv/',
 ];
 
-const CREDENTIAL_PATTERNS = /(?:token=|key=|password=|secret=|sk-|ghp_|xoxb-|AKIA)/;
+// The bare token prefixes (sk-/ghp_/xoxb-) previously false-positived on ordinary content: `sk-`
+// matched inside words like "ask-state"/"task-management" and the placeholder literal "xoxb-test".
+// They now require BOTH gates: a non-alphanumeric boundary BEFORE the prefix (kills the in-word
+// matches — "ask-state" has `sk-` preceded by 'a'), AND a >=8-char token body AFTER it (kills short
+// placeholders — "xoxb-test" is preceded by a quote so the boundary passes, but its 4-char body
+// "test" fails). Real credentials clear both: sk-proj-<key>, ghp_<36>, xoxb-<long token>. The
+// `=`-suffixed forms (token=/key=/password=/secret=) and AKIA stay bare — already specific enough
+// (the `=` / the AKIA literal is its own boundary). Root-caused by claudia, verified w/ erkel;
+// regression tests in tests/unit/bus/system.test.ts.
+const CREDENTIAL_PATTERNS = /(?:token=|key=|password=|secret=|AKIA)|(?<![A-Za-z0-9])(?:sk-|ghp_|xoxb-)[A-Za-z0-9_-]{8,}/;
 
 const SCRIPT_EXTENSIONS = new Set(['.sh', '.py', '.js']);
 
