@@ -1,16 +1,18 @@
 import { readdirSync, readFileSync, existsSync, mkdirSync, writeFileSync, unlinkSync } from 'fs';
+import { retrySessionRevocation, sessionQuarantineReason } from './session-revocation-quarantine.js';
 import { join, relative } from 'path';
 import type { AgentConfig, AgentStatus, CtxEnv, BusPaths, WorkerStatus, TelegramMessage, TeamMember } from '../types/index.js';
-import { AgentProcess } from './agent-process.js';
+import { AgentProcess, type AgentInjectionOptions, type AgentInjectionResult } from './agent-process.js';
 import { WorkerProcess } from './worker-process.js';
 import { FastChecker } from './fast-checker.js';
 import { SlackSocketListener } from './slack-socket-listener.js';
+import { loadSlackRoutingConfig, slackConfigPath, claimSlackAppToken, releaseSlackAppTokens, type SlackRoutingConfig } from '../slack/slack-routing.js';
 import { resolveSlackInboundMode } from './slack-inbound-mode.js';
-import { CronScheduler } from './cron-scheduler.js';
+import { CronScheduler, type CronFireContext } from './cron-scheduler.js';
 import { syncCronsForAgent } from './cron-migration.js';
 import { appendExecutionLog } from './cron-execution-log.js';
 import { CronNoopDetector } from './cron-noop-detector.js';
-import type { CronDefinition } from '../types/index.js';
+import type { CronDefinition, CronFireKind } from '../types/index.js';
 import { TelegramAPI } from '../telegram/api.js';
 import { TelegramPoller } from '../telegram/poller.js';
 import { resolvePaths } from '../utils/paths.js';
@@ -19,15 +21,54 @@ import { logEvent } from '../bus/event.js';
 import { sendMessage } from '../bus/message.js';
 import { recordInboundTelegram, cacheLastSent, logOutboundMessage, buildRecentHistory } from '../telegram/logging.js';
 import { collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
-import { stripControlChars } from '../utils/validate.js';
+import { rawDaemonBody, rawDaemonInjection, renderDaemonInjection, stripControlChars, structuralDaemonInjection } from '../utils/validate.js';
+import type { DaemonInjection } from '../utils/validate.js';
 import { processMediaMessage } from '../telegram/media.js';
 import { evaluateShift } from './shift.js';
 import { stripBom } from '../utils/strip-bom.js';
+import { configuredOrHostTimezone, configuredTimezone } from '../utils/timezone.js';
 import { normalizeAllowedUser } from './allowed-user.js';
 import { confirmSupportAccessOnFirstContact } from '../cli/support-access-notify.js';
+import {
+  discoverSourceAgentCandidates,
+  isAgentStartCandidate,
+  loadSourceAgentConfig,
+} from './agent-discovery.js';
+import { resolveCodexCronRouting } from './cron-model-routing.js';
+import { resolveSideRunRouting, resolveSideRunResolution, buildEscalationInjection, type ELIGIBLE } from './cron-side-run.js';
+import { BuzzRelayClient, BuzzDispatcher, formatBuzzInboxMessage, loadBuzzConfig, type NostrEvent } from '../buzz/index.js';
+import {
+  writePendingSlot,
+  startSideRun,
+  sweepSideRuns,
+  clearObservedSlot,
+  type SideRunPending,
+} from './cron-side-run-runner.js';
+import type { DeferredAgentLifecycle } from './deferred-agent-lifecycle.js';
+import type {
+  ChildBinding, DeferredEffect, DeferredRecord, ReconstructionObservation, RequestResult,
+} from './deferred-start-machine.js';
 
 type LogFn = (msg: string) => void;
-type AgentStartOptions = { partOfFleetStart?: boolean };
+
+export function buildCronInjection(firedAt: string, cronName: string, prompt: string): DaemonInjection {
+  return structuralDaemonInjection('CRON FIRED', `${firedAt} ${cronName}`, rawDaemonBody(prompt));
+}
+type AgentStartOptions = {
+  partOfFleetStart?: boolean;
+  deferredBeforeOnline?: (pid: number) => Promise<void>;
+};
+type DeferredSpawnContext = {
+  agentDir: string;
+  config?: AgentConfig;
+  org?: string;
+  options: AgentStartOptions;
+};
+type PendingRestartCause = 'post-crash' | 'in-flight-duplicate';
+type PendingRestartEntry = {
+  cause: PendingRestartCause;
+  queuedAt: number;
+};
 type AgentRestartOptions = {
   partOfFleetStart?: boolean;
   fleetTotal?: number;
@@ -44,21 +85,89 @@ type FleetStartBatch = {
 /**
  * Manages all agents in a cortextOS instance.
  */
+
+/**
+ * Does this cron declare an emergency class the agent has agreed to wake for?
+ *
+ * Exported so the no-reader-regression test can assert this function is what
+ * consumes `off_shift_can_wake_for` — the field spent an unknown period declared
+ * and unread, and the test exists so that can never silently recur.
+ *
+ * Matching is exact and case-insensitive on trimmed strings. Deliberately NOT
+ * fuzzy: a near-miss must fail closed and suppress, because a cron that thinks
+ * it is exempt and is not is worse than one that knows it is suppressed.
+ */
+export function cronWakesForEmergencyClass(
+  cron: Pick<CronDefinition, 'emergency_class'>,
+  agentConfig: Pick<AgentConfig, 'shift_schedule'>,
+): boolean {
+  const cls = cron.emergency_class;
+  if (typeof cls !== 'string' || cls.trim() === '') return false;
+
+  const allowed = agentConfig.shift_schedule?.emergency_override?.off_shift_can_wake_for;
+  if (!Array.isArray(allowed) || allowed.length === 0) return false;
+
+  const want = cls.trim().toLowerCase();
+  return allowed.some((a) => typeof a === 'string' && a.trim().toLowerCase() === want);
+}
+
+type AgentEntry = { process: AgentProcess; checker: FastChecker; stopped?: boolean; poller?: TelegramPoller; activityPoller?: TelegramPoller; slackListener?: SlackSocketListener; buzzOrg?: string; telegramRejectCount?: number; telegramLastRejectAlertAt?: number };
+
 export class AgentManager {
-  private agents: Map<string, { process: AgentProcess; checker: FastChecker; poller?: TelegramPoller; activityPoller?: TelegramPoller; slackListener?: SlackSocketListener; telegramRejectCount?: number; telegramLastRejectAlertAt?: number }> = new Map();
+  private agents: Map<string, AgentEntry> = new Map();
+  /** Socket Mode app-token ownership: appToken -> agent name. Slack splits an
+   * app's events across its open connections, so two agents sharing one app
+   * token silently LOSE messages — detected at listener start, warned loudly. */
+  private slackAppTokenOwners: Map<string, string> = new Map();
   private workers: Map<string, WorkerProcess> = new Map();
+  private buzzClients = new Map<string, {
+    client: BuzzRelayClient;
+    dispatcher: BuzzDispatcher;
+    relayUrl: string;
+    /** Single injected org authentication identity; every agent must match it. */
+    authPubkey: string;
+    started: boolean;
+  }>();
   /** Daemon-level cron scheduler registry: one CronScheduler per enabled agent. */
   private cronSchedulers: Map<string, CronScheduler> = new Map();
   /** Post-fire verifier that confirms Claude cron prompts reached the REPL transcript. */
   private cronNoopDetector: CronNoopDetector;
+  /**
+   * Side-run eligibility registry. Undefined in production, where
+   * resolveSideRunRouting falls back to the shipped ELIGIBLE list.
+   *
+   * Exists ONLY so the admission path can be driven by a test. The shipped
+   * heartbeat rows pin the live agent skill file, which is symlinked runtime and
+   * absent from the repo, so no CI-runnable test could reach the accept path
+   * through here — which meant the copy of plan.continuationPrompt into the
+   * pending slot had no coverage at all, and a mutation dropping it stayed green.
+   *
+   * Same seam, and the same reason, as ResolveSideRunInput.registry one layer
+   * down: a gate whose accept path cannot be exercised is indistinguishable from
+   * one that never opens.
+   */
+  private sideRunRegistry?: typeof ELIGIBLE;
   // Tracks agents that received a start request while still stopping.
   // stopAgent() honors these after cleanup completes so restart-all is race-free.
-  private pendingRestarts: Set<string> = new Set();
+  private pendingRestarts: Map<string, PendingRestartEntry> = new Map();
+  private inFlightRestarts: Set<string> = new Set();
+  /** Names whose stale registry entries are being torn down before a fresh start. */
+  private evictingAgents: Set<string> = new Set();
   private instanceId: string;
   private ctxRoot: string;
   private frameworkRoot: string;
   private org: string;
   private fleetStartBatch: FleetStartBatch | null = null;
+  private deferredLifecycle?: DeferredAgentLifecycle;
+  private deferredSpawnContexts = new Map<string, DeferredSpawnContext>();
+  private deferredSubscriberSequence = 0;
+  private observeDeferredChildIdentity?: (pid: number) => string;
+  private reconstructedDeferredAgents = new Set<string>();
+  private deferredBootAgents: readonly string[] = [];
+  private deferredHistoricalTerminalAgents = new Set<string>();
+  private deferredRecoveryNeedsFreshAdmission = new Set<string>();
+  private deferredBootReconstruction?: Promise<void>;
+  private deferredBootAdmissions = new Set<string>();
 
   // Set true at construction time if any agent in state/ has a stale
   // .daemon-crashed marker, meaning the previous daemon process died
@@ -110,6 +219,392 @@ export class AgentManager {
     });
   }
 
+  private stillMapped(name: string, entry: AgentEntry): boolean {
+    return this.agents.get(name) === entry;
+  }
+
+  configureDeferredLifecycle(lifecycle: DeferredAgentLifecycle, observeChildIdentity: (pid: number) => string): void {
+    if (this.deferredLifecycle) throw new Error('deferred lifecycle already configured');
+    this.deferredLifecycle = lifecycle;
+    this.observeDeferredChildIdentity = observeChildIdentity;
+    // Reconstruction is an eager boot phase, never a side effect of first admission.
+    this.deferredBootAgents = lifecycle.persistedAgents();
+    this.deferredHistoricalTerminalAgents = new Set(
+      this.deferredBootAgents.filter(agent => {
+        const record = lifecycle.persistedRecord(agent);
+        return record?.state === 'completed-for-accounting' || record?.outcome !== undefined;
+      }),
+    );
+  }
+
+  async admitStartAgent(
+    name: string,
+    agentDir: string,
+    config?: AgentConfig,
+    org?: string,
+    options: AgentStartOptions = {},
+  ): Promise<RequestResult | undefined> {
+    if (!this.deferredLifecycle) {
+      await this.startAgent(name, agentDir, config, org, options);
+      return undefined;
+    }
+    await this.ensureDeferredBootReconstruction();
+    this.reconstructDeferredAgent(name);
+    const bootResult = await this.consumeDeferredBootAdmission(name, { agentDir, config, org });
+    if (bootResult) return bootResult;
+    const result = this.deferredLifecycle.request({
+      agent: name,
+      operation: 'start',
+      operationContext: {
+        agentDir, config, org, partOfFleetStart: options.partOfFleetStart,
+      },
+      subscriber: {
+        id: `${options.partOfFleetStart ? 'fleet' : 'individual'}:${name}:${++this.deferredSubscriberSequence}`,
+        kind: options.partOfFleetStart ? 'fleet' : 'individual',
+      },
+    });
+    if (result.status === 'refused') return result;
+    this.bindDeferredOperationContext(result);
+    return result;
+  }
+
+  async admitRestartAgent(name: string, options: AgentRestartOptions = {}): Promise<RequestResult | undefined> {
+    if (options.partOfFleetStart && options.fleetTotal && options.fleetTotal > 0 && !this.fleetStartBatch) {
+      this.beginFleetStartBatch(options.fleetTotal, 'restart-all');
+    }
+    if (!this.deferredLifecycle) {
+      await this.restartAgent(name, options);
+      return undefined;
+    }
+    await this.ensureDeferredBootReconstruction();
+    this.reconstructDeferredAgent(name);
+    const bootResult = await this.consumeDeferredBootAdmission(name);
+    if (bootResult) return bootResult;
+    const status = this.getAgentStatus(name);
+    const pid = status?.pid;
+    const result = this.deferredLifecycle.request({
+      agent: name,
+      operation: 'restart',
+      oldProcessIdentity: pid ? this.measureDeferredIdentity(pid) : undefined,
+      operationContext: { agentDir: '', partOfFleetStart: options.partOfFleetStart },
+      subscriber: {
+        id: `${options.partOfFleetStart ? 'fleet' : 'individual'}:${name}:${++this.deferredSubscriberSequence}`,
+        kind: options.partOfFleetStart ? 'fleet' : 'individual',
+      },
+    });
+    if (result.status === 'refused') return result;
+    this.bindDeferredOperationContext(result);
+    return result;
+  }
+
+  async executeDeferredStop(name: string, expectedIdentity: string): Promise<void> {
+    const status = this.getAgentStatus(name);
+    if (!status?.pid || this.measureDeferredIdentity(status.pid) !== expectedIdentity) {
+      throw new Error(`old process identity changed for ${name}`);
+    }
+    await this.stopAgent(name, false, true);
+  }
+
+  async executeDeferredSpawn(name: string, token: string, generation: number): Promise<ChildBinding> {
+    const contextKey = this.deferredContextKey(name, generation);
+    const context = this.deferredSpawnContexts.get(contextKey) ?? { agentDir: '', options: {} };
+    this.deferredSpawnContexts.delete(contextKey);
+    let durableBinding: ChildBinding | undefined;
+    await this.startAgent(name, context.agentDir, context.config, context.org, {
+      ...context.options,
+      deferredBeforeOnline: async (pid) => {
+        const binding = { token, pid, kernelIdentity: this.measureDeferredIdentity(pid) };
+        if (!this.deferredLifecycle) throw new Error('deferred lifecycle unavailable');
+        this.deferredLifecycle.bindChildBeforeOnline(name, binding, generation);
+        durableBinding = binding;
+      },
+    });
+    const status = this.getAgentStatus(name);
+    if (!status?.pid || status.status !== 'running') throw new Error(`spawn did not publish a running child for ${name}`);
+    if (!durableBinding || durableBinding.pid !== status.pid) {
+      throw new Error(`spawn reached running without its durable child binding for ${name}`);
+    }
+    return durableBinding;
+  }
+
+  async reapDeferredChild(name: string, binding: ChildBinding): Promise<void> {
+    const observation = await this.reapReceiptBoundChild(name, binding);
+    if (observation === 'unknown') {
+      throw new Error(`deferred child identity unknown; refusing reap for ${name}`);
+    }
+    // `absent` and `conflict` are proven non-matches for the durable binding.
+    // Never signal a reused PID merely because its number matches the receipt.
+  }
+
+  async completeDeferredSubscriber(effect: Extract<DeferredEffect, { type: 'deliver' }>): Promise<void> {
+    if (effect.subscriber.kind === 'fleet') {
+      this.recordFleetStartAgent(effect.agent);
+      this.finishFleetStartBatch();
+    } else {
+      console.log(`[agent-manager] Deferred ${effect.agent} operation completed: ${effect.outcome}`);
+    }
+  }
+
+  isAgentEnabledForDeferred(name: string): boolean {
+    const configEntry = this.readInstanceEnableList()[name];
+    if (configEntry?.enabled === false) return false;
+    const record = this.deferredLifecycle?.observe(name);
+    const persistedDir = record?.operationContext?.agentDir;
+    if (persistedDir && existsSync(persistedDir)) {
+      const sourceConfig = loadSourceAgentConfig(persistedDir);
+      if (sourceConfig.enabled === false) return false;
+    }
+    const generation = record?.recordGeneration;
+    const context = generation === undefined
+      ? undefined
+      : this.deferredSpawnContexts.get(this.deferredContextKey(name, generation));
+    return context?.config?.enabled !== false;
+  }
+
+  private reconstructDeferredAgent(name: string): void {
+    if (!this.deferredLifecycle || this.reconstructedDeferredAgents.has(name)) return;
+    const persisted = this.deferredLifecycle.persistedRecord(name);
+    const observation = this.measureDeferredReconstruction(name);
+    if (persisted?.state === 'spawning' && observation.replacementIdentity === 'absent') {
+      this.deferredRecoveryNeedsFreshAdmission.add(name);
+    }
+    this.deferredLifecycle.reconstruct(name, observation);
+    this.reconstructedDeferredAgents.add(name);
+  }
+
+  private ensureDeferredBootReconstruction(): Promise<void> {
+    if (!this.deferredLifecycle) return Promise.resolve();
+    if (!this.deferredBootReconstruction) {
+      for (const name of this.deferredBootAgents) this.reconstructDeferredAgent(name);
+      this.deferredBootAdmissions = new Set(this.deferredBootAgents);
+      const attempt = Promise.all(
+        this.deferredBootAgents.map(name => this.deferredLifecycle!.settled(name)),
+      ).then(() => undefined);
+      const guarded = attempt.catch(error => {
+        // Keep boot fail-closed, but do not memoize one rejected drain for the
+        // daemon lifetime. The next admission reconstructs the durable rows
+        // through fresh per-agent scheduling tails.
+        if (this.deferredBootReconstruction === guarded) this.deferredBootReconstruction = undefined;
+        for (const name of this.deferredBootAgents) this.reconstructedDeferredAgents.delete(name);
+        throw error;
+      });
+      this.deferredBootReconstruction = guarded;
+    }
+    return this.deferredBootReconstruction;
+  }
+
+  private measureDeferredIdentity(pid: number): string {
+    if (!this.observeDeferredChildIdentity) throw new Error('process identity observer unavailable');
+    return this.observeDeferredChildIdentity(pid);
+  }
+
+  private async consumeDeferredBootAdmission(
+    name: string,
+    context?: { agentDir: string; config?: AgentConfig; org?: string },
+  ): Promise<RequestResult | undefined> {
+    if (!this.deferredBootAdmissions.delete(name) || !this.deferredLifecycle) return undefined;
+    // A record that was already terminal when boot began is history, not
+    // satisfaction of today's enabled admission. Reconstruction outcomes that
+    // become terminal during this boot still return their truthful verdict.
+    const record = this.deferredLifecycle.observe(name);
+    if (!record) return undefined;
+    if (this.deferredRecoveryNeedsFreshAdmission.delete(name)) {
+      if (record.childBinding) {
+        const reconciled = await this.reconcileRecoveredChild(name, record, context);
+        if (reconciled === 'refused') return { status: 'refused', reason: 'UNKNOWN_GUARD' };
+      }
+      return undefined;
+    }
+    if (this.deferredHistoricalTerminalAgents.delete(name)) {
+      if (record.childBinding) {
+        const reconciled = await this.reconcileRecoveredChild(name, record, context);
+        if (reconciled === 'refused') return { status: 'refused', reason: 'UNKNOWN_GUARD' };
+      }
+      return undefined;
+    }
+    if (record.state === 'deferred-with-owner') {
+      return { status: 'deferred', receiptId: record.receiptId, record };
+    }
+    if (record.outcome && record.outcome !== 'spawned') {
+      // A row that terminalized during this boot (for example on conflicting
+      // measured identity) is a current fail-closed verdict, not historical.
+      return { status: 'cancelled', receiptId: record.receiptId, record };
+    }
+    if (record.outcome === 'spawned') {
+      if (record.childBinding) {
+        const reconciled = await this.reconcileRecoveredChild(name, record, context);
+        if (reconciled === 'refused') return { status: 'refused', reason: 'UNKNOWN_GUARD' };
+      }
+      // PTY-backed runtimes cannot adopt a child after daemon loss: the PTY,
+      // message injection and poller ownership died with the old manager. A
+      // measured survivor is reaped above; a vanished child needs a fresh
+      // operation. In both cases this historical outcome cannot consume boot.
+      return undefined;
+    }
+    return { status: 'accepted', receiptId: record.receiptId, record };
+  }
+
+  private async reconcileRecoveredChild(
+    name: string,
+    record: DeferredRecord,
+    context?: { agentDir: string; config?: AgentConfig; org?: string },
+  ): Promise<'accounted' | 'refused'> {
+    this.deferredLifecycle!.beginRecoveredChildReplacement(name, record.recordGeneration);
+    const result = await this.reapReceiptBoundChild(name, record.childBinding!, context);
+    if (result === 'conflict' || result === 'unknown') return 'refused';
+    this.deferredLifecycle!.completeRecoveredChildReap(name, record.recordGeneration);
+    return 'accounted';
+  }
+
+  private async reapReceiptBoundChild(
+    name: string,
+    binding: ChildBinding,
+    context?: { agentDir: string; config?: AgentConfig; org?: string },
+  ): Promise<'reaped' | 'absent' | 'conflict' | 'unknown'> {
+    let measured: string;
+    try {
+      measured = this.measureDeferredIdentity(binding.pid);
+    } catch (error) {
+      if (String(error).includes('vanished')) return 'absent';
+      return 'unknown';
+    }
+    if (measured !== binding.kernelIdentity) return 'conflict';
+    const resolvedOrg = this.resolveAgentOrg(name, context?.org);
+    const agentDir = context?.agentDir || join(this.frameworkRoot, 'orgs', resolvedOrg, 'agents', name);
+    const config = context?.config ?? (existsSync(agentDir) ? loadSourceAgentConfig(agentDir) : {} as AgentConfig);
+    const env: CtxEnv = {
+      instanceId: this.instanceId,
+      ctxRoot: this.ctxRoot,
+      frameworkRoot: this.frameworkRoot,
+      agentName: name,
+      agentDir,
+      org: resolvedOrg,
+      projectRoot: this.frameworkRoot,
+    };
+    const processEntry = new AgentProcess(name, env, config, msg => console.log(`[${name}] ${msg}`));
+    processEntry.adoptExternalProcess(binding, pid => this.measureDeferredIdentity(pid));
+    await processEntry.stop();
+    return 'reaped';
+  }
+
+  private bindDeferredOperationContext(result: RequestResult): void {
+    if (result.status === 'refused') return;
+    const context = result.record.operationContext;
+    const key = this.deferredContextKey(result.record.agent, result.record.recordGeneration);
+    if (!context || this.deferredSpawnContexts.has(key)) return;
+    this.deferredSpawnContexts.set(key, {
+      agentDir: context.agentDir,
+      config: context.config as AgentConfig | undefined,
+      org: context.org,
+      options: { partOfFleetStart: context.partOfFleetStart },
+    });
+  }
+
+  private deferredContextKey(agent: string, generation: number): string {
+    return `${agent}:${generation}`;
+  }
+
+  private measureDeferredReconstruction(name: string): ReconstructionObservation {
+    if (!this.deferredLifecycle) throw new Error('deferred lifecycle unavailable');
+    const persisted = this.deferredLifecycle.persistedRecord(name);
+    const status = this.getAgentStatus(name);
+    const durableChild = persisted?.childBinding;
+    const candidatePid = status?.pid ?? durableChild?.pid;
+    let measuredIdentity: string | undefined;
+    let observationUnknown = false;
+    let observationVanished = false;
+    if (candidatePid) {
+      try {
+        measuredIdentity = this.measureDeferredIdentity(candidatePid);
+      } catch (error) {
+        if (String(error).includes('vanished')) observationVanished = true;
+        else observationUnknown = true;
+      }
+    }
+    const observedPid = observationVanished ? undefined : candidatePid;
+
+    const afterOldProcess = persisted?.state === 'start-pending' || persisted?.state === 'spawning';
+    const oldIdentity: ReconstructionObservation['oldIdentity'] = afterOldProcess
+      ? 'absent'
+      : observationUnknown
+        ? 'unknown'
+        : !observedPid
+          ? 'absent'
+          : persisted?.oldProcessIdentity === measuredIdentity ? 'exact' : 'conflict';
+
+    const reportedBinding = status && (status as AgentStatus & { deferredChildBinding?: ChildBinding })
+      .deferredChildBinding;
+    const bound = reportedBinding ?? durableChild;
+    const replacementIdentity: ReconstructionObservation['replacementIdentity'] = observationUnknown
+      ? 'unknown'
+      : !observedPid
+        ? observationVanished ? 'absent' : persisted?.intendedChildToken ? 'unknown' : 'absent'
+        : bound
+          && bound.pid === observedPid
+          && bound.kernelIdentity === measuredIdentity
+          && bound.token === persisted?.intendedChildToken
+          ? 'exact'
+          : bound ? 'conflict' : 'unknown';
+
+    return {
+      oldIdentity,
+      replacementIdentity,
+      custodyBlocked: this.deferredLifecycle.custodyBlocked(name),
+      child: replacementIdentity === 'exact' ? bound : undefined,
+    };
+  }
+
+  private async handleAgentCronFire(
+    agentName: string,
+    cron: CronDefinition,
+    context: CronFireContext,
+  ): Promise<void> {
+    const prompt = cron.prompt ?? `[cron] ${cron.name} fired`;
+
+    // Shift gate (RFC internal design docs §4).
+    const suppression = this.evaluateCronShiftSuppression(agentName, cron);
+    if (suppression) {
+      console.log(`[daemon] cron suppressed off-shift for ${agentName}: ${cron.name} (mode=${suppression.mode})`);
+      try {
+        const resolvedOrg = this.resolveAgentOrg(agentName);
+        const paths = resolvePaths(agentName, this.instanceId, resolvedOrg);
+        logEvent(paths, agentName, resolvedOrg || '', 'action', 'cron_suppressed_off_shift', 'info', {
+          agent: agentName,
+          cron: cron.name,
+          mode: suppression.mode,
+          path: 'daemon_cron_fire',
+        });
+      } catch (err) {
+        console.log(`[daemon] logEvent failed for cron-suppressed (non-fatal): ${err}`);
+      }
+      return;
+    }
+
+    const firedAt = context.firedAt;
+    const injection = buildCronInjection(firedAt, cron.name, prompt);
+    const injected = this.injectCronAgent(agentName, cron, injection, firedAt);
+    if (!injected) {
+      throw new Error(`injectAgent returned false for agent "${agentName}" — agent may not be running`);
+    }
+    try {
+      const entry = this.agents.get(agentName);
+      const config = entry?.process.getConfig();
+      if (entry && config) {
+        this.cronNoopDetector.registerFire({
+          agentName,
+          agentDir: entry.process.getAgentDir(),
+          config,
+          cronName: cron.name,
+          prompt,
+          firedAt,
+          fireKind: context.fireKind,
+        });
+      }
+    } catch (err) {
+      console.log(`[cron-noop-detector] register failed for ${agentName}/${cron.name} (non-fatal): ${err}`);
+    }
+  }
+
   /**
    * Scan state/<agent>/.daemon-crashed markers (written by daemon/index.ts:handleFatal).
    * Presence means the previous daemon process died via uncaughtException
@@ -125,6 +620,42 @@ export class AgentManager {
       return dirs.some(name => existsSync(join(stateBase, name, '.daemon-crashed')));
     } catch {
       return false;
+    }
+  }
+
+  private pendingRestartCause(): PendingRestartCause {
+    return this.daemonJustCrashed ? 'post-crash' : 'in-flight-duplicate';
+  }
+
+  private emitPendingRestartEvent(
+    name: string,
+    event: 'pending_restart_enqueued' | 'pending_restart_consumed' | 'pending_restart_cause_disagreement',
+    phase: 'enqueue' | 'consume',
+    entry: PendingRestartEntry,
+    consumeDerivedCause: PendingRestartCause,
+  ): void {
+    const elapsedMs = Math.max(0, Date.now() - entry.queuedAt);
+    try {
+      const resolvedOrg = this.resolveAgentOrg(name);
+      const paths = resolvePaths(name, this.instanceId, resolvedOrg);
+      logEvent(
+        paths,
+        name,
+        resolvedOrg || '',
+        'action',
+        event,
+        event === 'pending_restart_cause_disagreement' ? 'warning' : 'info',
+        {
+          agent: name,
+          phase,
+          recorded_cause: entry.cause,
+          consume_derived_cause: consumeDerivedCause,
+          queued_at: entry.queuedAt,
+          elapsed_ms: elapsedMs,
+        },
+      );
+    } catch (err) {
+      console.warn(`[agent-manager] Failed to emit ${event} for ${name} (non-fatal): ${err}`);
     }
   }
 
@@ -167,6 +698,7 @@ export class AgentManager {
    * Discover and start all enabled agents.
    */
   async discoverAndStart(): Promise<void> {
+    await this.ensureDeferredBootReconstruction();
     const agentDirs = this.discoverAgents();
     const startCandidates: Array<{ name: string; dir: string; org: string; config: AgentConfig }> = [];
 
@@ -181,15 +713,14 @@ export class AgentManager {
     // single up-front snapshot would let a just-disabled agent still start
     // (and a just-enabled agent stay dark) until the next daemon restart.
     for (const { name, dir, org, config } of agentDirs) {
-      // Per-agent config.json `enabled: false` (existing behavior, unchanged)
-      if (config.enabled === false) {
-        console.log(`[agent-manager] Skipping disabled agent: ${name} (per-agent config.json)`);
-        continue;
-      }
       const instanceEnabled = this.readInstanceEnableList();
       const entry = instanceEnabled[name];
-      if (entry && entry.enabled === false) {
-        console.log(`[agent-manager] Skipping disabled agent: ${name} (enabled-agents.json)`);
+      if (!isAgentStartCandidate(config, entry)) {
+        if (config.enabled === false) {
+          console.log(`[agent-manager] Skipping disabled agent: ${name} (per-agent config.json)`);
+        } else {
+          console.log(`[agent-manager] Skipping disabled agent: ${name} (enabled-agents.json)`);
+        }
         continue;
       }
       startCandidates.push({ name, dir, org, config });
@@ -204,14 +735,23 @@ export class AgentManager {
       // and startAgent re-throws after cleanup; we log + continue here so
       // the rest of the fleet still comes online.
       try {
-        await this.startAgent(name, dir, config, org, { partOfFleetStart: true });
+        const persistedBootAdmission = this.deferredBootAdmissions.has(name);
+        const admission = await this.admitStartAgent(name, dir, config, org, { partOfFleetStart: true });
+        if (admission?.status === 'refused') {
+          this.recordFleetStartRejection(name, startCandidates.length);
+        } else if (persistedBootAdmission && admission) {
+          // This verdict belongs to a subscriber persisted before this boot, so
+          // no current fleet delivery will ever account today's enabled member.
+          this.recordFleetStartAgent(name);
+          this.finishFleetStartBatch();
+        }
       } catch (err) {
         console.error(`[agent-manager] Failed to start ${name}: ${err}`);
       } finally {
-        this.recordFleetStartAgent(name);
+        if (!this.deferredLifecycle) this.recordFleetStartAgent(name);
       }
     }
-    this.finishFleetStartBatch(true);
+    if (!this.deferredLifecycle) this.finishFleetStartBatch(true);
 
     // Successful startup pass — clear .daemon-crashed markers from disk
     // AND clear the in-memory daemonJustCrashed flag. After this point,
@@ -234,6 +774,34 @@ export class AgentManager {
       notifyHandle: null,
       source,
     };
+  }
+
+  /**
+   * Account for a fleet-restart member that the IPC gate REFUSED (e.g. DEDUPED because
+   * a manual restart of that agent is already in flight).
+   *
+   * Without this, a refused member is never recorded: `restartAgent` is never called for
+   * it, so `finishFleetStartBatch` strands at completed < expected and the stale
+   * coordinator then suppresses the NEXT fleet batch via the already-active guard in
+   * `beginFleetStartBatch`. Found in review of PR #183.
+   *
+   * Deliberately does NOT touch `inFlightRestarts` — the agent really is mid-restart and
+   * its marker must survive — and does NOT dispatch, which is the whole point of the refusal.
+   */
+  recordFleetStartRejection(name: string, fleetTotal?: number): void {
+    if (!this.fleetStartBatch) {
+      // Without a real fleetTotal we cannot size a batch. Defaulting to 1 would create a
+      // bogus single-member batch, immediately satisfy it, clear it, and then let the
+      // FIRST GENUINE member open a second batch that strands one short — turning a
+      // missing total into silent corruption. Refuse to guess; log instead.
+      if (!fleetTotal || fleetTotal <= 0) {
+        console.warn(`[agent-manager] refused fleet member ${name} not accounted: no active batch and no fleetTotal`);
+        return;
+      }
+      this.beginFleetStartBatch(fleetTotal, 'restart-all');
+    }
+    this.recordFleetStartAgent(name);
+    this.finishFleetStartBatch();
   }
 
   private captureFleetNotifyHandle(api: TelegramAPI, chatId: string): void {
@@ -454,10 +1022,13 @@ export class AgentManager {
   inspectAgentOp(op: 'start' | 'stop' | 'restart', name: string): { ok: true } | { ok: false; code: 'DEDUPED' | 'NOT_FOUND'; message: string } {
     const inRegistry = this.agents.has(name);
     if (op === 'start') {
-      if (inRegistry) {
+      if (inRegistry && this.isAgentActuallyAlive(name)) {
         return { ok: false, code: 'DEDUPED', message: `start request for "${name}" deduped — agent already in registry (in-flight start or already running)` };
       }
       return { ok: true };
+    }
+    if (op === 'restart' && this.inFlightRestarts.has(name)) {
+      return { ok: false, code: 'DEDUPED', message: `restart request for "${name}" deduped — restart already in flight` };
     }
     // stop / restart need the agent to be present
     if (!inRegistry) {
@@ -466,8 +1037,43 @@ export class AgentManager {
     return { ok: true };
   }
 
+  /** Registry membership is not liveness: AgentProcess reconciles its status with the OS pid. */
+  private isAgentActuallyAlive(name: string): boolean {
+    const entry = this.agents.get(name);
+    if (!entry) return false;
+    // Be conservative if a test double or future transitional entry cannot
+    // report status: unknown custody must never be evicted as dead.
+    if (typeof entry.process.getStatus !== 'function') return true;
+    const { status } = entry.process.getStatus();
+    return status === 'starting' || status === 'running';
+  }
+
   async startAgent(name: string, agentDir: string, config?: AgentConfig, org?: string, options: AgentStartOptions = {}): Promise<void> {
+    // Scoped fail-closed on an unknown session revocation. Boot could not clear
+    // this agent's stale heartbeat session records, and a record that survives is
+    // still a VALID credential — starting a new generation would leave two live
+    // sessions for this agent, so a detached descendant of the dead one could keep
+    // refreshing its heartbeat. Retry the revoke first: repairing the directory
+    // permission is all an operator should have to do.
+    if (!retrySessionRevocation(this.ctxRoot, name)) {
+      const reason = sessionQuarantineReason(name);
+      console.error(`[agent-manager] REFUSING TO START ${name}: ${reason}`);
+      throw new Error(`${name} cannot start: ${reason}`);
+    }
+
     if (this.agents.has(name)) {
+      const mapped = this.agents.get(name)!;
+      const mappedStatus = typeof mapped.process.getStatus === 'function'
+        ? mapped.process.getStatus().status
+        : undefined;
+      // A delayed start is already the canonical registered admission. A
+      // duplicate start must collapse completely, not leave a latent queued
+      // restart that can fire during a later lifecycle operation.
+      if (mappedStatus === 'starting') {
+        console.log(`[agent-manager] ${name} start already in flight — deduping without queued restart.`);
+        return;
+      }
+
       // BUG-031: this branch was the workaround for the BUG-011 PTY race
       // (restart-all could send stop+start simultaneously, and the new
       // start would arrive while the old stop's PTY exit was still in
@@ -481,20 +1087,68 @@ export class AgentManager {
       // the core stability test plan + cycle 2 of PR #13 both confirmed
       // this branch is dormant. Once we have weeks of zero-warning
       // production data, we can delete the queue mechanism entirely.
-      if (this.daemonJustCrashed) {
-        // Post-crash startup. The previous daemon exited via
-        // uncaughtException without running stopAll(), so the in-memory
-        // registry from the prior process is gone — but the post-crash
-        // discoverAndStart pass can briefly re-enter startAgent for an
-        // agent whose pendingRestarts entry survived. This is benign and
-        // distinct from the BUG-011 in-flight race PR #11 closed. Log at
-        // info level so operators don't think PR #11 has regressed.
-        console.log(`[agent-manager] ${name} already in registry (post-crash discovery overlap, expected). Queueing restart.`);
-      } else {
-        console.warn(`[agent-manager] BUG-011 REGRESSION CHECK: ${name} still in registry during startAgent — pendingRestarts queueing engaged. This should not happen with PR #11 in place.`);
+      if (this.isAgentActuallyAlive(name)) {
+        if (this.daemonJustCrashed) {
+          console.log(`[agent-manager] ${name} already in registry (post-crash discovery overlap, expected). Queueing restart.`);
+        } else {
+          console.warn(`[agent-manager] BUG-011 REGRESSION CHECK: ${name} still in registry during startAgent — pendingRestarts queueing engaged. This should not happen with PR #11 in place.`);
+        }
+        const consumeDerivedCause = this.pendingRestartCause();
+        const entry = this.pendingRestarts.get(name) ?? {
+          cause: consumeDerivedCause,
+          queuedAt: Date.now(),
+        };
+        this.pendingRestarts.set(name, entry);
+        this.emitPendingRestartEvent(
+          name,
+          'pending_restart_enqueued',
+          'enqueue',
+          entry,
+          consumeDerivedCause,
+        );
+        if (entry.cause !== consumeDerivedCause) {
+          this.emitPendingRestartEvent(
+            name,
+            'pending_restart_cause_disagreement',
+            'enqueue',
+            entry,
+            consumeDerivedCause,
+          );
+        }
+        return;
       }
-      this.pendingRestarts.add(name);
-      return;
+
+      if (this.evictingAgents.has(name)) {
+        console.log(`[agent-manager] ${name} stale-entry eviction already in flight — skipping duplicate start.`);
+        return;
+      }
+
+      this.evictingAgents.add(name);
+      try {
+        const stale = this.agents.get(name)!;
+        console.log(`[agent-manager] ${name} is mapped but not alive — evicting stale entry before restart.`);
+        try { stale.poller?.stop(); } catch { /* best effort */ }
+        try { stale.activityPoller?.stop(); } catch { /* best effort */ }
+        try { stale.slackListener?.stop(); } catch { /* best effort */ }
+        // Mirror stopAgent's Buzz teardown (post-merge P1): eviction is the
+        // OTHER path an entry leaves the registry by, and a stale dispatcher
+        // registration would keep routing events for a dead agent.
+        try {
+          if (stale.buzzOrg) this.buzzClients.get(stale.buzzOrg)?.dispatcher.unregister(name);
+        } catch { /* best effort */ }
+        this.cronNoopDetector.cancelAgentVerifications(name);
+        try { stale.checker.stop(); } catch { /* best effort */ }
+        try { await stale.process.stop(); } catch { /* best effort */ }
+        if (this.agents.get(name) === stale) this.agents.delete(name);
+        this.pendingRestarts.delete(name);
+        const scheduler = this.cronSchedulers.get(name);
+        if (scheduler) {
+          scheduler.stop();
+          this.cronSchedulers.delete(name);
+        }
+      } finally {
+        this.evictingAgents.delete(name);
+      }
     }
 
     // BUG-043 fix: resolve the agent's true org instead of using `this.org`.
@@ -512,7 +1166,7 @@ export class AgentManager {
     }
 
     if (!config) {
-      config = this.loadAgentConfig(agentDir);
+      config = loadSourceAgentConfig(agentDir);
     }
 
     const env: CtxEnv = {
@@ -623,9 +1277,14 @@ export class AgentManager {
           token: string;
           trustedSlackUsers?: string[];
           teamMembers?: TeamMember[];
+          routing?: SlackRoutingConfig;
         }
       | undefined;
     let slackSocketConfig: { channel: string; botToken: string; appToken: string } | undefined;
+    // D1 routing config, loaded ONCE and shared by BOTH inbound consumers
+    // (socket listener AND poll fallback) — hoisted so the listener
+    // construction below reuses the same load instead of re-reading the file.
+    let agentSlackRouting: SlackRoutingConfig | null = null;
     if (config.slack_watch?.channel) {
       let slackBotToken = '';
       let slackAppToken = '';
@@ -639,6 +1298,14 @@ export class AgentManager {
       }
       if (!slackBotToken) slackBotToken = process.env.SLACK_BOT_TOKEN ?? '';
       if (!slackAppToken) slackAppToken = process.env.SLACK_APP_TOKEN ?? '';
+
+      // The census rule: every ingress passes through the same route gate —
+      // an ungated fallback would be an unfenced consumer.
+      const slackJsonPathEarly = slackConfigPath(this.frameworkRoot, resolvedOrg, name);
+      agentSlackRouting = loadSlackRoutingConfig(this.frameworkRoot, resolvedOrg, name);
+      if (agentSlackRouting === null && existsSync(slackJsonPathEarly)) {
+        log(`WARNING: ${slackJsonPathEarly} exists but is malformed (unparseable JSON, or a field with the wrong shape — allowed_channels/allowed_users must be string arrays). Slack routing DISABLED for this agent — running in legacy single-channel mode. Fix the file and restart.`);
+      }
 
       // Socket Mode is primary ONLY when native WebSocket is available (Node 22+);
       // otherwise the poll stays live as the fallback so there is never a silent
@@ -665,6 +1332,7 @@ export class AgentManager {
           token: decision.botToken,
           trustedSlackUsers: config.trusted_slack_users,
           teamMembers: config.team_members,
+          routing: agentSlackRouting ?? undefined,
         };
       } else {
         log(`Slack watch configured but ${decision.reason} in .env — skipping`);
@@ -683,6 +1351,7 @@ export class AgentManager {
       gmailWatch: gmailWatchOption,
       slackWatch: slackWatchOption,
       ctxRestartThreshold: config.ctx_restart_threshold,
+      turnWatchdogThresholdMinutes: config.turn_watchdog_threshold_minutes,
     });
 
     // Reset watchdog session state on actual transitions back to running.
@@ -719,15 +1388,19 @@ export class AgentManager {
       prevStatusForReset = status.status;
     });
 
-    const entry = { process: agentProcess, checker };
-    this.agents.set(name, entry);
+    const ownEntry: AgentEntry = { process: agentProcess, checker };
+    const entry = ownEntry;
+    this.agents.set(name, ownEntry);
 
     // Start agent. If start() throws, AgentProcess has already flipped status
     // to 'crashed' (it now re-throws so callers can react). Tear down the
     // map entry before re-throwing so we don't leave a half-registered
     // zombie that blocks future startAgent() retries.
     try {
-      await agentProcess.start({ partOfFleetStart: options.partOfFleetStart });
+      await agentProcess.start({
+        partOfFleetStart: options.partOfFleetStart,
+        beforeOnline: options.deferredBeforeOnline,
+      });
     } catch (err) {
       // Only delete if we are still the canonical entry — a concurrent
       // stop+start could have replaced the map entry while we were awaiting.
@@ -797,6 +1470,24 @@ export class AgentManager {
     // configured. Stored on the registry entry so stopAgent() closes the WSS
     // cleanly. When active, the legacy poll is dormant (slackWatchOption unset).
     if (slackSocketConfig) {
+      // SHARED-APP DETECTION (PR313 Codex P1): Slack distributes an app's
+      // event envelopes across its open Socket Mode connections — each event
+      // reaches ONE connection. Two agents on one app token therefore each
+      // receive a random SUBSET of events: silent message loss, not fan-out.
+      // The supported N:1 topology is one Slack app per agent (runbook §1).
+      // Warn loudly (log + operator Telegram) rather than refuse: an existing
+      // shared-token fleet keeps today's runtime behavior, but the loss mode
+      // is named where the operator will see it.
+      const conflictOwner = claimSlackAppToken(this.slackAppTokenOwners, slackSocketConfig.appToken, name);
+      if (conflictOwner !== null) {
+        const sharedAppAlert = `⚠️ SLACK SHARED APP TOKEN: agents '${conflictOwner}' and '${name}' are using the SAME Slack app token. Slack splits events across an app's connections, so EACH agent will receive only a random subset of messages (silent loss). Give each agent its own Slack app (see docs/architecture/slack-adapter-setup.md §1).`;
+        log(sharedAppAlert);
+        if (telegramApi && chatId) {
+          telegramApi.sendMessage(chatId, sharedAppAlert).catch(() => {
+            /* alert is best-effort; the log line above always lands */
+          });
+        }
+      }
       const slackListener = new SlackSocketListener({
         appToken: slackSocketConfig.appToken,
         botToken: slackSocketConfig.botToken,
@@ -806,6 +1497,7 @@ export class AgentManager {
         log,
         trustedSlackUsers: config.trusted_slack_users,
         teamMembers: config.team_members,
+        routing: agentSlackRouting ?? undefined,
         // PERMANENT auth failure (invalid/revoked app token): the socket client
         // has STOPPED reconnecting — this never self-heals, so alert the
         // operator directly over Telegram (same mechanism as the ALLOWED_USER
@@ -927,7 +1619,7 @@ export class AgentManager {
               log('Media processing returned null - falling back to text format');
               const text = stripControlChars(msg.caption || '');
               const formatted = FastChecker.formatTelegramTextMessage(from, effectiveChatId, text, this.frameworkRoot, replyToText);
-              if (!checker.isDuplicate(formatted)) checker.queueTelegramMessage(formatted);
+              if (!checker.isDuplicate(renderDaemonInjection(formatted))) checker.queueTelegramMessage(formatted);
               return;
             }
 
@@ -942,7 +1634,7 @@ export class AgentManager {
             const relFilePath = toRel(media.file_path);
 
             log(`[DEBUG] media.type=${media.type} image_path=${JSON.stringify(relImagePath)} file_path=${JSON.stringify(relFilePath)}`);
-            let formatted: string;
+            let formatted: DaemonInjection;
             if (media.type === 'photo') {
               formatted = FastChecker.formatTelegramPhotoMessage(from, effectiveChatId, media.text, relImagePath, replyToText);
             } else if (media.type === 'document') {
@@ -954,7 +1646,7 @@ export class AgentManager {
               formatted = FastChecker.formatTelegramVideoMessage(from, effectiveChatId, media.text, relFilePath, media.file_name || '', media.duration, replyToText);
             }
 
-            if (checker.isDuplicate(formatted)) {
+            if (checker.isDuplicate(renderDaemonInjection(formatted))) {
               log('Duplicate Telegram media message suppressed');
               return;
             }
@@ -964,7 +1656,7 @@ export class AgentManager {
             log(`Media processing error: ${err} - falling back to text format`);
             const text = stripControlChars(msg.caption || '');
             const formatted = FastChecker.formatTelegramTextMessage(from, effectiveChatId, text, this.frameworkRoot, replyToText);
-            if (!checker.isDuplicate(formatted)) checker.queueTelegramMessage(formatted);
+            if (!checker.isDuplicate(renderDaemonInjection(formatted))) checker.queueTelegramMessage(formatted);
           });
           return;
         }
@@ -984,7 +1676,7 @@ export class AgentManager {
           recentHistory,
         );
 
-        if (checker.isDuplicate(formatted)) {
+        if (checker.isDuplicate(renderDaemonInjection(formatted))) {
           log('Duplicate Telegram message suppressed');
           return;
         }
@@ -1039,7 +1731,7 @@ export class AgentManager {
           reaction.old_reaction ?? [],
           reaction.new_reaction ?? [],
         );
-        if (checker.isDuplicate(formatted)) {
+        if (checker.isDuplicate(renderDaemonInjection(formatted))) {
           log('Duplicate Telegram reaction suppressed');
           return;
         }
@@ -1130,6 +1822,60 @@ export class AgentManager {
       // is always non-empty.
       await this.maybeStartActivityChannelPoller(name, resolvedOrg, agentDir, log);
     }
+
+    try {
+      await this.maybeRegisterBuzzAgent(name, resolvedOrg, agentDir, log);
+    } catch (err) {
+      log(`Buzz registration failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  private async maybeRegisterBuzzAgent(name: string, org: string, agentDir: string, log: LogFn): Promise<void> {
+    const config = loadBuzzConfig(agentDir);
+    if (!config) return;
+    const relayUrl = config.relay_url || process.env.BUZZ_RELAY_URL;
+    if (!relayUrl) {
+      log('Buzz configured but no injected relay URL is available; skipping');
+      return;
+    }
+
+    let entry = this.buzzClients.get(org);
+    if (!entry) {
+      const dispatcher = new BuzzDispatcher();
+      const client = new BuzzRelayClient(relayUrl, config.secret_key, (message) => log(`[buzz] ${message}`));
+      client.onMessage(async (channelId: string, event: NostrEvent) => {
+        await dispatcher.deliver(channelId, event, (target) => {
+          const targetOrg = this.resolveAgentOrg(target.agentName, org);
+          const targetPaths = resolvePaths(target.agentName, this.instanceId, targetOrg);
+          return sendMessage(targetPaths, 'daemon', target.agentName, 'normal', formatBuzzInboxMessage(target));
+        }, (message) => log(`[buzz] ${message}`));
+      });
+      entry = {
+        client,
+        dispatcher,
+        relayUrl,
+        authPubkey: config.pubkey.toLowerCase(),
+        started: false,
+      };
+      this.buzzClients.set(org, entry);
+    } else if (entry.relayUrl !== relayUrl) {
+      throw new Error(`org ${org} Buzz relay URL conflicts with the existing shared connection`);
+    } else if (entry.authPubkey !== config.pubkey.toLowerCase()) {
+      throw new Error(`org ${org} Buzz auth identity conflicts with the existing shared connection`);
+    }
+
+    entry.dispatcher.register(name, config);
+    entry.client.subscribeChannels(entry.dispatcher.allChannels());
+    const agentEntry = this.agents.get(name);
+    if (agentEntry) agentEntry.buzzOrg = org;
+
+    if (!entry.started) {
+      entry.started = true;
+      entry.client.start().catch((err) => {
+        log(`Buzz relay client wrapper crashed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+      });
+    }
+    log(`Buzz registered for org ${org} (channels: ${config.channels.join(', ') || 'none'})`);
   }
 
   /**
@@ -1257,7 +2003,8 @@ export class AgentManager {
   /**
    * Stop a specific agent.
    */
-  async stopAgent(name: string): Promise<void> {
+  async stopAgent(name: string, userInitiated = false, lifecycleInternal = false): Promise<void> {
+    if (userInitiated && !lifecycleInternal) this.deferredLifecycle?.stop(name);
     const entry = this.agents.get(name);
     if (!entry) {
       console.log(`[agent-manager] Agent ${name} not found`);
@@ -1267,10 +2014,13 @@ export class AgentManager {
     if (entry.poller) entry.poller.stop();
     if (entry.activityPoller) entry.activityPoller.stop();
     if (entry.slackListener) entry.slackListener.stop();
+    if (entry.buzzOrg) this.buzzClients.get(entry.buzzOrg)?.dispatcher.unregister(name);
+    releaseSlackAppTokens(this.slackAppTokenOwners, name);
     this.cronNoopDetector.cancelAgentVerifications(name);
     entry.checker.stop();
     await entry.process.stop();
-    this.agents.delete(name);
+    entry.stopped = true;
+    if (this.stillMapped(name, entry)) this.agents.delete(name);
 
     // Stop and remove the agent's cron scheduler (if one was wired)
     const scheduler = this.cronSchedulers.get(name);
@@ -1279,12 +2029,37 @@ export class AgentManager {
       this.cronSchedulers.delete(name);
     }
 
+    if (userInitiated) {
+      if (this.pendingRestarts.delete(name)) {
+        console.log(`[agent-manager] Dropped queued restart for ${name} — explicit user stop/disable wins.`);
+      }
+      return;
+    }
+
     // BUG-031: honor any restart that was queued while we were stopping.
     // After PR #11 (BUG-011 fix) this branch should never fire — see the
     // matching warning comment in startAgent(). The honor logic is preserved
     // as a safety net in case BUG-011 regresses; the warn line tells us
     // immediately if it ever does.
-    if (this.pendingRestarts.has(name)) {
+    const pendingRestart = this.pendingRestarts.get(name);
+    if (pendingRestart) {
+      const consumeDerivedCause = this.pendingRestartCause();
+      this.emitPendingRestartEvent(
+        name,
+        'pending_restart_consumed',
+        'consume',
+        pendingRestart,
+        consumeDerivedCause,
+      );
+      if (pendingRestart.cause !== consumeDerivedCause) {
+        this.emitPendingRestartEvent(
+          name,
+          'pending_restart_cause_disagreement',
+          'consume',
+          pendingRestart,
+          consumeDerivedCause,
+        );
+      }
       if (this.daemonJustCrashed) {
         console.log(`[agent-manager] pendingRestarts fired for ${name} (post-crash safety net, expected). Honoring queued restart.`);
       } else {
@@ -1292,7 +2067,7 @@ export class AgentManager {
       }
       this.pendingRestarts.delete(name);
       console.log(`[agent-manager] Honoring queued restart for ${name}`);
-      this.startAgent(name, '').catch(err =>
+      this.admitStartAgent(name, '').catch(err =>
         console.error(`[agent-manager] Queued restart failed for ${name}:`, err),
       );
     }
@@ -1310,30 +2085,35 @@ export class AgentManager {
    * Participates in the pendingRestarts race protection used by restart-all.
    */
   async restartAgent(name: string, options: AgentRestartOptions = {}): Promise<void> {
-    if (options.partOfFleetStart && !this.fleetStartBatch) {
-      // `soft-restart-all` restarts child agent sessions only. The daemon and
-      // this AgentManager instance are not part of that restart set, so this
-      // in-memory coordinator persists until every requested child settles.
-      this.beginFleetStartBatch(options.fleetTotal ?? 1, 'restart-all');
-    }
-    if (!this.agents.has(name)) {
-      console.log(`[agent-manager] Agent ${name} not found — cannot restart`);
-      if (options.partOfFleetStart) {
-        this.recordFleetStartAgent(name);
-        this.finishFleetStartBatch();
-      }
-      return;
-    }
-    console.log(`[agent-manager] Restarting ${name}`);
+    this.inFlightRestarts.add(name);
     try {
-      await this.stopAgent(name);
-      await this.startAgent(name, '', undefined, undefined, { partOfFleetStart: options.partOfFleetStart });
-      console.log(`[agent-manager] Restart complete for ${name}`);
-    } finally {
-      if (options.partOfFleetStart) {
-        this.recordFleetStartAgent(name);
-        this.finishFleetStartBatch();
+      if (options.partOfFleetStart && !this.fleetStartBatch) {
+        // `soft-restart-all` restarts child agent sessions only. The daemon and
+        // this AgentManager instance are not part of that restart set, so this
+        // in-memory coordinator persists until every requested child settles.
+        this.beginFleetStartBatch(options.fleetTotal ?? 1, 'restart-all');
       }
+      if (!this.agents.has(name)) {
+        console.log(`[agent-manager] Agent ${name} not found — cannot restart`);
+        if (options.partOfFleetStart) {
+          this.recordFleetStartAgent(name);
+          this.finishFleetStartBatch();
+        }
+        return;
+      }
+      console.log(`[agent-manager] Restarting ${name}`);
+      try {
+        await this.stopAgent(name);
+        await this.startAgent(name, '', undefined, undefined, { partOfFleetStart: options.partOfFleetStart });
+        console.log(`[agent-manager] Restart complete for ${name}`);
+      } finally {
+        if (options.partOfFleetStart) {
+          this.recordFleetStartAgent(name);
+          this.finishFleetStartBatch();
+        }
+      }
+    } finally {
+      this.inFlightRestarts.delete(name);
     }
   }
 
@@ -1352,6 +2132,14 @@ export class AgentManager {
    * time `pty.kill()` runs, every agent already has its marker on disk.
    */
   async stopAll(): Promise<void> {
+    try {
+      await this.deferredLifecycle?.shutdown();
+    } catch (err) {
+      // Deferred cleanup is best-effort at daemon shutdown. Continue through
+      // marker publication and every ordinary agent stop so one failed reap
+      // cannot orphan the entire fleet or manufacture crash alerts.
+      console.error('[agent-manager] Deferred shutdown cleanup failed:', err);
+    }
     const names = [...this.agents.keys()];
 
     for (const name of names) {
@@ -1374,6 +2162,12 @@ export class AgentManager {
         console.error(`[agent-manager] Error stopping ${name}:`, err);
       }
     }
+    for (const [org, entry] of this.buzzClients) {
+      try { entry.client.stop(); } catch (err) {
+        console.error(`[agent-manager] Error stopping Buzz relay client for org ${org}:`, err);
+      }
+    }
+    this.buzzClients.clear();
   }
 
   /**
@@ -1423,8 +2217,27 @@ export class AgentManager {
    * Spawn an ephemeral worker session for a parallelized task.
    */
   async spawnWorker(name: string, dir: string, prompt: string, parent?: string, model?: string): Promise<void> {
-    if (this.workers.has(name)) {
-      throw new Error(`Worker "${name}" is already running`);
+    // Worker admission has two independent retained-credential gates and BOTH
+    // must clear. The in-process tombstone owns the exact nonce/generation from
+    // this daemon and lifts only when that exact revoke succeeds. After restart,
+    // boot quarantine owns any durable records it could not revoke and lifts only
+    // when the name-wide boot retry succeeds. Either source may exist alone; a
+    // success from one never overrides a refusal from the other.
+    const existing = this.workers.get(name);
+    if (existing) {
+      if (existing.getStatus().status !== 'revoke-failed') {
+        throw new Error(`Worker "${name}" is already running`);
+      }
+      if (!existing.retryRetainedSessionRevocation()) {
+        throw new Error(`Worker "${name}" cannot start: SESSION REVOCATION UNKNOWN`);
+      }
+      this.workers.delete(name);
+    }
+    // A daemon restart loses the in-memory tombstone, but boot reconstructs the
+    // same name-level gate as a session quarantine when its durable record cannot
+    // be revoked. Repairing the storage condition makes this retry self-lifting.
+    if (!retrySessionRevocation(this.ctxRoot, name)) {
+      throw new Error(`Worker "${name}" cannot start: ${sessionQuarantineReason(name)}`);
     }
     if (this.agents.has(name)) {
       throw new Error(`"${name}" is already a registered agent name`);
@@ -1458,7 +2271,8 @@ export class AgentManager {
       // Auto-remove finished workers after a short delay so list-workers
       // can still show the final status briefly before cleanup
       setTimeout(() => {
-        if (this.workers.get(workerName)?.isFinished()) {
+        const current = this.workers.get(workerName);
+        if (current?.isFinished() && current.getStatus().status !== 'revoke-failed') {
           this.workers.delete(workerName);
         }
       }, 30_000); // keep for 30s after exit
@@ -1476,7 +2290,9 @@ export class AgentManager {
       throw new Error(`Worker "${name}" not found`);
     }
     await worker.terminate();
-    this.workers.delete(name);
+    if (worker.getStatus().status !== 'revoke-failed') {
+      this.workers.delete(name);
+    }
   }
 
   /**
@@ -1493,24 +2309,258 @@ export class AgentManager {
    * Used by `cortextos bus test-cron-fire` to fire a cron immediately for testing.
    * Returns true if the agent is running and the inject succeeded; false otherwise.
    */
-  injectAgent(agentName: string, text: string): boolean {
-    return this.injectAgentDetailed(agentName, text).ok;
+  injectAgent(agentName: string, input: string | DaemonInjection): boolean {
+    return this.injectAgentDetailed(agentName, input).ok;
   }
 
   /**
    * Inject text into an agent's PTY with structured outcome — issue #346.
    *
    * Returns NOT_FOUND if the agent isn't in the registry, NOT_RUNNING if
-   * registered but the PTY is gone, DEDUPED on a MessageDedup hash hit. The
+   * registered but the PTY is gone, DEDUPED on a MessageDedup hash hit, and
+   * ADMISSION_FAILED if the runtime could not durably take custody. The
    * boolean-returning `injectAgent()` is preserved for callers (cron
    * scheduler, fast-checker, fire-cron) that only need pass/fail.
    */
-  injectAgentDetailed(agentName: string, text: string): { ok: true } | { ok: false; code: 'NOT_FOUND' | 'NOT_RUNNING' | 'DEDUPED'; message: string } {
+  injectAgentDetailed(
+    agentName: string,
+    input: string | DaemonInjection,
+    options?: AgentInjectionOptions,
+  ): AgentInjectionResult | { ok: false; code: 'NOT_FOUND'; message: string } {
     const entry = this.agents.get(agentName);
     if (!entry) {
       return { ok: false, code: 'NOT_FOUND', message: `agent "${agentName}" not in registry` };
     }
-    return entry.process.injectMessageDetailed(text);
+    return entry.process.injectMessageDetailed(
+      typeof input === 'string' ? rawDaemonInjection(input) : input,
+      options,
+    );
+  }
+
+  /**
+   * Telemetry for the side-run path. Every event carries the cron and the fire
+   * it belongs to; fallback events additionally carry a REASON.
+   *
+   * Six distinct fallback reasons are only worth having if they reach a log
+   * someone can count — an invisible fallback means routing looks successful
+   * while quietly doing nothing, which is the failure this path must not create.
+   */
+  private logSideRunEvent(agentName: string, event: string, meta: Record<string, unknown>): void {
+    try {
+      const org = this.resolveAgentOrg(agentName);
+      const paths = resolvePaths(agentName, this.instanceId, org);
+      logEvent(paths, agentName, org || '', 'action', event, 'info', { agent: agentName, ...meta });
+    } catch (err) {
+      console.log(`[daemon] side-run telemetry failed for ${agentName} (non-fatal): ${err}`);
+    }
+  }
+
+  /**
+   * Re-check outstanding side-run outcome slots. Called from the cron
+   * scheduler's existing tick, never awaited inside a fire.
+   *
+   * Every terminal verdict clears its slot, so a slot can only produce one
+   * action: the escalation path is idempotent because a redelivery finds
+   * nothing left to act on.
+   */
+  private sweepSideRunsForAgent(agentName: string, nowMs: number): void {
+    let stateDir: string;
+    try {
+      const org = this.resolveAgentOrg(agentName);
+      stateDir = resolvePaths(agentName, this.instanceId, org).stateDir;
+    } catch {
+      return;
+    }
+
+    for (const action of sweepSideRuns(stateDir, nowMs)) {
+      const { slotName, admissionId, cronName, verdict, cronPrompt, continuationPrompt } = action;
+      try {
+        if (verdict.action === 'done') {
+          this.logSideRunEvent(agentName, 'cron_side_run_clean', {
+            cron: cronName, fired_at: admissionId,
+          });
+        } else if (verdict.action === 'escalate') {
+          // Judgment belongs to the main session. The side-run only decided
+          // that judgment is required.
+          //
+          // For a handoff-shaped cron the summary alone is not enough: it says
+          // what was collected, never what the session still owes. The directive
+          // travels in the slot from admission, so it is delivered here rather
+          // than reconstructed.
+          this.injectAgent(agentName, buildEscalationInjection({
+            cronName, summary: verdict.summary, continuationPrompt,
+          }));
+          this.logSideRunEvent(agentName, 'cron_side_run_escalated', {
+            cron: cronName, fired_at: admissionId,
+          });
+        } else {
+          // Fall back to exactly what would have happened without side-runs.
+          // The prompt was frozen in the admission slot. Looking up the current
+          // scheduler definition here lets an edit or delete rewrite an already
+          // admitted fire during its deadline.
+          const injected = typeof cronPrompt === 'string'
+            && cronPrompt.length > 0
+            && this.injectAgent(agentName, cronPrompt);
+          this.logSideRunEvent(agentName, 'cron_side_run_fallback', {
+            cron: cronName,
+            fired_at: admissionId,
+            reason: verdict.reason,
+            injected,
+          });
+        }
+      } finally {
+        // Cleared even if the injection threw: a slot left behind would be
+        // re-actioned on the next tick, turning one missed fire into a loop.
+        clearObservedSlot(stateDir, slotName);
+      }
+    }
+  }
+
+  /**
+   * Inject a daemon-owned cron fire with structured Codex routing metadata.
+   * Prompt text is never parsed by the PTY as routing authority.
+   */
+  injectCronAgent(
+    agentName: string,
+    cron: Pick<CronDefinition, 'name' | 'prompt'>,
+    input: string | DaemonInjection,
+    firedAt = new Date().toISOString(),
+  ): boolean {
+    const entry = this.agents.get(agentName);
+    if (!entry) return false;
+    const config = entry.process.getConfig();
+
+    // Claude-side cheap-model side-run. Mutually exclusive with the codex route
+    // below (that requires runtime codex-app-server, this requires claude-code).
+    //
+    // Returning true here means ADMITTED, not COMPLETE: the chore runs headless
+    // and the scheduler's tick sweep decides what its outcome means. A side-run
+    // that never answers falls back to normal injection at its deadline, so this
+    // branch cannot silently skip a check.
+    // Resolve the agent directory defensively. This whole branch sits IN FRONT OF
+    // the ordinary cron path, so anything it can throw becomes a cron fire that
+    // never happens — the exact failure the side-run design exists to prevent,
+    // relocated into its own entry check. An unavailable agent dir means "cannot
+    // verify the pinned instruction file", which means do not route.
+    let sideAgentDir: string | undefined;
+    try {
+      const getDir = (entry.process as { getAgentDir?: () => string }).getAgentDir;
+      sideAgentDir = typeof getDir === 'function' ? getDir.call(entry.process) : undefined;
+    } catch {
+      sideAgentDir = undefined;
+    }
+
+    let sidePlan: ReturnType<typeof resolveSideRunRouting> = null;
+    try {
+      const resolution = resolveSideRunResolution({
+        cron,
+        runtime: config.runtime,
+        admissionId: firedAt,
+        agent: agentName,
+        agentDir: sideAgentDir,
+        registry: this.sideRunRegistry,
+      });
+      sidePlan = resolution.plan;
+      // A decline used to be SILENT. Routing could switch itself off fleet-wide
+      // and the only evidence was the shape of the prompt someone noticed
+      // (2026-08-09). Counted only for CANDIDATES — crons whose name is in the
+      // registry and therefore SHOULD route — so the event means "something that
+      // should have routed did not", never "an ordinary cron ran normally".
+      if (!resolution.plan && resolution.candidate && resolution.reason) {
+        this.logSideRunEvent(agentName, 'cron_side_run_declined', {
+          cron: cron.name,
+          fired_at: firedAt,
+          reason: resolution.reason,
+        });
+      }
+    } catch (err) {
+      console.log(`[daemon] side-run routing check failed for ${agentName}/${cron.name}, using main session: ${err}`);
+      sidePlan = null;
+    }
+    if (sidePlan) {
+      try {
+        const org = this.resolveAgentOrg(agentName);
+        const stateDir = resolvePaths(agentName, this.instanceId, org).stateDir;
+        const pending: SideRunPending = {
+          admissionId: sidePlan.admissionId,
+          cronName: cron.name,
+          agent: agentName,
+          admittedAtMs: Date.parse(firedAt) || Date.now(),
+          deadlineMs: sidePlan.deadlineMs,
+          cronPrompt: cron.prompt ?? (typeof input === 'string' ? input : cron.prompt ?? ''),
+          sideRunPrompt: sidePlan.prompt,
+          continuationPrompt: sidePlan.continuationPrompt,
+        };
+        // Slot first, then spawn. If the spawn dies instantly the slot still
+        // exists and the sweep converts it to a fallback; spawning first would
+        // leave a fire with no record that it was ever admitted.
+        writePendingSlot(stateDir, pending);
+        startSideRun(stateDir, sideAgentDir ?? this.frameworkRoot, sidePlan, pending);
+        this.logSideRunEvent(agentName, 'cron_side_run_started', {
+          cron: cron.name,
+          fired_at: firedAt,
+          model: sidePlan.routing.model,
+          prompt_sha256: sidePlan.routing.promptSha256,
+        });
+        // `true` here means ADMITTED, not COMPLETE. The scheduler reads it as
+        // fired, which is correct ONLY because the tick sweep guarantees either a
+        // later injection or a counted fallback for this admission id. If that
+        // guarantee ever breaks, this fire is silently lost.
+        return true;
+      } catch (err) {
+        // Any failure here falls through to normal injection below. The chore
+        // still runs; it just costs what it costs today.
+        console.log(`[daemon] side-run admission failed for ${agentName}/${cron.name}, using main session: ${err}`);
+      }
+    }
+
+    const plan = resolveCodexCronRouting({
+      cron,
+      frameworkRoot: this.frameworkRoot,
+      runtime: config.runtime,
+      configuredModel: config.model,
+    });
+    const dedupIdentity = `daemon-cron:${cron.name}:${firedAt}`;
+    const result = this.injectAgentDetailed(
+      agentName,
+      plan?.preflightPrompt !== undefined
+        ? rawDaemonInjection(plan.preflightPrompt)
+        : (typeof input === 'string' ? rawDaemonInjection(input) : input),
+      plan ? {
+        codexRouting: plan.routing,
+        codexContinuation: plan.continuationPrompt,
+        codexFallback: plan.fallbackPrompt,
+        dedupIdentity,
+      } : undefined,
+    );
+    if (!result.ok) {
+      // A scheduler retry for the same admitted fire is idempotent success:
+      // MessageDedup proves the sequence already crossed admission. Do not
+      // emit a second route-planned event, but let the scheduler close fired.
+      if (result.code === 'DEDUPED' && plan && result.dedupIdentity === dedupIdentity) return true;
+      return false;
+    }
+
+    if (plan) {
+      const { routing } = plan;
+      try {
+        const resolvedOrg = this.resolveAgentOrg(agentName);
+        const paths = resolvePaths(agentName, this.instanceId, resolvedOrg);
+        logEvent(paths, agentName, resolvedOrg || '', 'action', 'cron_model_route_planned', 'info', {
+          agent: agentName,
+          cron: cron.name,
+          fired_at: firedAt,
+          model: routing.model,
+          reason: routing.reason,
+          skill_name: routing.skillName ?? null,
+          requested_model: routing.requestedModel ?? null,
+          requested_effort: routing.effort ?? null,
+        });
+      } catch (err) {
+        console.log(`[daemon] cron model route telemetry failed for ${agentName}/${cron.name} (non-fatal): ${err}`);
+      }
+    }
+    return true;
   }
 
   /**
@@ -1584,65 +2634,17 @@ export class AgentManager {
       return;
     }
 
-    const onFire = async (cron: CronDefinition): Promise<void> => {
-      const prompt = cron.prompt ?? `[cron] ${cron.name} fired`;
+    const onFire = (cron: CronDefinition, context: CronFireContext) =>
+      this.handleAgentCronFire(agentName, cron, context);
 
-      // Shift gate (RFC your org internal docs §4).
-      // When the agent is off-shift, drop the cron fire silently and emit a
-      // cron_suppressed_off_shift event for telemetry. Crons with
-      // wake_on_fire=true bypass this gate (see CronDefinition.wake_on_fire).
-      const suppression = this.evaluateCronShiftSuppression(agentName, cron);
-      if (suppression) {
-        console.log(`[daemon] cron suppressed off-shift for ${agentName}: ${cron.name} (mode=${suppression.mode})`);
-        try {
-          // F4 fix (BUG-043 class): resolve the agent's true org instead of
-          // the daemon's startup org, so suppression events land in the
-          // correct org's event log on multi-org installs.
-          const resolvedOrg = this.resolveAgentOrg(agentName);
-          const paths = resolvePaths(agentName, this.instanceId, resolvedOrg);
-          logEvent(paths, agentName, resolvedOrg || '', 'action', 'cron_suppressed_off_shift', 'info', {
-            agent: agentName,
-            cron: cron.name,
-            mode: suppression.mode,
-            path: 'daemon_cron_fire',
-          });
-        } catch (err) {
-          console.log(`[daemon] logEvent failed for cron-suppressed (non-fatal): ${err}`);
-        }
-        return;
-      }
-
-      // Salt with the fire timestamp so MessageDedup (which hashes the last 100
-      // injects) does not reject identical cron prompts on subsequent fires.
-      // Without the salt, every recurring cron after its first fire would be
-      // dedup-rejected and treated as a dispatch failure.
-      const firedAt = new Date().toISOString();
-      const injection = `[CRON FIRED ${firedAt}] ${cron.name}: ${prompt}`;
-      const injected = this.injectAgent(agentName, injection);
-      if (!injected) {
-        throw new Error(`injectAgent returned false for agent "${agentName}" — agent may not be running`);
-      }
-      try {
-        const entry = this.agents.get(agentName);
-        const config = entry?.process.getConfig();
-        if (entry && config) {
-          this.cronNoopDetector.registerFire({
-            agentName,
-            agentDir: entry.process.getAgentDir(),
-            config,
-            cronName: cron.name,
-            prompt,
-            firedAt,
-          });
-        }
-      } catch (err) {
-        console.log(`[cron-noop-detector] register failed for ${agentName}/${cron.name} (non-fatal): ${err}`);
-      }
-    };
-
+    const config = entry.process.getConfig();
     const scheduler = new CronScheduler({
       agentName,
+      timezone: configuredTimezone(config.timezone),
       onFire,
+      // Rides the existing 30s tick so side-run outcomes are re-checked without
+      // a new timer and without blocking a fire slot.
+      onTick: (nowMs) => this.sweepSideRunsForAgent(agentName, nowMs),
       logger: (msg) => console.log(`[daemon] ${msg}`),
     });
 
@@ -1668,13 +2670,28 @@ export class AgentManager {
     agentName: string,
     cron: CronDefinition
   ): { mode: 'no_wake' | 'emergency_only_no_tag' } | null {
+    // Tier 1 — unconditional pierce. Blunt on purpose: fires through every
+    // suppression window, emits no suppression telemetry.
     if (cron.wake_on_fire) return null;
 
     const agentEntry = this.agents.get(agentName);
     const agentConfig = agentEntry?.process['config'] as AgentConfig | undefined;
     if (!agentConfig) return null;
 
-    const tz = agentConfig.timezone || 'America/New_York';
+    // Tier 2 — conditional wake by declared emergency CLASS.
+    //
+    // Added 2026-08-10 after the Greenwood/TDL50WP post-mortem. The agent's
+    // `off_shift_can_wake_for` list had been written by a human, read correctly
+    // to a human, and was consulted by NOTHING: an emergency check-back fired at
+    // 02:00:29Z, was suppressed off-shift, and never reached the agent. A flood
+    // would have been suppressed identically.
+    //
+    // A boolean could not express "flood wakes this agent, a routine sweep does
+    // not" — hence a class matched against the agent's own list, which makes the
+    // configuration the author already wrote actually govern behaviour.
+    if (cronWakesForEmergencyClass(cron, agentConfig)) return null;
+
+    const tz = configuredOrHostTimezone(agentConfig.timezone);
     const ev = evaluateShift(new Date(), agentConfig.shift_schedule, tz);
     if (ev.off_shift_no_wake) return { mode: 'no_wake' };
     if (ev.off_shift_emergency_only) return { mode: 'emergency_only_no_tag' };
@@ -1710,88 +2727,7 @@ export class AgentManager {
    * lookups via `resolveAgentOrg()`.
    */
   private discoverAgents(): Array<{ name: string; dir: string; org: string; config: AgentConfig }> {
-    const agents: Array<{ name: string; dir: string; org: string; config: AgentConfig }> = [];
-
-    const orgsBase = join(this.frameworkRoot, 'orgs');
-    if (!existsSync(orgsBase)) return agents;
-
-    let orgNames: string[] = [];
-    try {
-      orgNames = readdirSync(orgsBase, { withFileTypes: true })
-        .filter(d => d.isDirectory())
-        .map(d => d.name);
-    } catch {
-      return agents; // unreadable orgs dir — treat as empty
-    }
-
-    for (const org of orgNames) {
-      const agentsBase = join(orgsBase, org, 'agents');
-      if (!existsSync(agentsBase)) continue;
-
-      try {
-        const dirs = readdirSync(agentsBase, { withFileTypes: true })
-          .filter(d => d.isDirectory())
-          // Skip non-agent reserved dirs: leading `_` (e.g. _shared/ shared-utility)
-          // and leading `.` (hidden / VCS / OS metadata). Treating these as agents
-          // makes the daemon spawn a Claude session with no .env, which then falls
-          // through to operator-cred discovery and sends Telegram from a phantom
-          // agent identity (see _shared rogue-spawn incident 2026-05-10).
-          .filter(d => !d.name.startsWith('_') && !d.name.startsWith('.'))
-          .map(d => d.name);
-
-        for (const name of dirs) {
-          const dir = join(agentsBase, name);
-          const config = this.loadAgentConfig(dir);
-          agents.push({ name, dir, org, config });
-        }
-      } catch {
-        // Ignore read errors for this org — continue scanning others
-      }
-    }
-
-    return agents;
-  }
-
-  /**
-   * Load agent config from config.json.
-   *
-   * On parse error: log a clear, operator-actionable error to stderr (file path,
-   * SyntaxError message, and a 1-line offending-snippet hint when locatable) and
-   * fall back to default config so the daemon does not hard-crash. Without this
-   * surfacing, a trailing comma in config.json silently degrades the agent into
-   * a "model not available" state because the model field is missing — see #345.
-   */
-  private loadAgentConfig(agentDir: string): AgentConfig {
-    const configPath = join(agentDir, 'config.json');
-    if (!existsSync(configPath)) return {};
-    let raw: string;
-    try {
-      raw = readFileSync(configPath, 'utf-8');
-    } catch (err) {
-      console.error(`[agent-manager] config read failed: ${configPath}: ${(err as Error).message}`);
-      return {};
-    }
-    try {
-      return JSON.parse(raw);
-    } catch (err) {
-      const msg = (err as SyntaxError).message;
-      // Best-effort line/column extraction from V8 SyntaxError messages.
-      // V8 emits "Unexpected token ... in JSON at position N" — we resolve
-      // N back to a 1-indexed line/column so operators can jump to the offender.
-      const posMatch = /position (\d+)/.exec(msg);
-      let locHint = '';
-      if (posMatch) {
-        const pos = Math.min(Number(posMatch[1]), raw.length);
-        const before = raw.slice(0, pos);
-        const line = before.split('\n').length;
-        const col = pos - (before.lastIndexOf('\n') + 1) + 1;
-        const offendingLine = raw.split('\n')[line - 1] || '';
-        locHint = ` (line ${line}, col ${col}: \`${offendingLine.trim().slice(0, 80)}\`)`;
-      }
-      console.error(`[agent-manager] config.json invalid JSON: ${configPath}${locHint}: ${msg}`);
-      console.error(`[agent-manager] hint: trailing commas, unquoted keys, and single quotes are common causes`);
-      return {};
-    }
+    return discoverSourceAgentCandidates(this.frameworkRoot);
   }
 }
 

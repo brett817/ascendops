@@ -1,18 +1,28 @@
 import { appendFileSync, existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'fs';
-import { join, sep } from 'path';
+import { join } from 'path';
 import { homedir } from 'os';
 import { execFileSync } from 'child_process';
 import type { AgentConfig, AgentStatus, CtxEnv } from '../types/index.js';
 import { AgentPTY } from '../pty/agent-pty.js';
-import { CodexAppServerPTY } from '../pty/codex-app-server-pty.js';
+import { CodexAppServerPTY, type CodexTurnRouting } from '../pty/codex-app-server-pty.js';
 import { HermesPTY, hermesDbExists } from '../pty/hermes-pty.js';
 import { OpencodePTY, opencodeSessionExists } from '../pty/opencode-pty.js';
 import { MessageDedup, injectMessage as injectMessageIntoPty } from '../pty/inject.js';
+import type { TuiKey } from '../pty/inject.js';
 import type { TelegramAPI } from '../telegram/api.js';
 import { ensureDir } from '../utils/atomic.js';
-import { writeCortextosEnv } from '../utils/env.js';
+import { writeCortextosEnv, parseEnvFile } from '../utils/env.js';
 import { getOverdueReminders } from '../bus/reminders.js';
 import { resolvePaths } from '../utils/paths.js';
+import { resolveClaudeProjectDir } from '../utils/claude-project-dir.js';
+import { renderDaemonInjection } from '../utils/validate.js';
+import type { DaemonInjection } from '../utils/validate.js';
+import { clearSessionNonce } from '../bus/heartbeat-session-store.js';
+import {
+  quarantineAgentForUnrevokedSession,
+  retrySessionRevocation,
+  sessionQuarantineReason,
+} from './session-revocation-quarantine.js';
 import {
   findGitRoot,
   recordFailure,
@@ -22,7 +32,46 @@ import {
   MIN_HEALTHY_SECONDS,
 } from './watchdog.js';
 type LogFn = (msg: string) => void;
-type StartOptions = { partOfFleetStart?: boolean };
+// BUG-032 established that this exact question -- has the child actually
+// finished exiting? -- needs the empirically stable PTY shutdown budget:
+// 1s after graceful interruption, then 5s after forced termination. The old
+// 3s exit wait caused observed SIGHUP/exit-129 flakiness in production.
+export const RECOVERED_CHILD_GRACEFUL_EXIT_MS = 1_000;
+export const RECOVERED_CHILD_FORCED_EXIT_MS = 5_000;
+function isChildAlive(childPid: number): boolean {
+  try {
+    process.kill(childPid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+type StartOptions = {
+  partOfFleetStart?: boolean;
+  /** Durable deferred-child binding gate; resolves before status can be running. */
+  beforeOnline?(pid: number): Promise<void>;
+};
+type ManagedAgentPTY = (AgentPTY | CodexAppServerPTY) & {
+  /** The nonce minted by this lifecycle, or null for runtimes that never mint. */
+  sessionNonce(): string | null;
+};
+export interface AgentInjectionOptions {
+  codexRouting?: CodexTurnRouting;
+  codexContinuation?: string;
+  codexFallback?: string;
+  /** Daemon-owned identity for deduping structured injections without altering prompt bytes. */
+  dedupIdentity?: string;
+}
+
+export type AgentInjectionResult =
+  | { ok: true }
+  | {
+      ok: false;
+      code: 'NOT_RUNNING' | 'DEDUPED' | 'ADMISSION_FAILED';
+      message: string;
+      /** Present only when the duplicate is the same daemon-owned structured identity. */
+      dedupIdentity?: string;
+    };
 
 /**
  * Manages a single agent's lifecycle.
@@ -32,7 +81,7 @@ export class AgentProcess {
   readonly name: string;
   private env: CtxEnv;
   private config: AgentConfig;
-  private pty: AgentPTY | CodexAppServerPTY | null = null;
+  private pty: ManagedAgentPTY | null = null;
   private sessionTimer: ReturnType<typeof setTimeout> | null = null;
   private crashCount: number = 0;
   private maxCrashesPerDay: number = 10;
@@ -45,6 +94,19 @@ export class AgentProcess {
   private sessionStart: Date | null = null;
   private status: AgentStatus['status'] = 'stopped';
   private stopping: boolean = false;
+  private startPromise: Promise<void> | null = null;
+  /** The nonce the PTY minted for this lifecycle; only this lifecycle may clear it. */
+  // {generation, nonce}, not a bare nonce. A bare cached nonce never rotated:
+  // start A captured A, stop cleared A's FILE but left the FIELD set, start B
+  // published B, and the capture then refused to replace the cached A — so B's
+  // record was never owned by anything and survived every later exit. Durable
+  // stale credential after every second lifecycle. This is the worker lost-update
+  // bug rediscovered in the agent path, and it takes the same fix: the identity
+  // travels with the clear, and a lifecycle may only revoke its own capability.
+  private mintedSession: { generation: number; nonce: string } | null = null;
+  private stopInFlight: Promise<void> | null = null;
+  private deathUnconfirmedPid: number | null = null;
+  private sessionRefreshPromise: Promise<void> | null = null;
   // BUG-040 fix: persists across stop() return until handleExit clears it.
   // Required because BUG-032's CRLF + 5s wait can cause graceful shutdown to
   // exceed the 5s Promise.race timeout in stop(), which would otherwise reset
@@ -61,6 +123,8 @@ export class AgentProcess {
   // from an old PTY can race past stopRequested and trigger crash recovery on
   // the new agent.
   private lifecycleGeneration: number = 0;
+  /** Invalidates a start that is still waiting in startup_delay. */
+  private startAdmissionGeneration: number = 0;
   // BUG-011 fix: stop() awaits this promise (resolved by the onExit handler in start())
   // to guarantee the PTY exit has fired before stopping=false is reset. Without
   // this, the exit handler can fire after stopping=false and trigger spurious
@@ -86,6 +150,17 @@ export class AgentProcess {
   // a handoff doc marker. start() reads this after spawn to decide whether the
   // daemon should fire runtime-owned lifecycle Telegram directly.
   private lastSpawnWasHandoff = false;
+  // Wall-clock signal for the most recent successful daemon-owned
+  // injection. FastChecker compares this with the Stop hook's idle timestamp
+  // to distinguish an open turn from an idle session.
+  private lastInjectedAt: number = 0;
+  /** PTY-less child adopted from a durable deferred-spawn receipt after daemon restart. */
+  private adoptedExternal: {
+    pid: number;
+    kernelIdentity: string;
+    observeIdentity(pid: number): string;
+    terminate(pid: number, signal: 'SIGTERM' | 'SIGKILL'): void | Promise<void>;
+  } | null = null;
 
   constructor(name: string, env: CtxEnv, config: AgentConfig, log?: LogFn) {
     this.name = name;
@@ -101,22 +176,69 @@ export class AgentProcess {
     this.dedup = new MessageDedup();
     this.log = log || ((msg) => console.log(`[${name}] ${msg}`));
 
-    // Resolve the git root once at construction time. Used by the watchdog for
-    // commit-stability tracking and rollback. Null if not inside a git repo.
-    const agentDir = env.agentDir;
-    if (agentDir) {
-      this.repoRoot = findGitRoot(agentDir);
+    // Track the framework commit that supplies the running daemon code. Agent
+    // directories may live inside a nested org repository with an unrelated
+    // HEAD, so resolving from agentDir corrupts watchdog stability state.
+    if (env.frameworkRoot) {
+      this.repoRoot = findGitRoot(env.frameworkRoot);
     }
+  }
+
+  adoptExternalProcess(
+    binding: { pid: number; kernelIdentity: string },
+    observeIdentity: (pid: number) => string,
+    terminate: (pid: number, signal: 'SIGTERM' | 'SIGKILL') => void | Promise<void> =
+      (pid, signal) => { process.kill(pid, signal); },
+  ): void {
+    if (this.status !== 'stopped' || this.pty || this.adoptedExternal) {
+      throw new Error(`cannot adopt ${this.name}: process entry is not stopped`);
+    }
+    if (observeIdentity(binding.pid) !== binding.kernelIdentity) {
+      throw new Error(`cannot adopt ${this.name}: child identity changed`);
+    }
+    this.adoptedExternal = { ...binding, observeIdentity, terminate };
+    this.status = 'running';
+    this.sessionStart = new Date();
+    this.notifyStatusChange();
   }
 
   /**
    * Start the agent. Spawns Claude Code in a PTY.
    */
   async start(options: StartOptions = {}): Promise<void> {
+    if (this.startPromise) return this.startPromise;
+
+    const operation = this.performStart(options);
+    this.startPromise = operation;
+    try {
+      await operation;
+    } finally {
+      if (this.startPromise === operation) this.startPromise = null;
+    }
+  }
+
+  private async performStart(options: StartOptions): Promise<void> {
     if (this.status === 'running') {
       this.log('Already running');
       return;
     }
+
+    // Runtime revocation failures use the same scoped fail-closed contract as
+    // boot. Every direct recovery path calls this.start(), so enforcing here
+    // leaves no timer or manager bypass that can mint a second live nonce.
+    if (!retrySessionRevocation(this.env.ctxRoot, this.name)) {
+      const reason = sessionQuarantineReason(this.name);
+      console.error(`[agent-process] REFUSING TO START ${this.name}: ${reason}`);
+      this.status = 'crashed';
+      this.notifyStatusChange();
+      throw new Error(`${this.name} cannot start: ${reason}`);
+    }
+
+    // Registry liveness checks must see an admitted start before this method's
+    // first await. Otherwise a concurrent start during startup_delay can evict
+    // this AgentProcess as "stopped" while its original start later resumes.
+    this.status = 'starting';
+    const admissionGeneration = this.startAdmissionGeneration;
 
     // Apply startup delay
     const delay = this.config.startup_delay || 0;
@@ -125,13 +247,33 @@ export class AgentProcess {
       await sleep(delay * 1000);
     }
 
+    // stop() can complete while startup_delay is sleeping. Refuse before any
+    // environment write, marker mutation, or PTY construction if that happened.
+    if (admissionGeneration !== this.startAdmissionGeneration) {
+      this.log('Start cancelled during startup delay');
+      return;
+    }
+
     // Write .cortextos-env for backward compat (D6)
     if (this.env.agentDir) {
       writeCortextosEnv(this.env.agentDir, this.env);
     }
 
-    // Determine start mode
-    const mode = this.shouldContinue() ? 'continue' : 'fresh';
+    // ONE OBSERVATION serves BOTH the mode decision and the consume.
+    //
+    // These were two independent probes: shouldContinue() probed, and a second
+    // probe captured the identity for the post-spawn delete. A marker created
+    // BETWEEN them was invisible to the mode decision and visible to the
+    // capture, so the launch went CONTINUE and the post-spawn delete consumed a
+    // request that had never been honoured. Identity binding did not help --
+    // the marker was unchanged between capture and delete; the problem is that
+    // the capture saw something the decision did not.
+    //
+    // CONSUME ONLY WHAT YOU HONOURED. One probe feeds the decision, the same
+    // observation authorises the delete, and the delete is gated on that
+    // observation having actually selected `fresh`.
+    const observedForceFresh = this.probeForceFreshMarker();
+    const mode = this.shouldContinue(observedForceFresh) ? 'continue' : 'fresh';
     // Read the recovery note and rate-limit marker before building the prompt
     // but do NOT delete them yet. Both are deleted only after pty.spawn() succeeds
     // so that a spawn failure doesn't permanently swallow the recovery context
@@ -144,17 +286,26 @@ export class AgentProcess {
       : this.buildContinuePrompt(recoveryNote, options);
 
     this.log(`Starting in ${mode} mode`);
-    this.status = 'starting';
 
     // BUG-040 fix: clear any stale stop request from a previous lifecycle
     // (e.g. if the previous stop() timed out before the PTY actually exited).
     // We're starting fresh — the new PTY has no pending stop.
     this.stopRequested = false;
+    // A direct start/enable begins a new enabled lifecycle. The disable marker
+    // otherwise suppresses crash recovery indefinitely.
+    try {
+      const disableMarker = join(this.env.ctxRoot, 'state', this.name, '.user-disable');
+      if (existsSync(disableMarker)) unlinkSync(disableMarker);
+    } catch { /* best effort */ }
     // BUG-040 fix: bump generation. The onExit closure below captures THIS
     // value and uses it to detect "I'm an old PTY whose exit fired after a
     // new lifecycle began" — in which case it bails out without touching
     // handleExit, preventing spurious crash recovery on the new agent.
     const myGeneration = ++this.lifecycleGeneration;
+    // The lifecycle boundary, before this lifecycle can mint. Resetting here and
+    // nowhere else is what makes the capture below able to replace a stale entry
+    // while a LATE exit from the previous generation still deletes nothing.
+    this.mintedSession = null;
 
     // Create PTY — runtime-specific subclass handles binary, args, bootstrap detection
     const logPath = join(this.env.ctxRoot, 'logs', this.name, 'stdout.log');
@@ -193,12 +344,19 @@ export class AgentProcess {
         return;
       }
       this.log(`Exited with code ${exitCode} signal ${signal}`);
-      void this.handleExit(exitCode);
+      this.handleExit(exitCode, myGeneration);
       // Signal anyone awaiting this PTY's exit (e.g. stop() — BUG-011 fix)
       this.resolveExit?.();
       this.resolveExit = null;
     });
 
+    // The PTY records its nonce BEFORE the child environment exists, so a spawn
+    // that throws, or a PTY that exits mid-spawn, has already published a live
+    // record. Hold the reference the record belongs to: handleExit nulls this.pty
+    // during the await, and a lifecycle that cannot name its own nonce cannot
+    // clear it — the record would then survive until daemon boot revocation with
+    // no owning process, which is the exact liveness lie this PR exists to close.
+    const spawningPty = this.pty;
     try {
       await this.pty.spawn(mode, prompt);
       // Codex exec-per-turn race: the new PTY's onExit can fire BEFORE this
@@ -208,17 +366,46 @@ export class AgentProcess {
       // this.pty and schedules crash recovery — we must not claim 'running'
       // or call getPid() on null in that window.
       if (!this.pty) {
+        // handleExit already ran and cleared with the nonce we had at the time,
+        // which was null. Nobody else can name this record, so clear it here.
+        this.captureMintedNonce(spawningPty, myGeneration);
+        if (!this.clearOwnedSessionRecord(myGeneration, 'exit during spawn')) {
+          this.status = 'crashed';
+          this.notifyStatusChange();
+        }
         this.log('PTY exited during spawn — handleExit will recover');
         return;
       }
+      // Capture the nonce THIS lifecycle minted, so its exit clears its own record
+      // and cannot name a replacement's.
+      this.captureMintedNonce(spawningPty, myGeneration);
+      const childPid = this.pty.getPid();
+      if (!childPid || childPid <= 0) throw new Error('spawned child has no measurable pid');
+      if (options.beforeOnline) {
+        try {
+          await options.beforeOnline(childPid);
+        } catch (error) {
+          // The wrapper owns this exact PTY before its binding is durable.
+          // It must never cross the online boundary after publication failure.
+          const unboundChild = this.pty;
+          this.pty = null;
+          try {
+            if (unboundChild.isAlive()) unboundChild.kill();
+          } catch { /* the exact child may have exited while being reaped */ }
+          throw error;
+        }
+      }
       this.status = 'running';
       this.sessionStart = new Date();
-      this.log(`Running (pid: ${this.pty.getPid()})`);
+      this.log(`Running (pid: ${childPid})`);
 
       // Delete markers only after spawn succeeds so a spawn failure doesn't
       // permanently lose the recovery context (Bug-1 fix pattern).
       if (recoveryNote) deleteRecoveryNote(stateDir);
       if (hadRateLimit) this.deleteRateLimitMarker(stateDir);
+      // Gated on mode: a marker that did not select `fresh` was never honoured
+      // and must survive for the next start.
+      if (mode === 'fresh' && observedForceFresh) this.deleteForceFreshMarker(observedForceFresh);
 
       this.maybeSendRuntimeLifecycleNotification(options);
 
@@ -236,6 +423,10 @@ export class AgentProcess {
       // from a dead one and would proceed to wire crons / fast-checker /
       // Telegram pollers against a process that never reached running.
       // Throwing here lets startAgent abort the secondary wiring.
+      // The nonce was recorded before the failure, and this lifecycle is the only
+      // thing that can name it. Clear before rethrowing.
+      this.captureMintedNonce(spawningPty, myGeneration);
+      this.clearOwnedSessionRecord(myGeneration, 'spawn failure');
       this.log(`Failed to start: ${err}`);
       this.status = 'crashed';
       this.notifyStatusChange();
@@ -244,10 +435,72 @@ export class AgentProcess {
   }
 
   /**
+   * Learn which nonce this lifecycle's PTY published. Read from the reference the
+   * caller held, not `this.pty`, which handleExit may have nulled. Every managed
+   * PTY implements the contract; runtimes that never mint return null.
+   */
+  private captureMintedNonce(pty: ManagedAgentPTY | null, generation: number): void {
+    if (this.mintedSession?.generation === generation) return;   // idempotent WITHIN a lifecycle
+    const nonce = pty?.sessionNonce() ?? null;
+    this.mintedSession = nonce ? { generation, nonce } : null;
+  }
+
+  /**
+   * Drop the record THIS generation owns. A generation that owns nothing — because
+   * a later lifecycle has already replaced the entry — deletes nothing, so a late
+   * exit from a dead lifecycle cannot revoke a live replacement's credential.
+   */
+  private clearOwnedSessionRecord(generation: number, phase: string): boolean {
+    if (!this.mintedSession || this.mintedSession.generation !== generation) return true;
+    try {
+      clearSessionNonce(this.env.ctxRoot, this.name, this.mintedSession.nonce);
+    } catch (err) {
+      const reason = `session record for lifecycle generation ${generation} could not be revoked during ${phase}: ${err}`;
+      // Retain mintedSession deliberately: a later explicit start must retry
+      // revocation before this lifecycle identity can be forgotten or replaced.
+      quarantineAgentForUnrevokedSession(this.name, reason);
+      console.error(`[agent-process] SESSION REVOCATION UNKNOWN for ${this.name}: ${reason}`);
+      return false;
+    }
+    this.mintedSession = null;
+    return true;
+  }
+
+  /**
    * Stop the agent gracefully.
    */
   async stop(): Promise<void> {
-    if (this.stopping) return;
+    const activeStop = this.stopInFlight;
+    if (this.stopInFlight) await this.stopInFlight;
+    if (activeStop) return;
+    if (this.deathUnconfirmedPid != null) {
+      throw new Error(`death unconfirmed for agent ${this.name} (pid ${this.deathUnconfirmedPid})`);
+    }
+
+    // FIRST, before the PTY is signalled and therefore before Claude Code can
+    // dispatch SessionEnd hooks: drop the live-session record. A hook inherits
+    // the credential by lineage, so ordering the removal ahead of dispatch makes
+    // that inherited credential stale rather than valid. This is ordering, not
+    // the closure — we do not control hook dispatch timing, and mid-session hooks
+    // still hold a live record — so hooks also strip at their own entry
+    // (src/hooks/bootstrap.ts). Two mechanisms on purpose.
+    if (!this.clearOwnedSessionRecord(this.lifecycleGeneration, 'stop')) {
+      this.status = 'crashed';
+      this.notifyStatusChange();
+    }
+
+    const operation = this.performStop();
+    this.stopInFlight = operation;
+    try {
+      await operation;
+    } finally {
+      if (this.stopInFlight === operation) this.stopInFlight = null;
+    }
+  }
+
+  private async performStop(): Promise<void> {
+    // Synchronously revoke any performStart still blocked in startup_delay.
+    this.startAdmissionGeneration += 1;
     this.stopping = true;
     // BUG-040 fix: stopRequested persists ACROSS stop()'s return until
     // handleExit clears it. This is the safety net for the case where the
@@ -257,9 +510,73 @@ export class AgentProcess {
     this.clearSessionTimer();
     this.clearHealthTimer();
 
+    const adopted = this.adoptedExternal;
+    if (adopted) {
+      // Never signal a recycled PID. An unreadable or mismatched identity is a
+      // fail-closed stop error; the manager keeps the entry for operator action.
+      if (adopted.observeIdentity(adopted.pid) !== adopted.kernelIdentity) {
+        this.stopping = false;
+        throw new Error(`refusing to stop adopted ${this.name}: child identity changed`);
+      }
+      await adopted.terminate(adopted.pid, 'SIGTERM');
+      const deadline = Date.now() + RECOVERED_CHILD_GRACEFUL_EXIT_MS;
+      let vanished = false;
+      while (Date.now() < deadline) {
+        try {
+          if (adopted.observeIdentity(adopted.pid) !== adopted.kernelIdentity) {
+            throw new Error(`refusing to reap adopted ${this.name}: child identity changed`);
+          }
+        } catch (error) {
+          if (String(error).includes('vanished')) { vanished = true; break; }
+          throw error;
+        }
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      if (!vanished) {
+        // Close the final poll gap before escalation, then treat ESRCH from the
+        // signal itself as proof that the exact child already vanished.
+        try {
+          if (adopted.observeIdentity(adopted.pid) !== adopted.kernelIdentity) {
+            throw new Error(`refusing to reap adopted ${this.name}: child identity changed`);
+          }
+        } catch (error) {
+          if (String(error).includes('vanished')) vanished = true;
+          else throw error;
+        }
+        if (!vanished) {
+          try {
+            await adopted.terminate(adopted.pid, 'SIGKILL');
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === 'ESRCH') vanished = true;
+            else throw error;
+          }
+        }
+        const killDeadline = Date.now() + RECOVERED_CHILD_FORCED_EXIT_MS;
+        while (!vanished && Date.now() < killDeadline) {
+          try {
+            if (adopted.observeIdentity(adopted.pid) !== adopted.kernelIdentity) {
+              throw new Error(`refusing to reap adopted ${this.name}: child identity changed`);
+            }
+          } catch (error) {
+            if (String(error).includes('vanished')) { vanished = true; break; }
+            throw error;
+          }
+          await new Promise(resolve => setTimeout(resolve, 10));
+        }
+      }
+      if (!vanished) throw new Error(`adopted ${this.name} did not exit after SIGKILL`);
+      this.adoptedExternal = null;
+      this.stopping = false;
+      this.status = 'stopped';
+      this.notifyStatusChange();
+      this.log('Stopped adopted external child');
+      return;
+    }
+
     // Capture and null out pty BEFORE any awaits so handleExit() during graceful
     // shutdown doesn't race with us and trigger crash recovery or a double-kill.
     const pty = this.pty;
+    const childPid = pty?.getPid?.() ?? null;
     this.pty = null;
     // Capture the exit promise before any awaits — we'll wait on this AFTER
     // pty.kill() to guarantee the exit handler has run before stopping=false.
@@ -327,7 +644,26 @@ export class AgentProcess {
       // on this timeout (stopRequested handles late exits), but a generous
       // timeout reduces "Ignoring late exit from previous lifecycle" log noise.
       if (exitPromise) {
-        await Promise.race([exitPromise, sleep(15000)]);
+        let exitConfirmed = false;
+        await Promise.race([
+          exitPromise.then(() => { exitConfirmed = true; }),
+          sleep(15000),
+        ]);
+
+        if (!exitConfirmed && childPid) {
+          if (isChildAlive(childPid)) {
+            this.log(`Graceful stop timed out — escalating to SIGKILL (pid ${childPid})`);
+            try { process.kill(childPid, 'SIGKILL'); } catch { /* ESRCH */ }
+            const deadline = Date.now() + 5000;
+            while (isChildAlive(childPid) && Date.now() < deadline) await sleep(100);
+            if (isChildAlive(childPid)) {
+              this.deathUnconfirmedPid = childPid;
+              this.status = 'crashed';
+              this.notifyStatusChange();
+              throw new Error(`death unconfirmed for agent ${this.name}: pid ${childPid} still alive 5s after SIGKILL`);
+            }
+          }
+        }
       }
     }
 
@@ -385,6 +721,18 @@ export class AgentProcess {
    * conversation directory still has .jsonl files (shouldContinue() is true).
    */
   async sessionRefresh(): Promise<void> {
+    if (this.sessionRefreshPromise) return this.sessionRefreshPromise;
+
+    const operation = this.performSessionRefresh();
+    this.sessionRefreshPromise = operation;
+    try {
+      await operation;
+    } finally {
+      if (this.sessionRefreshPromise === operation) this.sessionRefreshPromise = null;
+    }
+  }
+
+  private async performSessionRefresh(): Promise<void> {
     if (this.status === 'halted' || this.status === 'stopped') {
       this.log(`Refusing session refresh in status=${this.status}`);
       return;
@@ -407,46 +755,119 @@ export class AgentProcess {
     } catch (err) {
       this.log(`Failed to write .session-refresh marker: ${err}`);
     }
-    await this.stop();
-    await this.start();
-    this.log('Session refreshed');
+    const retryBackoffsMs = [1_000, 5_000];
+    let lastError: Error | null = null;
+
+    for (let attempt = 1; attempt <= retryBackoffsMs.length + 1; attempt++) {
+      try {
+        await this.stop();
+        await this.start();
+        if (!this.pty || this.status !== 'running') {
+          throw new Error(`start returned without a running PTY (status=${this.status})`);
+        }
+        this.log(attempt === 1 ? 'Session refreshed' : `Session refreshed on retry ${attempt}`);
+        return;
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        const backoffMs = retryBackoffsMs[attempt - 1] ?? 0;
+        this.appendSessionRefreshToRestartsLog('SESSION_REFRESH_RETRY', attempt, backoffMs, lastError);
+        if (attempt <= retryBackoffsMs.length) {
+          this.log(`Session refresh attempt ${attempt} failed: ${lastError.message}; retrying in ${backoffMs / 1000}s`);
+          await sleep(backoffMs);
+        }
+      }
+    }
+
+    const reason = `session refresh failed after 3 attempts: ${lastError?.message ?? 'unknown error'}`;
+    this.appendSessionRefreshToRestartsLog('SESSION_REFRESH_ESCALATION', 3, 0, lastError);
+    this.log(`Escalating failed session refresh to a fresh hard restart: ${reason}`);
+    try {
+      await this.hardRestartSelf(reason);
+    } catch (err) {
+      const escalationError = err instanceof Error ? err : new Error(String(err));
+      this.appendSessionRefreshToRestartsLog('SESSION_REFRESH_ESCALATION_FAILED', 3, 0, escalationError);
+      // Enter the normal crash-recovery path so a failed fresh restart still
+      // gets another scheduled start instead of leaving the agent permanently dead.
+      this.handleExit(1, this.lifecycleGeneration);
+      throw escalationError;
+    }
   }
 
   /**
    * Inject a message into the agent's PTY — structured outcome.
    *
-   * Distinguishes NOT_RUNNING (agent registered but no live PTY) from
-   * DEDUPED (content collapsed against the in-process MessageDedup window).
+   * Distinguishes NOT_RUNNING (agent registered but no live PTY), DEDUPED
+   * (content collapsed against the in-process MessageDedup window), and
+   * ADMISSION_FAILED (the live PTY refused the message before taking custody).
    * See issue #346 — both used to surface as a bare `false` and got mistaken
    * for "agent not found" by operators investigating restart/cron failures.
    */
-  injectMessageDetailed(content: string): { ok: true } | { ok: false; code: 'NOT_RUNNING' | 'DEDUPED'; message: string } {
+  injectMessageDetailed(
+    input: DaemonInjection,
+    options?: AgentInjectionOptions,
+  ): AgentInjectionResult {
     if (!this.pty || this.status !== 'running') {
       return { ok: false, code: 'NOT_RUNNING', message: `agent "${this.name}" is registered but not running (status: ${this.status})` };
     }
 
-    if (this.dedup.isDuplicate(content)) {
+    const content = renderDaemonInjection(input);
+    const structuredIdentity = options?.dedupIdentity;
+    const dedupKey = structuredIdentity ?? content;
+    const dedupScope = structuredIdentity === undefined ? 'ordinary-content' : 'daemon-structured';
+    if (this.dedup.isDuplicate(dedupKey, dedupScope)) {
       this.log('Dedup: skipping duplicate message');
-      return { ok: false, code: 'DEDUPED', message: `inject for "${this.name}" deduped — content matches MessageDedup hash window` };
+      return {
+        ok: false,
+        code: 'DEDUPED',
+        message: `inject for "${this.name}" deduped — identity matches MessageDedup hash window`,
+        ...(structuredIdentity === undefined ? {} : { dedupIdentity: structuredIdentity }),
+      };
     }
 
-    if ('injectMessage' in this.pty && typeof this.pty.injectMessage === 'function') {
-      this.pty.injectMessage(content);
-    } else {
-      // CodexAppServerPTY intentionally models stdin writes itself and does not
-      // inherit AgentPTY. Feed it through the same write path used historically.
-      injectMessageIntoPty((data) => this.pty?.write(data), content);
+    try {
+      if (this.pty instanceof CodexAppServerPTY) {
+        if (options?.codexRouting && options.codexContinuation && options.codexFallback) {
+          this.pty.injectCronSequence(
+            content,
+            options.codexRouting,
+            options.codexContinuation,
+            options.codexFallback,
+          );
+        } else {
+          this.pty.injectMessage(content, options?.codexRouting);
+        }
+      } else if ('injectMessage' in this.pty && typeof this.pty.injectMessage === 'function') {
+        this.pty.injectMessage(content);
+      } else {
+        // CodexAppServerPTY intentionally models stdin writes itself and does not
+        // inherit AgentPTY. Feed it through the same write path used historically.
+        injectMessageIntoPty((data) => this.pty?.write(data), content);
+      }
+    } catch (err) {
+      this.dedup.remove?.(dedupKey, dedupScope);
+      const detail = err instanceof Error ? err.message : String(err);
+      this.log(`Injection admission failed: ${detail}`);
+      return {
+        ok: false,
+        code: 'ADMISSION_FAILED',
+        message: `inject for "${this.name}" failed before admission: ${detail}`,
+      };
     }
+    this.lastInjectedAt = Date.now();
     return { ok: true };
+  }
+
+  getLastInjectedAt(): number {
+    return this.lastInjectedAt;
   }
 
   /**
    * Inject a message into the agent's PTY (back-compat boolean wrapper).
-   * New callers that need to distinguish DEDUPED from NOT_RUNNING should use
+   * New callers that need the failure disposition should use
    * `injectMessageDetailed()` instead.
    */
-  injectMessage(content: string): boolean {
-    return this.injectMessageDetailed(content).ok;
+  injectMessage(input: DaemonInjection): boolean {
+    return this.injectMessageDetailed(input).ok;
   }
 
   /**
@@ -463,7 +884,7 @@ export class AgentProcess {
     // Liveness reconciliation: if cached status is 'running' but the
     // underlying OS process is gone, surface 'crashed' instead. This catches
     // silent-PTY-death paths where the codex-cli child exited but the
-    // PTY-layer onExit event never fired (observed 2026-05-10: an agent went
+    // PTY-layer onExit event never fired (observed 2026-05-10: a Codex seat went
     // silent at 18:40 UTC, codex process disappeared from ps, this.pty +
     // _alive stayed true, `cortextos status` reported stale 'running pid'
     // until daemon restart).
@@ -480,12 +901,16 @@ export class AgentProcess {
     // flap to 'crashed' in that window). Only act when we have a pid we
     // can probe and the probe fails.
     let reportedStatus = this.status;
-    if (reportedStatus === 'running' && this.pty) {
-      const pid = this.pty.getPid();
+    if (reportedStatus === 'running' && (this.pty || this.adoptedExternal)) {
+      const pid = this.pty?.getPid() ?? this.adoptedExternal?.pid;
       if (pid && pid > 0) {
         let alive = true;
         try {
-          process.kill(pid, 0);
+          if (this.adoptedExternal) {
+            alive = this.adoptedExternal.observeIdentity(pid) === this.adoptedExternal.kernelIdentity;
+          } else {
+            process.kill(pid, 0);
+          }
         } catch (err) {
           // EPERM = process exists but we lack permission; treat as alive
           // ESRCH = no such process — actually dead
@@ -499,13 +924,17 @@ export class AgentProcess {
     return {
       name: this.name,
       status: reportedStatus,
-      pid: this.pty?.getPid() || undefined,
+      pid: this.pty?.getPid() ?? this.adoptedExternal?.pid,
       uptime: this.sessionStart
         ? Math.floor((Date.now() - this.sessionStart.getTime()) / 1000)
         : undefined,
       sessionStart: this.sessionStart?.toISOString(),
       crashCount: this.crashCount,
       model: this.config.model,
+      awaitingConfirmation:
+        this.pty && 'isAwaitingInteractiveConfirmation' in this.pty
+          ? this.pty.isAwaitingInteractiveConfirmation()
+          : false,
     };
   }
 
@@ -529,11 +958,94 @@ export class AgentProcess {
     }
   }
 
+  private logWatchdogRollbackEvent(context: RollbackPreflightContext): void {
+    const meta = JSON.stringify({
+      agent: this.name,
+      branch: context.branch,
+      failed_commit: context.failedCommit,
+      target: context.target,
+      reset_count: context.resetCount,
+      max_resets: context.maxResets,
+      repo_root: context.repoRoot,
+    });
+    try {
+      execFileSync(
+        'cortextos',
+        ['bus', 'log-event', 'error', 'watchdog_rollback_preflight', 'error', '--meta', meta],
+        {
+          cwd: this.env.agentDir || process.cwd(),
+          env: {
+            ...process.env,
+            CTX_AGENT_NAME: this.name,
+            // The daemon is writing ABOUT this agent, not AS it — and it is
+            // doing so at the one moment the agent is provably not running
+            // (handleExit, after a crash, on the way into a destructive
+            // rollback). `bus log-event` opts into the heartbeat refresh
+            // unconditionally, so without a marker this audit write would
+            // bump the crashed agent's `last_heartbeat` and paint it alive on
+            // the dashboard while its repo is being reset underneath it.
+            //
+            // A POSITIVE marker, following cron-side-run-runner.ts: neither
+            // an absence check nor a subject-vs-actor comparison could catch
+            // this, because the line above deliberately sets CTX_AGENT_NAME
+            // to the subject. Consumed by borrowedIdentityMarker() in
+            // src/bus/event.ts. Carries the borrowed NAME rather than a bare
+            // flag so a misfiled event is diagnosable from the env alone.
+            CTX_ON_BEHALF_OF: this.name,
+            CTX_AGENT_DIR: this.env.agentDir,
+            CTX_ORG: this.env.org,
+            CTX_ROOT: this.env.ctxRoot,
+            CTX_PROJECT_ROOT: this.env.projectRoot,
+            CTX_FRAMEWORK_ROOT: this.env.frameworkRoot,
+            CORTEXTOS_DIR: this.env.frameworkRoot || process.env.CORTEXTOS_DIR,
+          },
+          stdio: 'pipe',
+          // The daemon is spawning its OWN CLI here. Unbounded, a CLI that blocks
+          // (lock contention, a wedged child of its own) stalls the daemon thread
+          // that is trying to report a rollback preflight - the supervisor waiting
+          // on the thing it supervises. 15s is generous for a local log-event.
+          timeout: 15_000,
+          killSignal: 'SIGKILL',
+        },
+      );
+    } catch (err) {
+      this.log(`Watchdog: failed to log rollback preflight event — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  private notifyWatchdogRollback(context: RollbackPreflightContext): void {
+    const telegramApi = this.telegramApi;
+    const telegramChatId = this.telegramChatId;
+    if (!telegramApi || !telegramChatId) {
+      this.log('Watchdog: no Telegram handle wired for rollback pre-notify');
+      return;
+    }
+    const text = [
+      `WATCHDOG ROLLBACK ABOUT TO RUN`,
+      `Agent: ${this.name}`,
+      `Branch: ${context.branch}`,
+      `Failed commit: ${context.failedCommit.slice(0, 12)}`,
+      `Rollback target: ${context.target.slice(0, 12)}`,
+      `Depth: ${context.resetCount + 1}/${context.maxResets}`,
+    ].join('\n');
+    try {
+      const result = telegramApi.sendMessage(telegramChatId, text);
+      if (result && typeof (result as Promise<unknown>).catch === 'function') {
+        (result as Promise<unknown>).catch((err) => {
+          this.log(`Watchdog: rollback pre-notify failed — ${err instanceof Error ? err.message : String(err)}`);
+        });
+      }
+    } catch (err) {
+      this.log(`Watchdog: rollback pre-notify failed — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   /**
    * Write raw data to the agent's PTY.
    * Used for TUI navigation (key sequences).
    */
-  write(data: string): void {
+  /** TUI control path: accepts only registered TUI keys, never message text. */
+  write(data: TuiKey): void {
     if (this.pty) {
       this.pty.write(data);
     }
@@ -616,7 +1128,13 @@ export class AgentProcess {
     }
   }
 
-  private async handleExit(exitCode: number): Promise<void> {
+  private handleExit(exitCode: number, generation: number): void {
+    // A crashed session is not a live session. stop() covers the intentional
+    // path; this covers the one where nothing was intentional.
+    if (!this.clearOwnedSessionRecord(generation, 'PTY exit')) {
+      this.status = 'crashed';
+      this.notifyStatusChange();
+    }
     // Capture the output buffer BEFORE nulling this.pty — needed for rate-limit
     // detection below (hasRateLimitSignature reads from the buffer).
     const outputBuffer = this.pty?.getOutputBuffer();
@@ -649,6 +1167,14 @@ export class AgentProcess {
     // cleanup stays with agent-manager / hook-crash-alert per the existing
     // separation of concerns.
     if (this.isDaemonShuttingDown()) {
+      return;
+    }
+
+    // A user disable is persistent intent, not a transient stop marker. Never
+    // let either crash-recovery path resurrect the agent while it is present.
+    if (this.isUserDisabled()) {
+      this.status = 'stopped';
+      this.notifyStatusChange();
       return;
     }
 
@@ -789,6 +1315,25 @@ export class AgentProcess {
     // loop caused unbounded git reset --hard regression on 2026-07-14.
     recordFailure(stateDir, this.repoRoot);
 
+    if (this.repoRoot && shouldRollback(stateDir, this.repoRoot)) {
+      if (!isWatchdogRollbackEnabled()) {
+        this.log('Watchdog: rollback threshold reached, but WATCHDOG_ROLLBACK_ENABLED is not true — diagnostics recorded, destructive rollback skipped');
+      } else {
+        this.log(`Watchdog: commit unstable after ${this.crashCount} crashes — performing git rollback`);
+        const result = performRollback(stateDir, this.repoRoot, {
+          maxResetsPerBranch: watchdogRollbackMaxResets(),
+          floorRef: watchdogRollbackFloorRef(),
+          logEventBeforeRollback: (context) => this.logWatchdogRollbackEvent(context),
+          notifyBeforeRollback: (context) => this.notifyWatchdogRollback(context),
+        });
+        if (result.success) {
+          this.log(`Watchdog: rolled back to ${result.rolledBackTo.slice(0, 12)}${result.stashRef ? `, stash: ${result.stashRef}` : ''}`);
+        } else {
+          this.log(`Watchdog: rollback failed — ${result.reason}`);
+        }
+      }
+    }
+
     // Exponential backoff restart
     const backoff = Math.min(5000 * Math.pow(2, this.crashCount - 1), 300000);
     this.log(`Crash recovery: restart in ${backoff / 1000}s (crash #${this.crashCount})`);
@@ -805,6 +1350,14 @@ export class AgentProcess {
         this.start().catch(err => this.log(`Restart failed: ${err}`));
       }
     }, backoff);
+  }
+
+  private isUserDisabled(): boolean {
+    try {
+      return existsSync(join(this.env.ctxRoot, 'state', this.name, '.user-disable'));
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -828,7 +1381,60 @@ export class AgentProcess {
     } catch { /* ignore */ }
   }
 
-  private shouldContinue(): boolean {
+  /**
+   * Probe for the `.force-fresh` marker WITHOUT consuming it, returning the
+   * IDENTITY of the file observed — not just whether one existed.
+   *
+   * The identity is load-bearing. Deferring the consume to after spawn opens a
+   * seconds-wide window in which another writer can replace the marker with a
+   * NEW request: `.force-fresh` has three writers, and `bus/system.ts`
+   * hard-restart runs in a separate CLI process entirely. An unconditional
+   * post-spawn delete cannot tell that newer request apart from the one
+   * observed at mode decision, and swallows it — so the concurrent restart
+   * boots `--continue`, which is the very failure this deferral exists to
+   * prevent, reintroduced on a narrower window.
+   *
+   * Returns null when absent. Mirrors hasRateLimitMarker(), except that a
+   * boolean is not enough here.
+   */
+  private probeForceFreshMarker(): { ino: number; mtimeMs: number; size: number } | null {
+    try {
+      const stat = statSync(join(this.env.ctxRoot, 'state', this.name, '.force-fresh'));
+      return { ino: Number(stat.ino), mtimeMs: stat.mtimeMs, size: stat.size };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Consume the `.force-fresh` marker. Call only after pty.spawn() succeeds.
+   *
+   * Consumes ONLY the exact file observed at probe time. If the marker on disk
+   * is a different file (replaced mid-spawn) it is LEFT IN PLACE, because it
+   * represents a request this launch did not satisfy.
+   *
+   * Tolerates an already-absent file: start() can be re-entered after a failed
+   * spawn, and the marker may have been consumed by an earlier successful one.
+   */
+  private deleteForceFreshMarker(observed: { ino: number; mtimeMs: number; size: number }): void {
+    const current = this.probeForceFreshMarker();
+    if (!current) return;
+    if (
+      current.ino !== observed.ino ||
+      current.mtimeMs !== observed.mtimeMs ||
+      current.size !== observed.size
+    ) {
+      this.log('.force-fresh changed during spawn — leaving the newer request for the next start');
+      return;
+    }
+    try {
+      unlinkSync(join(this.env.ctxRoot, 'state', this.name, '.force-fresh'));
+    } catch { /* ignore */ }
+  }
+
+  private shouldContinue(
+    observedForceFresh: { ino: number; mtimeMs: number; size: number } | null,
+  ): boolean {
     // Check for force-fresh marker FIRST (all runtimes honor it).
     //
     // Ordering matters: this check used to sit BELOW the Hermes early-return,
@@ -836,15 +1442,21 @@ export class AgentProcess {
     // never actually forced a fresh session — the marker was bypassed (the
     // agent kept resuming via --continue as long as state.db existed) AND
     // never consumed, so it leaked in the state dir indefinitely.
-    const forceFreshPath = join(this.env.ctxRoot, 'state', this.name, '.force-fresh');
-    if (existsSync(forceFreshPath)) {
-      // Context watchdog and hard-restart use this marker to force a fresh
-      // session instead of `--continue`. The marker is consumed here in the
-      // daemon launch decision, before runtime-specific boot prompts run; do
-      // not expect codex-app-server itself to read or clear `.force-fresh`.
-      try {
-        unlinkSync(forceFreshPath);
-      } catch { /* ignore */ }
+    // This is a PROBE ONLY — it must not consume the marker.
+    //
+    // The consume moved to start()'s post-spawn block, beside
+    // deleteRateLimitMarker(). Consuming here spent the authorization at the
+    // MODE DECISION, 74 lines before pty.spawn(); any failure in between lost
+    // the marker, and the next start() then booted `--continue` into the exact
+    // session the marker existed to escape. That is the same hazard the
+    // recovery note and `.rate-limited` are already protected from — see the
+    // comment at the call site and deleteRateLimitMarker()'s contract.
+    //
+    // Context watchdog and hard-restart use this marker to force a fresh
+    // session instead of `--continue`. The consume happens in the daemon launch
+    // path, not in any runtime adapter; do not expect codex-app-server itself
+    // to read or clear `.force-fresh`.
+    if (observedForceFresh !== null) {
       return false;
     }
 
@@ -883,15 +1495,10 @@ export class AgentProcess {
     const launchDir = this.config.working_directory || this.env.agentDir;
     if (!launchDir) return false;
 
-    // Claude projects dir uses the absolute path with all separators replaced by dashes
-    // e.g. /Users/foo/agents/boss -> -Users-foo-agents-boss (leading sep becomes -)
-    // Use homedir() for cross-platform compatibility (HOME is not set on Windows).
-    const convDir = join(
-      homedir(),
-      '.claude',
-      'projects',
-      launchDir.split(sep).join('-'),
-    );
+    // Predict Claude's project directory from the launch path. If Claude changes
+    // its private naming scheme, discover the matching JSONL and log the drift.
+    const convDir = resolveClaudeProjectDir(launchDir, homedir(), (message) => this.log(message));
+    if (!convDir) return false;
 
     try {
       const files = require('fs').readdirSync(convDir);
@@ -940,23 +1547,56 @@ export class AgentProcess {
    * path (~/.hermes) for state.db.
    */
   private resolveHermesHome(): string | undefined {
-    try {
-      const envFile = join(this.env.agentDir, '.env');
-      if (existsSync(envFile)) {
-        for (const line of readFileSync(envFile, 'utf-8').split('\n')) {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed.startsWith('#')) continue;
-          const eqIdx = trimmed.indexOf('=');
-          if (eqIdx > 0 && trimmed.slice(0, eqIdx).trim() === 'HERMES_HOME') {
-            const value = trimmed.slice(eqIdx + 1).trim();
-            if (value) return value;
-          }
-        }
-      }
-    } catch {
-      // Unreadable/malformed .env — fall through to the daemon's env.
+    // MUST parse with the same options AgentPTY.spawn() uses on this same file,
+    // or the two disagree about what HERMES_HOME is. The hand-rolled loop that
+    // used to live here was quote-blind, so once AgentPTY began stripping
+    // surrounding quotes a value like HERMES_HOME="/srv/hermes-home" gave the
+    // child /srv/hermes-home while this probed a path containing literal quote
+    // characters. state.db is then never found and shouldContinue() launches
+    // every restart in fresh mode — silently, since a missing db is
+    // indistinguishable from a first run. Found by Codex review 2026-08-13.
+    //
+    // Tolerant reader, matching the try/catch this replaced: an unreadable .env
+    // falls through to the daemon's env rather than killing the process.
+    // ABSENCE and an explicitly BLANK value are different answers, and treating
+    // them alike breaks the agreement this method exists to maintain. AgentPTY
+    // Object.assigns whatever the file says, so `HERMES_HOME=` puts an empty
+    // string in the child's environment. A truthiness test here would instead
+    // fall through to the daemon's own process.env, so the daemon would probe
+    // /whatever/state.db while the child runs with the empty value and resolves
+    // to the default — continue-vs-fresh decided from a DB the child never uses.
+    //
+    // So: key present wins, blank included, and hermesDbExists applies its own
+    // `|| ~/.hermes` default exactly as it does for the child. Only true absence
+    // falls through to the daemon env.
+    //
+    // Predates this PR (origin/main had the same truthiness test) but is fixed
+    // here because this PR is what claims the two readers agree.
+    // MIRROR AgentPTY's FULL precedence, not just the last layer. It builds
+    //   base env (HERMES_HOME passes the getBaseEnv allowlist)
+    //     <- orgs/<org>/secrets.env
+    //       <- agent .env
+    // so checking only the agent .env meant an org-level HERMES_HOME reached the
+    // child while the daemon fell through to its own process.env — the daemon
+    // probing one state.db and the child using another.
+    let value = process.env['HERMES_HOME'];
+
+    const layers: string[] = [];
+    if (this.env.org && this.env.projectRoot) {
+      layers.push(join(this.env.projectRoot, 'orgs', this.env.org, 'secrets.env'));
     }
-    return process.env['HERMES_HOME'];
+    layers.push(join(this.env.agentDir, '.env'));
+
+    for (const file of layers) {
+      if (!existsSync(file)) continue;
+      const vars = parseEnvFile(file, { stripInlineComments: false });
+      // Key-presence, not truthiness, at EVERY layer: `HERMES_HOME=` is an
+      // explicit blank that AgentPTY assigns into the child, so it must override
+      // an earlier layer here too rather than silently falling through.
+      if ('HERMES_HOME' in vars) value = vars['HERMES_HOME'];
+    }
+
+    return value;
   }
 
   private buildStartupPrompt(recoveryNote: string | null, options: StartOptions = {}): string {
@@ -1344,6 +1984,27 @@ export class AgentProcess {
       appendFileSync(join(logDir, 'restarts.log'), logLine, 'utf-8');
     } catch {
       /* swallow — never break crash recovery on a logging failure */
+    }
+  }
+
+  private appendSessionRefreshToRestartsLog(
+    kind: 'SESSION_REFRESH_RETRY' | 'SESSION_REFRESH_ESCALATION' | 'SESSION_REFRESH_ESCALATION_FAILED',
+    attempt: number,
+    backoffMs: number,
+    error: Error | null,
+  ): void {
+    try {
+      const logDir = join(this.env.ctxRoot, 'logs', this.name);
+      ensureDir(logDir);
+      const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+      const message = (error?.message ?? 'unknown error').replace(/[\r\n"]/g, ' ');
+      appendFileSync(
+        join(logDir, 'restarts.log'),
+        `[${timestamp}] ${kind}: attempt=${attempt} backoff_s=${backoffMs / 1000} error="${message}"\n`,
+        'utf-8',
+      );
+    } catch {
+      /* logging must never prevent lifecycle recovery */
     }
   }
 

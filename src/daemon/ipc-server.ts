@@ -9,8 +9,66 @@ import type { ExecutionLogStatusFilter } from '../bus/crons.js';
 import { nextFireFromCron } from './cron-scheduler.js';
 import { parseDurationMs } from '../bus/cron-state.js';
 import { computeHealth, aggregateFleetHealth } from '../utils/cron-health.js';
+import { configuredTimezone } from '../utils/timezone.js';
+import type { WorktreeLeaseIpcService } from './worktree-lease-ipc.js';
+import type { RequestResult } from './deferred-start-machine.js';
 
 const WORKER_NAME_REGEX = /^[a-z0-9_-]+$/;
+export const IPC_ADMISSION_BUDGET_MS = 750;
+
+async function admissionWithinBudget<T>(operation: Promise<T>): Promise<
+  | { kind: 'settled'; value: T }
+  | { kind: 'timeout' }
+> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const settled = operation.then(
+    value => ({ kind: 'settled' as const, value }),
+    error => { throw error; },
+  );
+  const timeout = new Promise<{ kind: 'timeout' }>(resolve => {
+    timer = setTimeout(() => resolve({ kind: 'timeout' }), IPC_ADMISSION_BUDGET_MS);
+  });
+  const result = await Promise.race([settled, timeout]);
+  if (timer) clearTimeout(timer);
+  return result;
+}
+
+function admissionResponse(operation: 'Start' | 'Restart', agent: string, result: RequestResult | undefined): IPCResponse {
+  if (!result) return { success: true, data: { verdict: 'admitted', message: `${operation}ing ${agent}` } };
+  if (result.status === 'accepted') {
+    return { success: true, data: { verdict: 'admitted', receiptId: result.receiptId } };
+  }
+  if (result.status === 'deferred') {
+    return {
+      success: false,
+      error: `${operation} deferred for ${agent}; retry owner=${result.receiptId}`,
+      code: 'ADMISSION_FAILED',
+      data: { verdict: 'deferred-with-owner', receiptId: result.receiptId },
+    };
+  }
+  if (result.status === 'in-flight') {
+    return {
+      success: false,
+      error: `${operation} already in flight for ${agent}`,
+      code: 'IN_FLIGHT',
+      data: { verdict: 'in-flight', receiptId: result.receiptId },
+    };
+  }
+  if (result.status === 'cancelled') {
+    return {
+      success: false,
+      error: `${operation} was cancelled for ${agent}`,
+      code: 'REFUSED',
+      data: { verdict: 'refused', receiptId: result.receiptId },
+    };
+  }
+  return {
+    success: false,
+    error: `${operation} refused for ${agent}: ${result.reason}`,
+    code: 'REFUSED',
+    data: { verdict: 'refused', reason: result.reason },
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Manual fire cooldown — Subtask 4.5
@@ -67,7 +125,7 @@ export interface FireCronResult {
 export function handleFireCron(
   agent: string | undefined,
   cronName: string | undefined,
-  injectFn: (agent: string, text: string) => boolean,
+  injectFn: (agent: string, text: string, cron: CronDefinition) => boolean,
   nowMs = Date.now(),
 ): FireCronResult {
   if (!agent || !agent.trim()) {
@@ -97,7 +155,7 @@ export function handleFireCron(
 
   // Inject into PTY
   const injection = `[CRON: ${cronName}] ${cron.prompt}`;
-  const injected = injectFn(agent, injection);
+  const injected = injectFn(agent, injection, cron);
   if (!injected) {
     return { ok: false, error: `Agent '${agent}' not found or not running.` };
   }
@@ -121,11 +179,13 @@ export function handleFireCron(
  * @param schedule    - Interval shorthand or 5-field cron expression.
  * @param lastFiredAt - ISO 8601 of last fire; if absent uses `now`.
  * @param now         - Epoch ms for "now" (injectable for testing).
+ * @param timezone    - IANA timezone for 5-field cron evaluation.
  */
 export function computeNextFire(
   schedule: string,
   lastFiredAt: string | undefined,
   now = Date.now(),
+  timezone?: string,
 ): string {
   const referenceMs = lastFiredAt ? new Date(lastFiredAt).getTime() : now;
 
@@ -137,7 +197,7 @@ export function computeNextFire(
   }
 
   // Try as a 5-field cron expression
-  const nextMs = nextFireFromCron(schedule, now);
+  const nextMs = nextFireFromCron(schedule, now, timezone);
   if (!isNaN(nextMs)) {
     return new Date(nextMs).toISOString();
   }
@@ -150,7 +210,7 @@ export function computeNextFire(
  * Walk all enabled agents from enabled-agents.json, read each agent's crons.json
  * and cron execution log, and return a combined summary array.
  */
-function listAllCrons(): CronSummaryRow[] {
+export function listAllCrons(): CronSummaryRow[] {
   const ctxRoot = process.env.CTX_ROOT ?? process.cwd();
   const enabledFile = join(ctxRoot, 'config', 'enabled-agents.json');
 
@@ -165,12 +225,18 @@ function listAllCrons(): CronSummaryRow[] {
 
   const rows: CronSummaryRow[] = [];
   const now = Date.now();
+  const frameworkRoot = process.env.CTX_FRAMEWORK_ROOT ?? process.cwd();
 
   for (const [agentName, entry] of Object.entries(enabledAgents)) {
     if (entry.enabled === false) continue;
 
     const org = entry.org ?? '';
     const crons = readCrons(agentName);
+    let timezone: string | undefined;
+    try {
+      const config = JSON.parse(readFileSync(join(frameworkRoot, 'orgs', org, 'agents', agentName, 'config.json'), 'utf-8'));
+      timezone = configuredTimezone(config.timezone);
+    } catch { /* missing config preserves the live scheduler's host-local path */ }
 
     for (const cron of crons) {
       // Read the last execution log entry for this cron
@@ -183,7 +249,8 @@ function listAllCrons(): CronSummaryRow[] {
         cron,
         lastFire: lastEntry?.ts ?? null,
         lastStatus: lastEntry?.status ?? null,
-        nextFire: computeNextFire(cron.schedule, cron.last_fired_at, now),
+        lastFireKind: lastEntry?.fire_kind ?? null,
+        nextFire: computeNextFire(cron.schedule, cron.last_fired_at, now, timezone),
       });
     }
   }
@@ -485,12 +552,20 @@ export function handleRemoveCron(
  */
 export class IPCServer {
   private server: Server | null = null;
+  /** True only after THIS instance successfully bound the socket. See stop(). */
+  private boundSocket = false;
   private socketPath: string;
   private agentManager: AgentManager;
+  private worktreeLeaseService?: WorktreeLeaseIpcService;
 
-  constructor(agentManager: AgentManager, instanceId: string = 'default') {
+  constructor(
+    agentManager: AgentManager,
+    instanceId: string = 'default',
+    worktreeLeaseService?: WorktreeLeaseIpcService,
+  ) {
     this.agentManager = agentManager;
     this.socketPath = getIpcPath(instanceId);
+    this.worktreeLeaseService = worktreeLeaseService;
   }
 
   /**
@@ -515,7 +590,7 @@ export class IPCServer {
           try {
             const request: IPCRequest = JSON.parse(data);
             data = '';
-            this.handleRequest(request, socket);
+            void this.handleRequest(request, socket);
           } catch {
             // Incomplete JSON, wait for more data
           }
@@ -532,6 +607,7 @@ export class IPCServer {
           // Clean up the re-created socket and retry once.
           try { unlinkSync(this.socketPath); } catch { /* ignore */ }
           this.server!.listen(this.socketPath, () => {
+            this.boundSocket = true;
             console.log(`[ipc] Listening on ${this.socketPath} (recovered from stale socket)`);
             resolve();
           });
@@ -541,6 +617,7 @@ export class IPCServer {
       });
 
       this.server.listen(this.socketPath, () => {
+        this.boundSocket = true;
         if (process.platform !== 'win32') {
           try {
             chmodSync(this.socketPath, 0o600);
@@ -563,20 +640,28 @@ export class IPCServer {
       this.server = null;
     }
 
-    // Clean up socket file
-    if (process.platform !== 'win32' && existsSync(this.socketPath)) {
+    // Unlink ONLY a socket this instance actually bound.
+    //
+    // The path is shared across daemons for an instance. A process that never
+    // bound it — a duplicate start that aborted on the exclusivity probe, whose
+    // throw reaches process.exit(1) and therefore this handler — would otherwise
+    // delete the ORIGINAL daemon's socket on its way out, leaving that daemon
+    // running but unreachable by every CLI. Deleting a resource you never acquired
+    // is not cleanup.
+    if (this.boundSocket && process.platform !== 'win32' && existsSync(this.socketPath)) {
       try {
         unlinkSync(this.socketPath);
       } catch {
         // Ignore
       }
     }
+    this.boundSocket = false;
   }
 
   /**
    * Handle an incoming IPC request.
    */
-  private handleRequest(request: IPCRequest, socket: Socket): void {
+  private async handleRequest(request: IPCRequest, socket: Socket): Promise<void> {
     // BUG-015: log every incoming IPC request with its source so we can
     // trace which CLI command triggered which daemon action. The source
     // field is populated by CLI clients (cortextos enable / disable / stop
@@ -602,6 +687,23 @@ export class IPCServer {
           };
           break;
 
+        case 'acquire-worktree-lease':
+        case 'bind-worktree-lease-child':
+        case 'check-worktree-lease':
+        case 'release-worktree-lease': {
+          if (!this.worktreeLeaseService) {
+            response = { success: false, error: 'worktree lease service unavailable', code: 'ADMISSION_FAILED' };
+            break;
+          }
+          const fd = (socket as Socket & { _handle?: { fd?: number } })._handle?.fd;
+          if (!Number.isSafeInteger(fd) || fd! < 0) {
+            response = { success: false, error: 'peer-identity-unknown', code: 'ADMISSION_FAILED' };
+            break;
+          }
+          response = await this.worktreeLeaseService.handle(request.type, request.data ?? {}, fd!);
+          break;
+        }
+
         case 'start-agent':
           if (!request.agent) {
             response = { success: false, error: 'Agent name required', code: 'INVALID_INPUT' };
@@ -611,12 +713,15 @@ export class IPCServer {
             // agent-manager's own dedup logic still runs and is the source of
             // truth; we just give the operator a structured response code.
             const insp = this.agentManager.inspectAgentOp('start', request.agent);
-            this.agentManager.startAgent(
-              request.agent,
-              (request.data?.dir as string) || '',
-            ).catch(err => console.error(`Failed to start ${request.agent}:`, err));
+            const admissionResult = insp.ok
+              ? await admissionWithinBudget(
+                this.agentManager.admitStartAgent(request.agent, (request.data?.dir as string) || ''),
+              )
+              : undefined;
             if (insp.ok) {
-              response = { success: true, data: `Starting ${request.agent}` };
+              response = admissionResult?.kind === 'timeout'
+                ? { success: false, error: 'Start admission exceeded its response budget', code: 'ADMISSION_TIMEOUT' }
+                : admissionResponse('Start', request.agent, admissionResult?.value);
             } else {
               console.log(`[ipc] start-agent ${request.agent}: ${insp.code} — ${insp.message}`);
               response = { success: false, error: insp.message, code: insp.code };
@@ -628,8 +733,11 @@ export class IPCServer {
           if (!request.agent) {
             response = { success: false, error: 'Agent name required', code: 'INVALID_INPUT' };
           } else {
+            // Inspect synchronously so the IPC response can report NOT_FOUND.
+            // stopAgent's own registry check remains the downstream gate; this
+            // read-only verdict shapes the operator response (issue #346).
             const insp = this.agentManager.inspectAgentOp('stop', request.agent);
-            this.agentManager.stopAgent(request.agent)
+            this.agentManager.stopAgent(request.agent, request.userInitiated ?? true)
               .catch(err => console.error(`Failed to stop ${request.agent}:`, err));
             if (insp.ok) {
               response = { success: true, data: `Stopping ${request.agent}` };
@@ -648,14 +756,22 @@ export class IPCServer {
             const isFleetRestart = request.source === 'cortextos bus soft-restart-all';
             const fleetTotal = typeof request.data?.fleetTotal === 'number' ? request.data.fleetTotal : undefined;
             const fleetIndex = typeof request.data?.fleetIndex === 'number' ? request.data.fleetIndex : undefined;
-            this.agentManager.restartAgent(request.agent, isFleetRestart
-              ? { partOfFleetStart: true, fleetTotal, fleetIndex }
-              : undefined)
-              .catch(err => console.error(`Failed to restart ${request.agent}:`, err));
             if (insp.ok) {
-              response = { success: true, data: `Restarting ${request.agent}` };
+              const admission = await admissionWithinBudget(
+                this.agentManager.admitRestartAgent(request.agent, isFleetRestart
+                  ? { partOfFleetStart: true, fleetTotal, fleetIndex }
+                  : undefined),
+              );
+              response = admission.kind === 'timeout'
+                ? { success: false, error: 'Restart admission exceeded its response budget', code: 'ADMISSION_TIMEOUT' }
+                : admissionResponse('Restart', request.agent, admission.value);
             } else {
               console.log(`[ipc] restart-agent ${request.agent}: ${insp.code} — ${insp.message}`);
+              // A refused FLEET member must still be accounted for, or the coordinator
+              // strands at completed < expected and suppresses the next fleet batch.
+              if (isFleetRestart) {
+                this.agentManager.recordFleetStartRejection(request.agent, fleetTotal);
+              }
               response = { success: false, error: insp.message, code: insp.code };
             }
           }
@@ -691,9 +807,8 @@ export class IPCServer {
             if (!underCtxRoot && !underCwd) {
               response = { success: false, error: 'Invalid worker dir' };
             } else {
-              this.agentManager.spawnWorker(d.name, resolvedDir, d.prompt, d.parent, d.model)
-                .catch(err => console.error(`[ipc] spawn-worker failed:`, err));
-              response = { success: true, data: `Spawning worker ${d.name}` };
+              await this.agentManager.spawnWorker(d.name, resolvedDir, d.prompt, d.parent, d.model);
+              response = { success: true, data: `Spawned worker ${d.name}` };
             }
           }
           break;
@@ -704,9 +819,8 @@ export class IPCServer {
           if (!workerName) {
             response = { success: false, error: 'terminate-worker requires: name' };
           } else {
-            this.agentManager.terminateWorker(workerName)
-              .catch(err => console.error(`[ipc] terminate-worker failed:`, err));
-            response = { success: true, data: `Terminating worker ${workerName}` };
+            await this.agentManager.terminateWorker(workerName);
+            response = { success: true, data: `Terminated worker ${workerName}` };
           }
           break;
         }
@@ -736,8 +850,9 @@ export class IPCServer {
             response = { success: false, error: 'inject-agent requires: agent, data.text', code: 'INVALID_INPUT' };
           } else {
             // Structured outcome distinguishes NOT_FOUND (agent not in registry)
-            // from NOT_RUNNING (registered but PTY dead) from DEDUPED (content
-            // collision in MessageDedup window). Closes the conflation Boris
+            // from NOT_RUNNING (registered but PTY dead), DEDUPED (content
+            // collision in MessageDedup window), and ADMISSION_FAILED (runtime
+            // could not durably take custody). Closes the conflation Boris
             // surfaced — the harness "3 not found errors" were dedup hits.
             // See issue #346.
             const result = this.agentManager.injectAgentDetailed(agentToInject, textToInject);
@@ -770,7 +885,7 @@ export class IPCServer {
           const fireCronResult = handleFireCron(
             agentToFire,
             fireCronName,
-            (a, text) => this.agentManager.injectAgent(a, text),
+            (a, text, cron) => this.agentManager.injectCronAgent(a, cron, text),
           );
           if (fireCronResult.ok) {
             // Invalidate fleet health cache so next poll reflects the new fire

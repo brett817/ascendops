@@ -3,6 +3,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 let capturedOnExit: ((exitCode: number, signal?: number) => void) | null = null;
 
 const mockCodexAppServerPty = {
+  sessionNonce: vi.fn().mockReturnValue(null),
   spawn: vi.fn().mockResolvedValue(undefined),
   kill: vi.fn(),
   write: vi.fn(),
@@ -248,11 +249,21 @@ describe('AgentProcess codex-app-server runtime', () => {
     const codexThreadPath = '/tmp/test-ctx/state/codex-app-agent/codex-app-server-thread.json';
 
     // Both signals present: .force-fresh must win (fresh spawn), and the
-    // marker must be consumed in the launch decision — pins the
-    // force-fresh-BEFORE-runtime-checks ordering in shouldContinue().
+    // marker must be consumed — pins the force-fresh-BEFORE-runtime-checks
+    // ordering in shouldContinue().
+    //
+    // The consume is now in start()'s POST-SPAWN block, not the launch
+    // decision, so that a failed spawn cannot swallow the request. The probe
+    // stats rather than exists-checks because the consume binds to the
+    // identity of the file it observed. Mock updated to the mechanism; both
+    // assertions below are unchanged.
     fsMocks.existsSync.mockImplementation((path: string) => {
       if (path.endsWith('.force-fresh')) return true;
       return path === codexThreadPath;
+    });
+    fsMocks.statSync.mockImplementation((path: string) => {
+      if (String(path).endsWith('.force-fresh')) return { ino: 11, mtimeMs: 22, size: 33 };
+      throw new Error('ENOENT');
     });
     const forced = new AgentProcess('codex-app-agent', mockEnv, { runtime: 'codex-app-server' });
     await forced.start();

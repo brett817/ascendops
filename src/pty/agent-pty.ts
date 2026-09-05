@@ -1,15 +1,14 @@
-import { basename, join } from 'path';
+import { join } from 'path';
+import { agentSessionCredential, stripReservedSessionCredential, HEARTBEAT_SESSION_ENV } from '../utils/env.js';
+import { recordSessionNonce } from '../bus/heartbeat-session-store.js';
 import { existsSync, readFileSync } from 'fs';
 import { platform } from 'os';
 import type { AgentConfig, CtxEnv } from '../types/index.js';
 import { OutputBuffer } from './output-buffer.js';
 import { loadAdapter } from './adapters/base.js';
+import { readUnattendedConsent } from '../utils/claude-preflight.js';
 import { injectMessage as injectMessageIntoPty } from './inject.js';
-import {
-  ensureBypassPromptSuppressed,
-  ensureFolderTrusted,
-  readUnattendedConsent,
-} from '../utils/claude-preflight.js';
+import { parseEnvFileStrict } from '../utils/env.js';
 
 // node-pty types
 interface IPty {
@@ -45,19 +44,21 @@ function stripAnsi(value: string): string {
 export class AgentPTY {
   private pty: IPty | null = null;
   private _alive = false;
+  private _awaitingInteractiveConfirmation = false;
   private outputBuffer: OutputBuffer;
   protected env: CtxEnv;
   protected config: AgentConfig;
   private onExitHandler: ((exitCode: number, signal?: number) => void) | null = null;
   private spawnFn: SpawnFn | null = null;
+  /** The nonce this PTY minted, so an owning lifecycle can revoke exactly its own. */
+  private mintedSessionNonce: string | null = null;
+  sessionNonce(): string | null { return this.mintedSessionNonce; }
   // Trust-prompt auto-accept timers. Stored so they can be cancelled when
   // the PTY exits or is killed — otherwise a timer from a previous spawn()
   // can fire against a RESPAWNED PTY on the same instance and write a stray
   // Enter into the new session (the callbacks only check `this.pty`, which
   // is truthy again after a respawn).
   private trustPromptTimers: ReturnType<typeof setTimeout>[] = [];
-  private promptAnswerSent = false;
-  private promptOutputCursor = 0;
   private bypassAnswerCount = 0;
 
   constructor(env: CtxEnv, config: AgentConfig, logPath?: string, bootstrapPattern?: string) {
@@ -76,13 +77,11 @@ export class AgentPTY {
     if (this.pty) {
       throw new Error('PTY already spawned. Kill first.');
     }
-
-    const explicitSkip = this.config.dangerously_skip_permissions;
-    let effectiveSkip = explicitSkip;
-    if (explicitSkip === undefined && this.isClaudeCodeRuntime()) {
-      // Derived state must never be written into the store that distinguishes explicit from absent.
-      effectiveSkip = readUnattendedConsent(this.env.frameworkRoot);
-    }
+    this._awaitingInteractiveConfirmation = false;
+    // One AgentPTY instance can respawn multiple child processes. Bootstrap
+    // readiness is monotonic only within a child lifecycle, so discard the
+    // previous child's ring and latch before admitting output from the next.
+    this.outputBuffer.clear();
 
     // Lazy-load node-pty (native addon)
     if (!this.spawnFn) {
@@ -90,7 +89,17 @@ export class AgentPTY {
       this.spawnFn = nodePty.spawn;
     }
 
-    const cwd = this.config.working_directory || this.env.agentDir || process.cwd();
+    const configuredCwd = this.config.working_directory;
+    if (configuredCwd !== undefined && configuredCwd !== '') {
+      const trimmed = configuredCwd.trim();
+      if (trimmed === '') {
+        throw new Error(`[agent-pty] ${this.env.agentName}: working_directory is whitespace-only; set a valid path or remove it`);
+      }
+      if (!existsSync(trimmed)) {
+        throw new Error(`[agent-pty] ${this.env.agentName}: working_directory does not exist: ${trimmed}`);
+      }
+    }
+    const cwd = (configuredCwd && configuredCwd.trim()) || this.env.agentDir || process.cwd();
 
     // Build environment variables for the PTY process
     const ptyEnv: Record<string, string> = {
@@ -110,34 +119,32 @@ export class AgentPTY {
     // Source org-level shared secrets (orgs/{org}/secrets.env).
     // These are shared across all agents in the org: OPENAI_KEY, APIFY_TOKEN, GEMINI_API_KEY, etc.
     // Agent .env is loaded after and overrides org values — agent-specific keys win.
+    // parseEnvFileStrict (utils/env.ts) shares the canonical parser — it strips
+    // surrounding quotes, tolerates a UTF-8 BOM, and handles CRLF. The hand-rolled
+    // loops that used to live here did none of that, so a QUOTED value reached the
+    // agent with its quote characters still attached, which made quoting unusable
+    // as a fix for values containing shell metacharacters (2026-08-13 secrets.env
+    // DATABASE_URL: a bare `&` breaks every `source` of the file).
+    //
+    // STRICT, not the tolerant `parseEnvFile`, and the distinction is load-bearing.
+    // The replaced loops used a bare readFileSync, so a present-but-unreadable
+    // secrets file (EACCES, EISDIR) threw and the agent refused to start. The
+    // tolerant reader returns {} instead, which would spawn the agent with its
+    // secrets silently absent — BOT_TOKEN missing, failing later as something
+    // unrecognisable. Startup must keep failing loudly here.
     if (this.env.org && this.env.projectRoot) {
       const orgEnvFile = join(this.env.projectRoot, 'orgs', this.env.org, 'secrets.env');
       if (existsSync(orgEnvFile)) {
-        const content = readFileSync(orgEnvFile, 'utf-8');
-        for (const line of content.split('\n')) {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed.startsWith('#')) continue;
-          const eqIdx = trimmed.indexOf('=');
-          if (eqIdx > 0) {
-            ptyEnv[trimmed.slice(0, eqIdx).trim()] = trimmed.slice(eqIdx + 1).trim();
-          }
-        }
+        Object.assign(ptyEnv, stripReservedSessionCredential(orgEnvFile, parseEnvFileStrict(orgEnvFile, { stripInlineComments: false })));
       }
     }
 
     // Source agent .env file (overrides org secrets.env for same key names).
     // Contains agent-specific secrets: BOT_TOKEN, CHAT_ID, CLAUDE_CODE_OAUTH_TOKEN.
+    // Strict for the same reason as above.
     const agentEnvFile = join(this.env.agentDir, '.env');
     if (existsSync(agentEnvFile)) {
-      const content = readFileSync(agentEnvFile, 'utf-8');
-      for (const line of content.split('\n')) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith('#')) continue;
-        const eqIdx = trimmed.indexOf('=');
-        if (eqIdx > 0) {
-          ptyEnv[trimmed.slice(0, eqIdx).trim()] = trimmed.slice(eqIdx + 1).trim();
-        }
-      }
+      Object.assign(ptyEnv, stripReservedSessionCredential(agentEnvFile, parseEnvFileStrict(agentEnvFile, { stripInlineComments: false })));
     }
 
     // Add convenience CTX_* aliases used throughout agent templates.
@@ -168,14 +175,25 @@ export class AgentPTY {
 
     this.customizeEnv(ptyEnv);
 
+    // MINT THE SESSION CREDENTIAL LAST. Every earlier writer — org secrets.env,
+    // agent .env, and customizeEnv() — Object.assigns over this env, so minting
+    // it at construction time let any of them clobber it. Codex found the env-file
+    // case; the customizeEnv case is the same family. Being the final write is
+    // what makes "minted only at the PTY boundary" true rather than aspirational.
+    // Record the nonce as the live session BEFORE the child environment exists.
+    // A credential whose nonce is not in daemon-owned state is a forgery, and the
+    // window where the child could exist while the record does not must be empty.
+    const credential = agentSessionCredential(this.env.agentName);
+    const mintedNonce = credential[HEARTBEAT_SESSION_ENV].split(':').slice(1).join(':');
+    this.mintedSessionNonce = mintedNonce;
+    recordSessionNonce(this.env.ctxRoot, this.env.agentName, mintedNonce);
+    Object.assign(ptyEnv, credential);
+
     // Spawn the agent binary directly (no shell wrapper) — cross-platform, no shell escaping needed.
     // env is passed natively via node-pty options; no bash export commands required.
     // On Windows, npm global installs create .cmd wrappers, not .exe binaries.
     // node-pty's CreateProcess requires the exact wrapper name to resolve correctly.
-    const effectiveConfig = effectiveSkip === undefined
-      ? this.config
-      : { ...this.config, dangerously_skip_permissions: effectiveSkip };
-    const claudeArgs = this.buildClaudeArgs(mode, prompt, effectiveConfig);
+    const claudeArgs = this.buildClaudeArgs(mode, prompt);
     const claudeCmd = this.getBinaryName();
 
     // Apply vendor adapter's env filter — strips CLAUDE_* env vars before
@@ -184,22 +202,6 @@ export class AgentPTY {
     // no-op pass-through. HermesPTY uses default config.vendor (anthropic),
     // so its env is unchanged.
     const filteredEnv = loadAdapter(this.config.vendor).envFilter(ptyEnv);
-
-    const handlesClaudeTrustPrompts = this.isClaudeCodeRuntime();
-    if (handlesClaudeTrustPrompts) {
-      try {
-        ensureFolderTrusted(cwd);
-      } catch (error) {
-        console.warn(`[claude-preflight] unexpected folder trust failure; spawn will continue: ${String(error)}`);
-      }
-      if (effectiveSkip !== false) {
-        try {
-          ensureBypassPromptSuppressed();
-        } catch (error) {
-          console.warn(`[claude-preflight] unexpected bypass suppression failure; spawn will continue: ${String(error)}`);
-        }
-      }
-    }
 
     this.pty = this.spawnFn!(claudeCmd, claudeArgs, {
       name: 'xterm-256color',
@@ -232,41 +234,50 @@ export class AgentPTY {
       }
     });
 
-    // Claude Code can show two startup gates:
-    //   1. Folder trust defaults to accept, so Enter confirms it.
-    //   2. Bypass Permissions defaults to "No, exit", so bare Enter kills the process.
-    // Retry through 32s while a gate remains visible, with a hard answer cap.
-    this.promptAnswerSent = false;
-    this.promptOutputCursor = this.outputBuffer.createSafeCursor();
+    // Claude Code shows first-run gates that block the session until answered:
+    //   1. "trust this folder?": default highlight is accept, so Enter confirms.
+    //   2. "--dangerously-skip-permissions" Bypass Permissions warning: default
+    //      highlight is "No, exit", so a bare Enter EXITS the process (crash loop).
+    //      We must move the selection down to "Yes, I accept" before confirming.
+    // The prompt can render slowly; retry through 32s while the gate remains
+    // visible, with a hard cap on answers to bound stray input.
+    // Skipped for runtimes that never show these prompts (Hermes overrides
+    // needsTrustPromptAutoAccept). The loose substring match would otherwise
+    // fire stray input on unrelated output.
     this.bypassAnswerCount = 0;
-    if (handlesClaudeTrustPrompts) {
+    if (this.needsTrustPromptAutoAccept()) {
       for (const delayMs of [5000, 8000, 11000, 14000, 20000, 26000, 32000]) {
         const timer = setTimeout(() => {
-          if (!this.pty) return;
-          const candidate = this.promptAnswerSent
-            ? this.outputBuffer.getSafeTailSince(this.promptOutputCursor, 4096)
-            : this.outputBuffer.getRecentTail(4096);
-          const tail = stripAnsi(candidate);
+          // Once the real session has bootstrapped, old dialog text may still
+          // remain in the ring buffer. Never let a delayed prompt timer turn
+          // that stale text into a keystroke in the live session.
+          if (!this.pty || this.outputBuffer.isBootstrapped()) return;
+          const tail = stripAnsi(this.outputBuffer.getRecentTail(4096));
+          const lower = tail.toLowerCase();
           try {
+            // A restored session whose final 4KB still contains an old bypass
+            // dialog may receive Down+Enter at an empty prompt. That keystroke is
+            // harmless; the predicate order below excludes lethal bare Enter.
             const bypassGateVisible =
-              tail.includes('Yes, I accept') ||
-              tail.includes('running in Bypass Permissions mode');
-            if (bypassGateVisible && effectiveSkip !== false) {
+              lower.includes('no, exit') &&
+              (lower.includes('dangerously') || lower.includes('bypass permissions'));
+            if (bypassGateVisible) {
               if (this.bypassAnswerCount >= 3) return;
-              // Bypass Permissions defaults to exit. Move to accept, then confirm.
+              // The bypass gate defaults to "No, exit", so Down+Enter is required.
+              // This branch runs before folder trust detection, making bare Enter
+              // structurally unreachable while any bypass marker is visible.
               this.pty.write('\x1b[B\r');
               this.bypassAnswerCount += 1;
-              this.promptAnswerSent = true;
-              this.promptOutputCursor = this.outputBuffer.createSafeCursor();
               return;
             }
-            const folderTrustVisible =
-              tail.includes('Yes, I trust this folder') ||
-              tail.includes('trust the files in this folder');
-            if (folderTrustVisible) {
+            const trustGateVisible =
+              (lower.includes('trust this folder') ||
+                lower.includes('trust this directory') ||
+                lower.includes('trust the files in this folder')) &&
+              (lower.includes('yes') || lower.includes('proceed'));
+            if (trustGateVisible) {
+              // Folder trust defaults to accept. Down+Enter would select exit here.
               this.pty.write('\r');
-              this.promptAnswerSent = true;
-              this.promptOutputCursor = this.outputBuffer.createSafeCursor();
             }
           } catch {
             // PTY torn down between the alive check and the write. Ignore it.
@@ -274,26 +285,32 @@ export class AgentPTY {
         }, delayMs);
         this.trustPromptTimers.push(timer);
       }
+
+      const backstop = setTimeout(() => {
+        if (!this.pty || this.outputBuffer.isBootstrapped()) return;
+        const tail = stripAnsi(this.outputBuffer.getRecentTail(4096));
+        const promptVisible =
+          tail.includes('No, exit') ||
+          tail.includes('dangerously') ||
+          tail.includes('Bypass Permissions') ||
+          tail.includes('trust this folder') ||
+          tail.includes('trust this directory');
+        if (promptVisible) {
+          this._awaitingInteractiveConfirmation = true;
+          console.warn(`[agent-pty] ${this.env.agentName}: awaiting interactive confirmation — first-run prompt still showing at backstop`);
+        }
+      }, 45_000);
+      this.trustPromptTimers.push(backstop);
     }
   }
 
   /**
-   * Whether the binary this PTY will spawn is Claude Code. Derived from
-   * getBinaryName() -- the same value that decides what actually spawns -- so
-   * runtimes that override the binary (Hermes -> 'hermes', OpenCode ->
-   * 'opencode') and vendor adapters that spawn codex/gemini are excluded
-   * automatically, with no per-subclass opt-out to forget.
-   *
-   * Gates BOTH Claude-only spawn behaviors:
-   *   1. the claude-preflight config writes (~/.claude.json folder trust,
-   *      ~/.claude/settings.json bypass-prompt suppression), and
-   *   2. the trust/bypass prompt auto-accept timers, whose loose substring
-   *      match must never fire a stray keypress into a non-Claude TUI
-   *      (the hazard HermesPTY previously opted out of by override).
+   * Whether this runtime shows a "trust this folder?" prompt that the
+   * daemon should auto-accept. Claude Code does; Hermes does not
+   * (HermesPTY overrides this to return false).
    */
-  protected isClaudeCodeRuntime(): boolean {
-    const binary = basename(this.getBinaryName()).toLowerCase();
-    return binary === 'claude' || binary === 'claude.cmd' || binary === 'claude.exe';
+  protected needsTrustPromptAutoAccept(): boolean {
+    return true;
   }
 
   private clearTrustPromptTimers(): void {
@@ -343,13 +360,33 @@ export class AgentPTY {
    * Protected so HermesPTY can override this for its own spawn args.
    * Default delegates to the configured vendor adapter (anthropic by default).
    */
-  protected buildClaudeArgs(
-    mode: 'fresh' | 'continue',
-    prompt: string,
-    config: AgentConfig = this.config,
-  ): string[] {
-    const adapter = loadAdapter(config.vendor);
-    return adapter.buildArgs(mode, prompt, { config, env: this.env });
+  protected buildClaudeArgs(mode: 'fresh' | 'continue', prompt: string): string[] {
+    const adapter = loadAdapter(this.config.vendor);
+    return adapter.buildArgs(mode, prompt, { config: this.resolveSkipConsentConfig(), env: this.env });
+  }
+
+  /**
+   * Resolve durable unattended-consent at spawn time when the per-agent
+   * `dangerously_skip_permissions` field is ABSENT.
+   *
+   * add-agent writes the resolved value into config for agents generated under
+   * the current version, but a LEGACY config predating that field is never
+   * re-resolved — and the Anthropic adapter treats any non-`false` value
+   * (including absent) as skip-on, so a legacy agent whose installation recorded
+   * consent=false would silently regain `--dangerously-skip-permissions`.
+   * Resolving here (only for the Claude runtime, only when the field is unset)
+   * propagates the explicit opt-out — and an unreadable record fails safe to
+   * `false` (gate ON). An ABSENT record stays unset: the historical skip-on
+   * default for unattended agents is preserved.
+   */
+  private resolveSkipConsentConfig(): AgentConfig {
+    if (this.config.dangerously_skip_permissions !== undefined) return this.config;
+    const adapterBinary = loadAdapter(this.config.vendor).binary;
+    const isClaudeRuntime = adapterBinary === 'claude' || adapterBinary === 'claude.cmd';
+    if (!isClaudeRuntime) return this.config;
+    const durable = readUnattendedConsent(this.env.frameworkRoot);
+    if (typeof durable !== 'boolean') return this.config;
+    return { ...this.config, dangerously_skip_permissions: durable };
   }
 
   /**
@@ -437,6 +474,10 @@ export class AgentPTY {
     return this.outputBuffer;
   }
 
+  isAwaitingInteractiveConfirmation(): boolean {
+    return this._awaitingInteractiveConfirmation && !this.outputBuffer.isBootstrapped();
+  }
+
   /**
    * Get a clean base environment (excluding potentially harmful vars).
    */
@@ -447,6 +488,12 @@ export class AgentPTY {
       'PATH', 'HOME', 'USER', 'SHELL', 'TERM', 'LANG', 'LC_ALL',
       'TMPDIR', 'TEMP', 'TMP', 'ANTHROPIC_API_KEY', 'CLAUDE_API_KEY',
       'NODE_PATH', 'COMSPEC', 'USERPROFILE',
+      // HERMES_HOME: without this the child could NEVER inherit the daemon's
+      // value, while AgentProcess.resolveHermesHome() falls back to it when no
+      // env file supplies one — so the daemon probed a state.db the child would
+      // never use. Passing it through makes the daemon's documented
+      // process.env fallback true for the child as well. See resolveHermesHome.
+      'HERMES_HOME',
       // Windows path-expansion essentials.
       'SystemDrive', 'SystemRoot', 'windir',
       'APPDATA', 'LOCALAPPDATA', 'ProgramData', 'ALLUSERSPROFILE',

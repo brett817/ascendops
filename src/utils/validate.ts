@@ -40,6 +40,35 @@ export function validateOrgName(org: string): void {
   }
 }
 
+/**
+ * Reject an empty or whitespace-only message body.
+ *
+ * Added 2026-08-03. Before this, `sendMessage` validated the sender, the recipient and the
+ * priority but never the text, so an empty body was accepted, HMAC-signed, written to the
+ * inbox, delivered and ACK'd with EVERY layer reporting success: the send returned a msg_id,
+ * the receive succeeded, the ACK succeeded. A review verdict, an approval, or a blocker
+ * could vanish with no error raised anywhere.
+ *
+ * Measured before the fix: 19 empty bodies across 43,457 stored messages, from 5 distinct
+ * senders, spread from 2026-04-24 through 2026-08-03 — a live low-rate silent loss, not a
+ * closed historical bug. Immediate trigger was a PR review verdict that arrived empty.
+ *
+ * Root cause: the `send-message` CLI declares `<text>` as a REQUIRED positional, but
+ * commander treats an empty string as satisfying it.
+ *
+ * A caller sweep of all 11 bus `sendMessage` call sites found ZERO legitimate metadata-only
+ * empty-text patterns, so rejecting empty breaks no existing traffic.
+ */
+export function validateMessageText(text: string): void {
+  if (typeof text !== 'string' || text.trim() === '') {
+    throw new Error(
+      'Empty message body: refusing to send a message with no text. ' +
+      'An empty body is delivered and ACKed silently, so the content is lost with no error. ' +
+      'If this came from the CLI, check for an empty quoted argument.'
+    );
+  }
+}
+
 export function validatePriority(priority: string): asserts priority is Priority {
   if (!VALID_PRIORITIES.includes(priority as Priority)) {
     throw new Error(
@@ -118,6 +147,53 @@ export function validateTrustLevel(level: string): asserts level is TrustLevel {
   }
 }
 
+// Every `=== X ===` containment header the daemon injects into an agent PTY.
+// This is the single source of truth: sanitizeForPtyInjection builds its
+// forged-header quote pattern FROM this list, so the neutralizer can never lag
+// the set. SLACK (Socket Mode + fast-checker) and GMAIL WATCH (unread-mail
+// notification) were emitting headers that predated their registration here —
+// a forged copy in an unfenced context-preview field went un-quoted until they
+// were added. `SLACK` covers `=== SLACK CONNECTION DEAD` via the \b rule, and
+// `TELEGRAM` covers the PHOTO/DOCUMENT/VOICE/VIDEO variants. The anti-drift
+// census test (tests/unit/utils/validate.test.ts) fails if any daemon-emitted
+// marker is ever missing from this list again.
+export const DAEMON_STRUCTURAL_HEADERS = [
+  'AGENT MESSAGE', 'TELEGRAM', 'SLACK', 'REACTION', 'URGENT SIGNAL', 'CRON FIRED',
+  'CONTEXT', 'CONTEXT HANDOFF REQUIRED', 'GMAIL WATCH',
+] as const;
+
+export type DaemonStructuralHeader = typeof DAEMON_STRUCTURAL_HEADERS[number];
+export type DaemonInjectionReply =
+  | { kind: 'agent'; from: string; messageId: string }
+  | { kind: 'telegram'; chatId: string | number };
+export type DaemonInjectionBody = { kind: 'raw'; content: string };
+export type DaemonInjection =
+  | { kind: 'raw'; content: string }
+  | { kind: 'structural'; header: DaemonStructuralHeader; details?: string; body?: DaemonInjectionBody; reply?: DaemonInjectionReply };
+
+export const rawDaemonInjection = (content: string): DaemonInjection => ({ kind: 'raw', content });
+export const rawDaemonBody = (content: string): DaemonInjectionBody => ({ kind: 'raw', content });
+export function structuralDaemonInjection(
+  header: DaemonStructuralHeader,
+  details = '',
+  body?: DaemonInjectionBody,
+  reply?: DaemonInjectionReply,
+): DaemonInjection {
+  return { kind: 'structural', header, details, body, reply };
+}
+
+export function createDaemonStructuralHeader(header: DaemonStructuralHeader, details = ''): string {
+  if (!(DAEMON_STRUCTURAL_HEADERS as readonly string[]).includes(header)) {
+    throw new Error(`Unregistered daemon structural header: ${String(header)}`);
+  }
+  if (/(?:^|[\r\n])\s*===/.test(details)) {
+    throw new Error('Daemon structural header details must not contain an unneutralized header');
+  }
+  return `=== ${header}${details ? ` ${details}` : ''} ===`;
+}
+
+const DAEMON_STRUCTURAL_HEADER_PATTERN = DAEMON_STRUCTURAL_HEADERS.join('|');
+
 /**
  * Wrap untrusted text as a code-fenced block that the body CANNOT escape, with
  * zero mutation of the body itself (legit code blocks survive byte-exact).
@@ -177,7 +253,39 @@ export function sanitizeForPtyInjection(input: string): string {
     .replace(/\r\n?/g, '\n')
     .replace(/`{3,}/g, '``')
     .replace(
-      /^([ \t\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000\uFEFF]*)(={3,}\s*(?:AGENT MESSAGE|TELEGRAM)\b|Reply using:\s*cortextos\s+bus)/gim,
+      new RegExp(`^([ \\t\\u00A0\\u1680\\u2000-\\u200A\\u202F\\u205F\\u3000\\uFEFF]*)(={3,}\\s*(?:${DAEMON_STRUCTURAL_HEADER_PATTERN})\\b|Reply using:\\s*cortextos\\s+bus)`, 'gim'),
       '$1[quoted] $2',
     );
+}
+
+export function renderDaemonInjection(input: DaemonInjection): string {
+  if (!input || typeof input !== 'object' || !('kind' in input)) throw new Error('Malformed daemon injection');
+  if (input.kind === 'raw') {
+    if (typeof input.content !== 'string') throw new Error('Malformed raw daemon injection');
+    return wrapFenceSafe(input.content);
+  }
+  if (input.kind !== 'structural') throw new Error(`Unknown daemon injection variant: ${String((input as { kind?: unknown }).kind)}`);
+  if (!(DAEMON_STRUCTURAL_HEADERS as readonly unknown[]).includes(input.header)) {
+    throw new Error(`Unregistered daemon structural header: ${String(input.header)}`);
+  }
+  if (input.details !== undefined && typeof input.details !== 'string') throw new Error('Malformed daemon structural details');
+  if (input.body !== undefined && (!input.body || input.body.kind !== 'raw' || typeof input.body.content !== 'string')) {
+    throw new Error('Malformed daemon structural body');
+  }
+  const details = sanitizeForPtyInjection(input.details ?? '').replace(/\n+/g, ' ').trim();
+  const header = createDaemonStructuralHeader(input.header, details);
+  const body = input.body ? `\n${wrapFenceSafe(input.body.content)}` : '';
+  let reply = '';
+  if (input.reply?.kind === 'agent') {
+    if (typeof input.reply.from !== 'string' || typeof input.reply.messageId !== 'string') throw new Error('Malformed agent reply directive');
+    const from = sanitizeForPtyInjection(input.reply.from).replace(/\n+/g, ' ').trim();
+    const messageId = sanitizeForPtyInjection(input.reply.messageId).replace(/\n+/g, '').trim();
+    reply = `\nReply using: cortextos bus send-message ${from} normal '<your reply>' ${messageId}`;
+  } else if (input.reply?.kind === 'telegram') {
+    if (!['string', 'number'].includes(typeof input.reply.chatId)) throw new Error('Malformed Telegram reply directive');
+    reply = `\nReply using: cortextos bus send-telegram ${input.reply.chatId} '<your reply>'`;
+  } else if (input.reply !== undefined) {
+    throw new Error('Unknown daemon reply directive');
+  }
+  return `${header}${body}${reply}\n\n`;
 }

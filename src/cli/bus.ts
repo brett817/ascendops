@@ -3,18 +3,24 @@ import { spawnSync, execFileSync } from 'child_process';
 import { existsSync, readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { sendMessage, checkInbox, ackInbox, pruneProcessed, PROCESSED_TTL_DAYS, PROCESSED_TTL_MIN_DAYS } from '../bus/message.js';
-import { agentExists, listAgents } from '../bus/agents.js';
+import { agentExists } from '../bus/agents.js';
 import { validateAgentName, isValidJson, validateTaskId } from '../utils/validate.js';
-import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
+import { createTask, updateTask, touchTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
 import { redactSSN } from '../utils/ssn-redaction.js';
 import { updateHeartbeat, readAllHeartbeats } from '../bus/heartbeat.js';
 import { queryCap } from '../bus/query-cap.js';
 import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, postActivity } from '../bus/system.js';
+import {
+  assertAutoCommitLeaseHeld,
+  getAutoCommitLeaseStatus,
+  releaseAutoCommitLease,
+  resolveAutoCommitLeaseTtlMs,
+} from '../bus/auto-commit-lease.js';
 import { createExperiment, runExperiment, evaluateExperiment, listExperiments, gatherContext, manageCycle, loadExperimentConfig } from '../bus/experiment.js';
 import { browseCatalog, installCommunityItem, prepareSubmission, submitCommunityItem } from '../bus/catalog.js';
-import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
+import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, checkUpstreamAsOwner, collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
 import { createApproval, updateApproval } from '../bus/approval.js';
 import { listActiveThreads, addActiveThread, updateActiveThread, removeActiveThread, clearActiveThreads } from '../bus/active-threads.js';
 import { listVendorDocPatterns, vendorDocPattern } from '../bus/vendor-patterns.js';
@@ -29,12 +35,17 @@ import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, ALERT_5H, 
 import { createSkillPr, createSkillAuditPr } from '../bus/skill-autopr.js';
 import { atomicWriteSync } from '../utils/atomic.js';
 import { resolvePaths } from '../utils/paths.js';
-import { resolveEnv } from '../utils/env.js';
-import { resolveCommsLintRules, type ResolvedCommsLintRules } from '../bus/comms-lint-config.js';
+import { parseEnvFile, resolveEnv, resolveTargetAgentDir } from '../utils/env.js';
+import { configuredTimezone } from '../utils/timezone.js';
+import {
+  resolveCommsLintRules,
+  type CommsLintRule,
+  type ResolvedCommsLintRules,
+} from '../bus/comms-lint-config.js';
 import { IPCClient } from '../daemon/ipc-server.js';
 import { TelegramAPI } from '../telegram/api.js';
 import { logOutboundMessage, cacheLastSent, rotateMessageLogIfNeeded } from '../telegram/logging.js';
-import type { Priority, Task, TaskStatus, EventCategory, EventSeverity, ApprovalCategory, ApprovalStatus, OrgContext, CronDefinition } from '../types/index.js';
+import type { Priority, Task, TaskStatus, EventCategory, EventSeverity, ApprovalCategory, ApprovalStatus, OrgContext, CronDefinition, BusPaths } from '../types/index.js';
 
 /**
  * Check if the org requires deliverables and the task has none attached.
@@ -78,11 +89,64 @@ function checkDeliverableRequirement(taskId: string, frameworkRoot: string, org:
 export const busCommand = new Command('bus')
   .description('Bus commands for agent messaging, tasks, and events');
 
+export type TelegramBotTokenResolution =
+  | { ok: true; token: string; source: 'agent-env' | 'process-env'; warning?: string }
+  | { ok: false; message: string; exitCode: number };
+
+export function resolveTelegramBotTokenForSend(
+  env: { agentDir?: string },
+  processEnv: NodeJS.ProcessEnv = process.env,
+): TelegramBotTokenResolution {
+  if (env.agentDir) {
+    const agentEnv = join(env.agentDir, '.env');
+    const token = existsSync(agentEnv) ? parseEnvFile(agentEnv).BOT_TOKEN?.trim() : '';
+    if (token) {
+      return { ok: true, token, source: 'agent-env' };
+    }
+
+    if (processEnv.CTX_AGENT_DIR?.trim()) {
+      return {
+        ok: false,
+        exitCode: 1,
+        message: `Error: BOT_TOKEN is missing from ${agentEnv}. Refusing to fall back to ambient BOT_TOKEN while CTX_AGENT_DIR is set, because that can send from the wrong Telegram bot.`,
+      };
+    }
+  }
+
+  const token = processEnv.BOT_TOKEN?.trim() || '';
+  if (token) {
+    return {
+      ok: true,
+      token,
+      source: 'process-env',
+      warning: env.agentDir
+        ? 'Warning: CTX_AGENT_DIR is not explicitly set. Falling back to process.env.BOT_TOKEN for send-telegram after derived agent .env did not provide BOT_TOKEN.'
+        : 'Warning: no CTX_AGENT_DIR/agentDir context resolved. Falling back to process.env.BOT_TOKEN for send-telegram.',
+    };
+  }
+
+  return {
+    ok: false,
+    exitCode: 0,
+    message: 'Warning: BOT_TOKEN not set. Skipping Telegram message. Set it in your agent .env file to enable Telegram.',
+  };
+}
+
 type OutboundLintResult = {
   ok: boolean;
   phrase?: string;
   reason?: string;
   suggest?: string;
+  ruleClass?: CommsLintRule['group'];
+  ruleId?: string;
+};
+
+type CommsLintTargetType = 'agent' | 'telegram' | 'mobile';
+
+type CommsLintTelemetryContext = {
+  paths: BusPaths;
+  agentName: string;
+  org: string;
 };
 
 // The banned/passive/telegram/agent-name rule data formerly lived as
@@ -101,6 +165,8 @@ function lintOutboundMessage(text: string, rules: ResolvedCommsLintRules): Outbo
         phrase: m[0],
         reason: 'banned jargon',
         suggest: rule.suggest,
+        ruleClass: rule.group,
+        ruleId: rule.id,
       };
     }
   }
@@ -110,14 +176,20 @@ function lintOutboundMessage(text: string, rules: ResolvedCommsLintRules): Outbo
     const hasActiveContext = rules.activeContext.test(text) || rules.nextSignalContext.test(text);
     if (!hasActiveContext) {
       let m: RegExpMatchArray | null = null;
+      let matchedRule: CommsLintRule | undefined;
       for (const r of rules.passive) {
         m = text.match(r.pattern);
-        if (m) break;
+        if (m) {
+          matchedRule = r;
+          break;
+        }
       }
       return {
         ok: false,
         phrase: m?.[0] ?? 'passive posture framing',
         reason: 'passive posture framing without active-work or specific next-signal context',
+        ruleClass: matchedRule?.group ?? 'passive',
+        ruleId: matchedRule?.id,
       };
     }
   }
@@ -156,31 +228,73 @@ export function emitResult(result: unknown, extraFailStatuses: string[] = []): v
  * Resolve the comms-lint rule set for the current agent/org context. Reads
  * per-org and per-agent config (fail-open to defaults). Never throws.
  */
-function resolveLintRules(): ResolvedCommsLintRules {
+function resolveLintRules(targetType: CommsLintTargetType): ResolvedCommsLintRules {
   const env = resolveEnv();
-  // Agent-name lint is built from the CONFIGURED org roster, never hardcoded.
-  // FAIL-SAFE floor: always seed the roster with the calling agent's OWN runtime
-  // identity (env.agentName), so an agent can NEVER leak its own name even with
-  // zero org roster (a leak-prevention lint must fail safe, not open). The org
-  // roster from listAgents layers on top. A broken roster read never crashes a
-  // send and never removes the own-identity floor.
-  const roster = new Set<string>();
-  if (typeof env.agentName === 'string' && env.agentName.length > 0) {
-    roster.add(env.agentName);
-  }
-  try {
-    for (const a of listAgents(env.ctxRoot, env.org)) {
-      if (typeof a.name === 'string' && a.name.length > 0) roster.add(a.name);
-    }
-  } catch {
-    // roster read failed — the own-identity floor above still protects.
-  }
-  return resolveCommsLintRules({
+  const rules = resolveCommsLintRules({
     org: env.org,
     agentDir: env.agentDir,
     frameworkRoot: env.frameworkRoot,
-    roster: [...roster],
   });
+  if (targetType === 'agent') {
+    const humanDefaultIds = new Set([
+      'banned:sleep-posture', 'banned:standing-by', 'banned:standby',
+      'banned:parked', 'banned:on-deck', 'banned:idle', 'banned:asleep',
+      'banned:sleeping', 'banned:waiting-on', 'passive:posture-set',
+      'passive:waiting',
+    ]);
+    return {
+      ...rules,
+      banned: rules.banned.filter(rule => !humanDefaultIds.has(rule.id)),
+      passive: rules.passive.filter(rule => !humanDefaultIds.has(rule.id)),
+    };
+  }
+  return rules;
+}
+
+function logCommsLintBlocked(
+  result: OutboundLintResult,
+  targetType: CommsLintTargetType,
+  telemetryContext?: CommsLintTelemetryContext,
+): void {
+  try {
+    const context = telemetryContext ?? currentCommsLintTelemetryContext();
+    logEvent(context.paths, context.agentName, context.org, 'action', 'comms_lint_blocked', 'warning', {
+      matched_phrase: result.phrase ?? null,
+      rule_class: result.ruleClass ?? null,
+      rule_id: result.ruleId ?? null,
+      target_type: targetType,
+    });
+  } catch {
+    // Telemetry must never change the lint decision.
+  }
+}
+
+function logCommsLintSkipped(
+  result: OutboundLintResult,
+  targetType: CommsLintTargetType,
+  telemetryContext?: CommsLintTelemetryContext,
+): void {
+  try {
+    const context = telemetryContext ?? currentCommsLintTelemetryContext();
+    logEvent(context.paths, context.agentName, context.org, 'action', 'comms_lint_skipped', 'warning', {
+      skip_lint: true,
+      matched_phrase: result.phrase ?? null,
+      rule_class: result.ruleClass ?? null,
+      rule_id: result.ruleId ?? null,
+      target_type: targetType,
+    });
+  } catch {
+    // Telemetry must never change the lint decision.
+  }
+}
+
+function currentCommsLintTelemetryContext(): CommsLintTelemetryContext {
+  const env = resolveEnv();
+  return {
+    paths: resolvePaths(env.agentName, env.instanceId, env.org),
+    agentName: env.agentName,
+    org: env.org,
+  };
 }
 
 /**
@@ -212,16 +326,27 @@ function printSuggestReport(result: OutboundLintResult): void {
 function enforceOutboundLintOrExit(
   text: string,
   skipLint: boolean | undefined,
-  opts?: { suggest?: boolean },
+  targetType: Exclude<CommsLintTargetType, 'telegram'>,
+  opts?: { suggest?: boolean; telemetryContext?: CommsLintTelemetryContext },
 ): boolean {
-  if (skipLint) return true;
-  const rules = resolveLintRules();
+  if (skipLint) {
+    let result: OutboundLintResult = { ok: true };
+    try {
+      result = lintOutboundMessage(text, resolveLintRules(targetType));
+    } catch {
+      // Preserve the pre-telemetry --skip-lint behavior on any probe failure.
+    }
+    logCommsLintSkipped(result, targetType, opts?.telemetryContext);
+    return true;
+  }
+  const rules = resolveLintRules(targetType);
   const result = lintOutboundMessage(text, rules);
   if (opts?.suggest) {
     printSuggestReport(result);
     return false;
   }
   if (!result.ok) {
+    logCommsLintBlocked(result, targetType, opts?.telemetryContext);
     const phrase = result.phrase ?? 'unknown';
     const reason = result.reason ?? 'policy violation';
     console.error(
@@ -234,7 +359,7 @@ function enforceOutboundLintOrExit(
   return true;
 }
 
-// ─── Telegram-only plain-talk patterns (locked 2026-05-22 by an agent C5 dispatch) ───
+// ─── Telegram-only plain-talk patterns ───
 // These fire ONLY on send-telegram (outbound to David). Agent-to-agent bus
 // comms stay technical/jargon-permissive — the patterns catch engineer-speak
 // that confuses non-technical recipients. Rule data now lives in the loader
@@ -261,6 +386,8 @@ function lintOutboundTelegramMessage(
         // surface suggest separately for --suggest.
         reason: rule.suggest ? `${rule.reason} — ${rule.suggest}` : rule.reason,
         suggest: rule.suggest,
+        ruleClass: rule.group,
+        ruleId: rule.id,
       };
     }
   }
@@ -278,6 +405,8 @@ function lintOutboundTelegramMessage(
           ? `${rules.agentName.reason} — ${rules.agentName.suggest}`
           : rules.agentName.reason,
         suggest: rules.agentName.suggest,
+        ruleClass: rules.agentName.group,
+        ruleId: rules.agentName.id,
       };
     }
   }
@@ -295,14 +424,24 @@ function enforceTelegramLintOrExit(
   explicitNaming: boolean | undefined,
   opts?: { suggest?: boolean },
 ): boolean {
-  if (skipLint) return true;
-  const rules = resolveLintRules();
+  if (skipLint) {
+    let result: OutboundLintResult = { ok: true };
+    try {
+      result = lintOutboundTelegramMessage(text, !!explicitNaming, resolveLintRules('telegram'));
+    } catch {
+      // Preserve the pre-telemetry --skip-lint behavior on any probe failure.
+    }
+    logCommsLintSkipped(result, 'telegram');
+    return true;
+  }
+  const rules = resolveLintRules('telegram');
   const result = lintOutboundTelegramMessage(text, !!explicitNaming, rules);
   if (opts?.suggest) {
     printSuggestReport(result);
     return false;
   }
   if (!result.ok) {
+    logCommsLintBlocked(result, 'telegram');
     const phrase = result.phrase ?? 'unknown';
     const reason = result.reason ?? 'policy violation';
     console.error(
@@ -406,7 +545,7 @@ busCommand
 
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
-    if (!enforceOutboundLintOrExit(text, opts.skipLint, { suggest: opts.suggest })) return;
+    if (!enforceOutboundLintOrExit(text, opts.skipLint, 'agent', { suggest: opts.suggest })) return;
     // SSN scrub happens at the sendMessage() primitive (src/bus/message.ts),
     // so it covers this path AND every other inbox writer (create-task notify,
     // notifyAgent). No per-call-site scrub needed here.
@@ -421,8 +560,8 @@ busCommand
 
     const msgId = sendMessage(paths, env.agentName, to, priority as Priority, text, effectiveReplyTo);
     try {
-      // rerouted to canonical category 2026-04-29 via internal dispatch — RFC #15 schema-drift cleanup
-      logEvent(paths, env.agentName, env.org, 'action', 'agent_message_sent', 'info', JSON.stringify({ to, priority, msg_id: msgId, reply_to: effectiveReplyTo ?? null }));
+      // rerouted to canonical category 2026-04-29 — RFC #15 schema-drift cleanup
+      logEvent(paths, env.agentName, env.org, 'action', 'agent_message_sent', 'info', JSON.stringify({ to, priority, msg_id: msgId, reply_to: effectiveReplyTo ?? null }), { refreshHeartbeat: true });
     } catch { /* non-fatal */ }
     console.log(msgId);
   });
@@ -432,8 +571,13 @@ busCommand
   .action(() => {
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
-    const messages = checkInbox(paths);
-    console.log(JSON.stringify(messages));
+    try {
+      const messages = checkInbox(paths);
+      console.log(JSON.stringify(messages));
+    } catch (err) {
+      console.error(`check-inbox failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exitCode = 1;
+    }
   });
 
 busCommand
@@ -444,8 +588,8 @@ busCommand
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
     ackInbox(paths, id);
     try {
-      // rerouted to canonical category 2026-04-29 via internal dispatch — RFC #15 schema-drift cleanup
-      logEvent(paths, env.agentName, env.org, 'action', 'inbox_ack', 'info', JSON.stringify({ msg_id: id }));
+      // rerouted to canonical category 2026-04-29 — RFC #15 schema-drift cleanup
+      logEvent(paths, env.agentName, env.org, 'action', 'inbox_ack', 'info', JSON.stringify({ msg_id: id }), { refreshHeartbeat: true });
     } catch { /* non-fatal */ }
     console.log(`ACK'd ${id}`);
   });
@@ -514,6 +658,17 @@ busCommand
       sendMessage(assigneePaths, env.agentName, opts.assignee, 'normal',
         `Task assigned: [${opts.priority}] ${title}${desc} (id: ${taskId})`);
     }
+  });
+
+busCommand
+  .command('touch-task')
+  .description('Bump a task\'s updated_at without a status transition (BUG-030) — for standing/recurring tasks re-verified every heartbeat that never change status, so check-stale-tasks does not false-flag them. Prefer this over `update-task <id> <same-status>`, which writes a misleading no-op transition into the audit log.')
+  .argument('<id>', 'Task ID')
+  .action((id: string) => {
+    const env = resolveEnv();
+    const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+    touchTask(paths, id);
+    console.log(`Touched ${id} (updated_at refreshed)`);
   });
 
 busCommand
@@ -706,14 +861,16 @@ busCommand
   .command('list-tasks')
   .option('--agent <name>', 'Filter by agent')
   .option('--status <s>', 'Filter by status')
+  .option('--project <name>', 'Filter by project (e.g. human-tasks)')
   .option('--format <fmt>', 'Output format: json or text', 'text')
   .option('--respect-deps', 'Sort DAG-aware: unblocked tasks first, blocked tasks last')
-  .action((opts: { agent?: string; status?: string; format?: string; respectDeps?: boolean }) => {
+  .action((opts: { agent?: string; status?: string; project?: string; format?: string; respectDeps?: boolean }) => {
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
     const tasks = listTasks(paths, {
       agent: opts.agent,
       status: opts.status as TaskStatus,
+      project: opts.project,
       respectDeps: opts.respectDeps ?? false,
     });
 
@@ -727,33 +884,42 @@ busCommand
       console.log('  No tasks found.');
       return;
     }
-
-    const PRIORITY_ICON: Record<string, string> = { urgent: '🔴', high: '🟠', normal: '🔵', low: '⚪' };
-    const STATUS_ICON: Record<string, string> = { pending: '○', in_progress: '●', blocked: '◑', completed: '✓', done: '✓', cancelled: '✗' };
-
-    console.log(`\n  Tasks (${tasks.length})\n`);
-    // ID column is sized to the widest task id in the result set and NEVER
-    // truncates: a displayed task id is the value operators copy-paste straight
-    // into `update-task`/`complete-task`, so a clipped id is a silent
-    // command-failure footgun (a 27-char `task_<13-digit-epoch>_<8-digit-rand>`
-    // was being cut to 26, dropping the last suffix digit). Min width 2 keeps
-    // the 'ID' header column from collapsing when the list is empty.
-    const idWidth = Math.max(2, ...tasks.map((t) => t.id.length));
-    const header = `  Status  Pri  ${'ID'.padEnd(idWidth)}  Assignee         Title`;
-    const separator = '  ' + '-'.repeat(header.length - 2);
-    console.log(header);
-    console.log(separator);
-
-    for (const t of tasks) {
-      const statusIcon = (STATUS_ICON[t.status] || '?').padEnd(8);
-      const priIcon = (PRIORITY_ICON[t.priority] || '·').padEnd(5);
-      const id = t.id.padEnd(idWidth);
-      const assignee = (t.assigned_to || '-').substring(0, 16).padEnd(17);
-      const title = t.title.substring(0, 50);
-      console.log(`  ${statusIcon}${priIcon}${id}  ${assignee}${title}`);
-    }
-    console.log('');
+    console.log(formatTaskTable(tasks));
   });
+
+/**
+ * Render the list-tasks text table. IDs are copy-paste targets for
+ * update-task/complete-task, so they are NEVER truncated — column widths
+ * come from the data (same pattern as the crons table). Every column is
+ * separated by 2+ spaces; the only column that may truncate is the trailing
+ * title, and truncation is marked with "…". (The previous fixed-width render
+ * cut every 27-char id to 26 with no delimiter before the assignee, which
+ * produced plausible-but-wrong ids when copied.)
+ */
+export function formatTaskTable(tasks: Task[]): string {
+  const PRIORITY_ICON: Record<string, string> = { urgent: '🔴', high: '🟠', normal: '🔵', low: '⚪' };
+  const STATUS_ICON: Record<string, string> = { pending: '○', in_progress: '●', blocked: '◑', completed: '✓', done: '✓', cancelled: '✗' };
+  const TITLE_MAX = 50;
+
+  const idW = Math.max(2, ...tasks.map(t => t.id.length));
+  const assigneeW = Math.max(8, ...tasks.map(t => (t.assigned_to || '-').length));
+
+  const lines: string[] = [];
+  lines.push(`\n  Tasks (${tasks.length})\n`);
+  const header = `  Status  Pri  ${'ID'.padEnd(idW)}  ${'Assignee'.padEnd(assigneeW)}  Title`;
+  lines.push(header);
+  lines.push('  ' + '-'.repeat(header.length - 2));
+  for (const t of tasks) {
+    const statusIcon = (STATUS_ICON[t.status] || '?').padEnd(8);
+    const priIcon = (PRIORITY_ICON[t.priority] || '·').padEnd(5);
+    const id = t.id.padEnd(idW);
+    const assignee = (t.assigned_to || '-').padEnd(assigneeW);
+    const title = t.title.length > TITLE_MAX ? t.title.substring(0, TITLE_MAX - 1) + '…' : t.title;
+    lines.push(`  ${statusIcon}${priIcon}${id}  ${assignee}  ${title}`);
+  }
+  lines.push('');
+  return lines.join('\n');
+}
 
 busCommand
   .command('log-event')
@@ -787,7 +953,7 @@ busCommand
     }
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
-    logEvent(paths, env.agentName, env.org, category as EventCategory, event, severity as EventSeverity, opts.meta);
+    logEvent(paths, env.agentName, env.org, category as EventCategory, event, severity as EventSeverity, opts.meta, { refreshHeartbeat: true });
     console.log(`Logged ${category}/${event} (${severity})`);
   });
 
@@ -839,7 +1005,7 @@ busCommand
 
     updateHeartbeat(paths, env.agentName, status, {
       org: env.org,
-      timezone: opts.timezone,
+      timezone: configuredTimezone(opts.timezone) ?? configuredTimezone(env.timezone),
       loopInterval: opts.interval,
       currentTask: opts.task,
       displayName,
@@ -848,7 +1014,7 @@ busCommand
     // even if the agent itself forgets to call log-event. This makes the
     // dashboard "agents" list derive from heartbeats, not just explicit events.
     try {
-      logEvent(paths, env.agentName, env.org, 'heartbeat', 'heartbeat', 'info', JSON.stringify({ status, task: opts.task ?? '' }));
+      logEvent(paths, env.agentName, env.org, 'heartbeat', 'heartbeat', 'info', JSON.stringify({ status, task: opts.task ?? '' }), { refreshHeartbeat: true });
     } catch {
       // Non-fatal: heartbeat write already succeeded
     }
@@ -1062,11 +1228,85 @@ busCommand
   .action((opts: { dryRun?: boolean }) => {
     const env = resolveEnv();
     const projectDir = env.projectRoot || env.frameworkRoot || process.cwd();
-    const report = autoCommit(projectDir, opts.dryRun ?? false);
+    const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+    let ttlMs: number;
+    try {
+      ttlMs = resolveAutoCommitLeaseTtlMs(env.agentDir);
+    } catch (err) {
+      emitResult({
+        status: 'error',
+        staged: [],
+        blocked: [],
+        error: err instanceof Error ? err.message : 'invalid auto-commit lease configuration',
+        lease: { status: 'not_acquired', reason: 'invalid_lease_configuration' },
+      });
+      return;
+    }
+    const report = autoCommit(projectDir, opts.dryRun ?? false, {
+      org: env.org,
+      agent: env.agentName,
+    }, {
+      ctxRoot: env.ctxRoot,
+      ttlMs,
+      onTakeover: takeover => {
+        logEvent(paths, env.agentName, env.org, 'action', 'auto_commit_lease_takeover', 'warning', {
+          previous_holder: takeover.previous_holder,
+          previous_expires_at: new Date(takeover.previous_expires_at).toISOString(),
+          new_holder: { org: env.org, agent: env.agentName },
+          lease_disposition: 'acquired',
+        });
+      },
+    });
     // emitResult fails loud (exit 1) if autoCommit ever returns status 'error'/
     // 'conflict'; valid states (clean, nothing_to_stage, dry_run, staged) stay
     // exit 0. Drain-safe — sets exitCode, never raw exit after the envelope.
     emitResult(report);
+  });
+
+busCommand
+  .command('auto-commit-release <token>')
+  .description('Release the active auto-commit lease with its exact token')
+  .action((token: string) => {
+    const env = resolveEnv();
+    const result = releaseAutoCommitLease({ ctxRoot: env.ctxRoot, token });
+    let output: typeof result & {
+      telemetry?: { status: 'degraded'; error: string };
+    } = result;
+    if (result.status === 'released') {
+      try {
+        const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+        logEvent(paths, env.agentName, env.org, 'action', 'auto_commit_lease_released', 'info', {
+          lease_holder: result.holder,
+          released_by: { org: env.org, agent: env.agentName },
+          released_at: new Date(result.released_at).toISOString(),
+        });
+      } catch (err) {
+        output = {
+          ...result,
+          telemetry: {
+            status: 'degraded',
+            error: `release succeeded but telemetry failed: ${err instanceof Error ? err.message : 'unknown telemetry error'}`,
+          },
+        };
+      }
+    }
+    emitResult(output);
+  });
+
+busCommand
+  .command('auto-commit-assert-held <token>')
+  .description('Require the exact auto-commit lease token and 60 seconds of remaining life')
+  .action((token: string) => {
+    const env = resolveEnv();
+    emitResult(assertAutoCommitLeaseHeld(env.ctxRoot, token));
+  });
+
+busCommand
+  .command('auto-commit-lease-status')
+  .description('Read the current auto-commit lease without modifying it')
+  .action(() => {
+    const env = resolveEnv();
+    emitResult(getAutoCommitLeaseStatus(env.ctxRoot));
   });
 
 busCommand
@@ -1217,7 +1457,24 @@ busCommand
   .option('--cycle <name>', 'Cycle name')
   .action((action: string, agent: string, opts: { metric?: string; metricType?: string; surface?: string; direction?: string; window?: string; measurement?: string; loopInterval?: string; enabled?: string; cycle?: string }) => {
     const env = resolveEnv();
-    const agentDir = env.agentDir || process.cwd();
+    // Cycles live in the TARGET agent's experiments/config.json — the file
+    // the autoresearch skill reads in that agent's session. Writing to the
+    // caller's dir instead silently created a second registry the target
+    // never reads.
+    let agentDir: string | null = null;
+    try {
+      agentDir = resolveTargetAgentDir(env, agent);
+    } catch (err) {
+      console.error((err as Error).message);
+      process.exit(1);
+    }
+    if (!agentDir && agent === env.agentName) {
+      agentDir = env.agentDir || process.cwd();
+    }
+    if (!agentDir) {
+      console.error(`Cannot resolve agent directory for '${agent}'. Cycles are stored in the target agent's experiments/config.json — check the agent name.`);
+      process.exit(1);
+    }
     if (opts.direction && opts.direction !== 'higher' && opts.direction !== 'lower') {
       console.error(`Invalid --direction '${opts.direction}'. Must be 'higher' or 'lower'`);
       process.exit(1);
@@ -1313,7 +1570,11 @@ busCommand
   .description('Collect and aggregate system metrics across all agents')
   .action(() => {
     const env = resolveEnv();
-    const report = collectMetrics(env.ctxRoot, env.org || undefined);
+    const report = collectMetrics(
+      env.ctxRoot,
+      env.org || undefined,
+      env.frameworkRoot || env.projectRoot || undefined,
+    );
     console.log(JSON.stringify(report, null, 2));
   });
 
@@ -1333,10 +1594,20 @@ busCommand
   .command('check-upstream')
   .description('Check canonical repo for framework updates')
   .option('--apply', 'Merge upstream changes (requires user approval)')
-  .action((opts: { apply?: boolean }) => {
+  .option('--owner-only', 'Require this agent to own the shared canonical upstream check')
+  .option('--cron-invocation', 'Return a clean skip for a non-owner cron (manual non-owner runs fail)')
+  .action((opts: { apply?: boolean; ownerOnly?: boolean; cronInvocation?: boolean }) => {
     const env = resolveEnv();
     const frameworkRoot = env.frameworkRoot || env.projectRoot || process.cwd();
-    const result = checkUpstream(frameworkRoot, { apply: opts.apply });
+    const result = opts.ownerOnly
+      ? checkUpstreamAsOwner(frameworkRoot, {
+          ctxRoot: env.ctxRoot,
+          org: env.org,
+          agentName: env.agentName,
+          orchestrator: env.orchestrator ?? '',
+          invocation: opts.cronInvocation ? 'cron' : 'manual',
+        }, { apply: opts.apply })
+      : checkUpstream(frameworkRoot, { apply: opts.apply });
     emitResult(result);
   });
 
@@ -1381,7 +1652,7 @@ busCommand
     const { SlackAPI } = await import('../slack/api.js');
     const api = new SlackAPI(slackToken);
     try {
-      await api.postMessage(channel, message);
+      await api.postMessage(channel, message, await resolveSlackDisplayIdentity(env));
       console.log(`Slack message sent to ${channel}`);
     } catch (err) {
       console.error(`Failed to send Slack message: ${err}`);
@@ -1389,10 +1660,93 @@ busCommand
     }
   });
 
+/** D4 display identity from the agent's slack.json, when present — GATED.
+ * The persona gate is structural: only gateSlackDisplayIdentity can produce a
+ * value postMessage accepts, and it permits nothing but the agent's plain
+ * functional name (custom names/icons loudly suppressed) until the
+ * brand/persona review exists as an authority. */
+async function resolveSlackDisplayIdentity(
+  env: ReturnType<typeof resolveEnv>,
+): Promise<import('../slack/slack-routing.js').GatedDisplayIdentity | undefined> {
+  if (!env.frameworkRoot || !env.org || !env.agentName) return undefined;
+  const { resolveGatedDisplayIdentity } = await import('../slack/slack-routing.js');
+  return resolveGatedDisplayIdentity(env.frameworkRoot, env.org, env.agentName, (line) =>
+    console.error(line),
+  );
+}
+
+/** Shared Slack token resolution: agent .env first, then process env — the
+ * same flow as send-slack so all three commands act as the same identity. */
+function resolveSlackBotToken(env: ReturnType<typeof resolveEnv>): string {
+  if (env.agentDir) {
+    const { readFileSync, existsSync } = require('fs');
+    const { join } = require('path');
+    const agentEnv = join(env.agentDir, '.env');
+    if (existsSync(agentEnv)) {
+      const content = readFileSync(agentEnv, 'utf-8') as string;
+      const match = content.match(/^SLACK_BOT_TOKEN=(.+)$/m);
+      if (match?.[1]?.trim()) return match[1].trim();
+    }
+  }
+  return process.env.SLACK_BOT_TOKEN ?? '';
+}
+
+busCommand
+  .command('slack-test-send')
+  .description('Post a test message to a Slack channel and print the outcome (config verification aid)')
+  .argument('<channel>', 'Slack channel ID (e.g. C1234567890)')
+  .argument('[message]', 'Test message text', 'cortextos slack test message')
+  .action(async (channel: string, message: string) => {
+    const env = resolveEnv();
+    const slackToken = resolveSlackBotToken(env);
+    if (!slackToken) {
+      console.error('Error: SLACK_BOT_TOKEN not set (agent .env or environment).');
+      process.exit(1);
+    }
+    const { SlackAPI } = await import('../slack/api.js');
+    try {
+      await new SlackAPI(slackToken)
+        .postMessage(channel, message, await resolveSlackDisplayIdentity(env));
+      console.log(`OK: test message posted to ${channel}`);
+    } catch (err) {
+      // Unlike send-slack's soft-skip, a TEST send failing is the answer the
+      // operator asked for — exit nonzero with the API's reason.
+      console.error(`FAIL: ${err instanceof Error ? err.message : err}`);
+      process.exit(1);
+    }
+  });
+
+busCommand
+  .command('slack-discover-channels')
+  .description('List Slack channels the bot is a member of, with ids (slack.json authoring aid)')
+  .option('--all', 'Include channels the bot is NOT a member of', false)
+  .action(async (opts: { all?: boolean }) => {
+    const env = resolveEnv();
+    const slackToken = resolveSlackBotToken(env);
+    if (!slackToken) {
+      console.error('Error: SLACK_BOT_TOKEN not set (agent .env or environment).');
+      process.exit(1);
+    }
+    const { SlackAPI } = await import('../slack/api.js');
+    try {
+      const channels = await new SlackAPI(slackToken).listChannels(!opts.all);
+      if (channels.length === 0) {
+        console.log(opts.all ? 'No channels visible to this bot.' : 'Bot is not a member of any channel. Invite it, or use --all to list visible channels.');
+        return;
+      }
+      for (const c of channels) {
+        console.log(`${c.id}\t${c.name}${c.isMember ? '' : '\t(not a member)'}`);
+      }
+    } catch (err) {
+      console.error(`FAIL: ${err instanceof Error ? err.message : err}`);
+      process.exit(1);
+    }
+  });
+
 busCommand
   .command('send-sms')
   .description('Send an outbound SMS via Telnyx. Safe-by-default: preview only unless --send-real and --approved-by are both set.')
-  .argument('<to-e164>', 'Recipient phone number in E.164 format, e.g. +12025550142')
+  .argument('<to-e164>', 'Recipient phone number in E.164 format, e.g. +16145551212')
   .argument('<text>', 'SMS body text')
   .option('--send-real', 'Actually send the SMS. Requires --approved-by <approval_id>.', false)
   .option('--approved-by <approval-id>', 'Approved external-comms approval id required for live sends')
@@ -1440,33 +1794,17 @@ busCommand
     // Layer-2 backstop: never SHARE/STORE an SSN. Scrub in-place before the
     // send AND before logOutboundMessage / cacheLastSent / the activity event.
     message = redactSSN(message);
-    // Resolve bot token: agent .env first, then process.env
     const env = resolveEnv();
-    let botToken = '';
-
-    // 1. Check agent .env (most specific)
-    if (env.agentDir) {
-      const { readFileSync, existsSync } = require('fs');
-      const { join } = require('path');
-      const agentEnv = join(env.agentDir, '.env');
-      if (existsSync(agentEnv)) {
-        const content = readFileSync(agentEnv, 'utf-8');
-        const match = content.match(/^BOT_TOKEN=(.+)$/m);
-        if (match && match[1].trim()) botToken = match[1].trim();
-      }
+    const tokenResolution = resolveTelegramBotTokenForSend(env);
+    if (!tokenResolution.ok) {
+      console.error(tokenResolution.message);
+      process.exit(tokenResolution.exitCode);
+    }
+    if (tokenResolution.warning) {
+      console.warn(tokenResolution.warning);
     }
 
-    // 2. Fall back to process env
-    if (!botToken) {
-      botToken = process.env.BOT_TOKEN || '';
-    }
-
-    if (!botToken) {
-      console.error('Warning: BOT_TOKEN not set. Skipping Telegram message. Set it in your agent .env file to enable Telegram.');
-      process.exit(0);
-    }
-
-    const api = new TelegramAPI(botToken);
+    const api = new TelegramAPI(tokenResolution.token);
     try {
       let sentMessageId = 0;
       if (opts.image) {
@@ -1494,8 +1832,8 @@ busCommand
         try {
           const paths = resolvePaths(env.agentName, env.instanceId, env.org);
           const preview = message.length > 120 ? message.slice(0, 120) + '…' : message;
-          // rerouted to canonical category 2026-04-29 via internal dispatch — RFC #15 schema-drift cleanup
-          logEvent(paths, env.agentName, env.org, 'action', 'telegram_sent', 'info', JSON.stringify({ chat_id: chatId, message_id: sentMessageId, preview }));
+          // rerouted to canonical category 2026-04-29 — RFC #15 schema-drift cleanup
+          logEvent(paths, env.agentName, env.org, 'action', 'telegram_sent', 'info', JSON.stringify({ chat_id: chatId, message_id: sentMessageId, preview }), { refreshHeartbeat: true });
         } catch { /* non-fatal */ }
       }
 
@@ -2194,7 +2532,17 @@ busCommand
   .action((agent: string, reply: string, msgId?: string, opts?: { skipLint?: boolean; suggest?: boolean }) => {
     // Same literal '\n'/'\t' normalize as send-telegram (codex agent fix).
     reply = reply.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
-    if (!enforceOutboundLintOrExit(reply, opts?.skipLint, { suggest: opts?.suggest })) return;
+    let telemetryContext: CommsLintTelemetryContext | undefined;
+    try {
+      const { env, agentName, paths } = resolveAgentBusPaths(agent);
+      telemetryContext = { paths, agentName, org: env.org };
+    } catch {
+      // Telemetry context is best-effort and must not change lint behavior.
+    }
+    if (!enforceOutboundLintOrExit(reply, opts?.skipLint, 'mobile', {
+      suggest: opts?.suggest,
+      telemetryContext,
+    })) return;
     // Layer-2 backstop: never SHARE/STORE an SSN in the mobile reply log.
     reply = redactSSN(reply);
     const { mkdirSync, appendFileSync } = require('fs');
@@ -2606,7 +2954,9 @@ busCommand
   .argument('<interval>', 'Schedule: interval ("6h", "30m", "1d") or 5-field cron expr ("0 8 * * *")')
   .argument('<prompt...>', 'Prompt text injected when the cron fires (all remaining words joined)')
   .option('--desc <description>', 'Human-readable description (optional)')
-  .action(async (agent: string, name: string, interval: string, promptWords: string[], opts: { desc?: string }) => {
+  .option('--wake-on-fire', 'Pierce ALL off-shift suppression. Use sparingly — this is the blunt tier.')
+  .option('--emergency-class <class>', 'Wake off-shift IF this class is in the agent\'s off_shift_can_wake_for (e.g. flood, fire, safety, no_heat_freezing)')
+  .action(async (agent: string, name: string, interval: string, promptWords: string[], opts: { desc?: string; wakeOnFire?: boolean; emergencyClass?: string }) => {
     // Validate agent name format
     try { validateAgentName(agent); } catch (err) { console.error(String(err)); process.exit(1); }
 
@@ -2630,6 +2980,11 @@ busCommand
       enabled: true,
       created_at: new Date().toISOString(),
       ...(opts.desc ? { description: opts.desc } : {}),
+      // Emergency-path flags. Before 2026-08-10 `wake_on_fire` was readable by
+      // the daemon but settable only by hand-editing a live crons.json, so the
+      // one working exemption was unreachable through the tool.
+      ...(opts.wakeOnFire ? { wake_on_fire: true } : {}),
+      ...(opts.emergencyClass ? { emergency_class: opts.emergencyClass } : {}),
     };
 
     try {
@@ -3497,12 +3852,12 @@ busCommand
           // Log to event bus
           if (!opts.dryRun) {
             try {
-              // rerouted to canonical category 2026-04-29 via internal dispatch — RFC #15 schema-drift cleanup
+              // rerouted to canonical category 2026-04-29 — RFC #15 schema-drift cleanup
               logEvent(paths, env.agentName, env.org, 'action', 'tool_call', 'info', {
                 line: trimmed,
                 session: sessionName,
                 high_signal: isHighSignal,
-              });
+              }, { refreshHeartbeat: true });
             } catch { /* Never fail the stream */ }
           } else {
             logLine(`[event] ${trimmed}`);
@@ -3610,7 +3965,7 @@ busCommand
     }
   });
 
-// added 2026-04-29 via internal dispatch K+L+N+F batch — needs npm run build before live
+// added 2026-04-29 K+L+N+F batch — needs npm run build before live
 busCommand
   .command('session-burn-so-far')
   .description('Report estimated token burn for the current session — reads inbound/outbound message logs + activity log, sums any usage fields, falls back to ~4-chars-per-token heuristic.')

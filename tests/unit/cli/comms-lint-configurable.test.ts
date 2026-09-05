@@ -9,6 +9,7 @@ import { tmpdir, homedir } from 'os';
 // allowlisted phrases now pass through to the real send.
 const sendMessageSpy = vi.fn().mockReturnValue('msg-test-1');
 const telegramSendSpy = vi.fn().mockResolvedValue({ result: { message_id: 1 } });
+const logEventSpy = vi.fn();
 
 vi.mock('../../../src/bus/message.js', () => ({
   sendMessage: (...args: unknown[]) => sendMessageSpy(...args),
@@ -22,7 +23,7 @@ vi.mock('../../../src/bus/message.js', () => ({
 }));
 
 vi.mock('../../../src/bus/event.js', () => ({
-  logEvent: vi.fn(),
+  logEvent: (...args: unknown[]) => logEventSpy(...args),
 }));
 
 vi.mock('../../../src/telegram/api.js', () => ({
@@ -66,6 +67,7 @@ beforeEach(() => {
   agentDir = join(orgDir, 'agents', 'test-agent');
   mkdirSync(join(orgDir, 'agents', 'target-agent'), { recursive: true });
   mkdirSync(agentDir, { recursive: true });
+  writeFileSync(join(agentDir, '.env'), 'BOT_TOKEN=fake-token\n', 'utf-8');
 
   originalCtxRoot = process.env.CTX_ROOT;
   originalAgentName = process.env.CTX_AGENT_NAME;
@@ -89,6 +91,7 @@ beforeEach(() => {
 
   sendMessageSpy.mockClear();
   telegramSendSpy.mockClear();
+  logEventSpy.mockReset();
 });
 
 afterEach(() => {
@@ -159,30 +162,30 @@ describe('configurable comms lint', () => {
     expect(telegramSendSpy).toHaveBeenCalledTimes(1);
   });
 
-  // §8 case 2: agent allowlists banned:holding → "holding" now SENDS.
-  it('allows send-message with "holding" when agent allowlists banned:holding', async () => {
-    writeAgentConfig({ banned: { allow: ['banned:holding'] } });
-    // "holding" is in BOTH the banned and passive default groups. Allowlisting
-    // banned:holding removes the hard-fail; the passive stage only blocks
+  // §8 case 2: agent allowlists banned:parked → "parked" now SENDS.
+  it('allows send-message with "parked" when agent allowlists banned:parked', async () => {
+    writeAgentConfig({ banned: { allow: ['banned:parked'] } });
+    // "parked" is in BOTH the banned and passive default groups. Allowlisting
+    // banned:parked removes the hard-fail; the passive stage only blocks
     // WITHOUT active-work context, so include a working-on clause so the passive
     // gate passes and the send proceeds.
     await busCommand.parseAsync(
-      ['send-message', 'target-agent', 'normal', 'holding the diff while testing the migration'],
+      ['send-message', 'target-agent', 'normal', 'parked the diff while testing the migration'],
       { from: 'user' },
     );
     // Proves the agent-layer allowlist removed a default banned rule.
     expect(sendMessageSpy).toHaveBeenCalledTimes(1);
   });
 
-  it('allows send-telegram with "holding" when agent allowlists both banned and passive rules', async () => {
-    // "holding" is in BOTH the banned and passive default groups; allowlist both
+  it('allows send-telegram with "parked" when agent allowlists both banned and passive rules', async () => {
+    // "parked" is in BOTH the banned and passive default groups; allowlist both
     // ids so neither stage blocks. Proves multi-group allowlisting.
     writeAgentConfig({
-      banned: { allow: ['banned:holding'] },
+      banned: { allow: ['banned:parked'] },
       passive: { allow: ['passive:posture-set'] },
     });
     await busCommand.parseAsync(
-      ['send-telegram', '12345', 'holding the line on that'],
+      ['send-telegram', '12345', 'parked the line on that'],
       { from: 'user' },
     );
     expect(telegramSendSpy).toHaveBeenCalledTimes(1);
@@ -214,6 +217,80 @@ describe('configurable comms lint', () => {
     expect(sendMessageSpy).not.toHaveBeenCalled();
   });
 
+  it('normalizes sticky y so an offset-zero passive match keeps exact telemetry', async () => {
+    writeOrgConfig({
+      passive: {
+        add: [
+          {
+            id: 'passive:queued',
+            pattern: '\\bqueued\\b',
+            flags: 'iy',
+            reason: 'passive posture',
+          },
+        ],
+      },
+    });
+
+    await expect(
+      busCommand.parseAsync(
+        ['send-message', 'target-agent', 'normal', 'queued for review'],
+        { from: 'user' },
+      ),
+    ).rejects.toThrow();
+    expect(sendMessageSpy).not.toHaveBeenCalled();
+    expect(logEventSpy).toHaveBeenCalledWith(
+      expect.anything(),
+      'test-agent',
+      'testorg',
+      'action',
+      'comms_lint_blocked',
+      'warning',
+      expect.objectContaining({
+        matched_phrase: 'queued',
+        rule_class: 'passive',
+        rule_id: 'passive:queued',
+        target_type: 'agent',
+      }),
+    );
+  });
+
+  it('normalizes sticky y so the same passive rule blocks mid-string', async () => {
+    writeOrgConfig({
+      passive: {
+        add: [
+          {
+            id: 'passive:queued',
+            pattern: '\\bqueued\\b',
+            flags: 'iy',
+            reason: 'passive posture',
+          },
+        ],
+      },
+    });
+
+    await expect(
+      busCommand.parseAsync(
+        ['send-message', 'target-agent', 'normal', 'the item is queued for review'],
+        { from: 'user' },
+      ),
+    ).rejects.toThrow();
+    expect(sendMessageSpy).not.toHaveBeenCalled();
+    expect(logEventSpy).toHaveBeenCalledWith(
+      expect.anything(),
+      'test-agent',
+      'testorg',
+      'action',
+      'comms_lint_blocked',
+      'warning',
+      expect.objectContaining({
+        matched_phrase: 'queued',
+        rule_class: 'passive',
+        rule_id: 'passive:queued',
+        target_type: 'agent',
+      }),
+    );
+  });
+
   // §8 case 4: --suggest on a would-be-blocked message → prints phrase + hint,
   // exit 0, does NOT send.
   it('--suggest on a blocked telegram message prints the phrase + hint and does NOT send', async () => {
@@ -232,7 +309,7 @@ describe('configurable comms lint', () => {
     expect(printed).toContain('reference the feature/fix by what it does');
   });
 
-  it('--suggest on a blocked send-message prints the phrase + hint and does NOT send', async () => {
+  it('--suggest on agent traffic reports pass for a human-only default and does NOT send', async () => {
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     await busCommand.parseAsync(
       ['send-message', 'target-agent', 'normal', 'standing by for the next task', '--suggest'],
@@ -241,8 +318,7 @@ describe('configurable comms lint', () => {
     expect(sendMessageSpy).not.toHaveBeenCalled();
     const printed = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
     expect(printed).toContain('--suggest');
-    expect(printed).toContain('BLOCKED');
-    expect(printed.toLowerCase()).toContain('standing by');
+    expect(printed.toLowerCase()).toContain('would pass');
   });
 
   // §8 case 5: --suggest on a clean message → prints clean confirmation, does
@@ -278,15 +354,13 @@ describe('configurable comms lint', () => {
 
   // §8 case 6: malformed agent config.json → fail open to defaults (a default
   // banned phrase still BLOCKS; a clean message still SENDS).
-  it('falls open to defaults when agent config.json is malformed JSON (default phrase still blocks)', async () => {
+  it('falls open to audience defaults when agent config is malformed', async () => {
     writeRawAgentConfig('{ this is not valid json ');
-    await expect(
-      busCommand.parseAsync(
-        ['send-message', 'target-agent', 'normal', 'standing by for the next task'],
-        { from: 'user' },
-      ),
-    ).rejects.toThrow();
-    expect(sendMessageSpy).not.toHaveBeenCalled();
+    await busCommand.parseAsync(
+      ['send-message', 'target-agent', 'normal', 'standing by for the next task'],
+      { from: 'user' },
+    );
+    expect(sendMessageSpy).toHaveBeenCalledTimes(1);
   });
 
   it('falls open to defaults when agent config.json is malformed JSON (clean message still sends)', async () => {
@@ -300,7 +374,7 @@ describe('configurable comms lint', () => {
 
   // §8 case 7: invalid regex in config → that rule dropped, default rules still
   // enforce, no crash.
-  it('drops an invalid-regex custom rule but keeps default rules enforcing (no crash)', async () => {
+  it('drops an invalid-regex custom rule and keeps agent defaults permissive (no crash)', async () => {
     writeOrgConfig({
       banned: {
         add: [
@@ -309,14 +383,11 @@ describe('configurable comms lint', () => {
         ],
       },
     });
-    // The bad rule is dropped (no crash), and a DEFAULT banned phrase still blocks.
-    await expect(
-      busCommand.parseAsync(
-        ['send-message', 'target-agent', 'normal', 'standing by for the next task'],
-        { from: 'user' },
-      ),
-    ).rejects.toThrow();
-    expect(sendMessageSpy).not.toHaveBeenCalled();
+    await busCommand.parseAsync(
+      ['send-message', 'target-agent', 'normal', 'standing by for the next task'],
+      { from: 'user' },
+    );
+    expect(sendMessageSpy).toHaveBeenCalledTimes(1);
   });
 
   it('still sends a clean message when config contains an invalid-regex rule', async () => {

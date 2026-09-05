@@ -8,6 +8,17 @@ export type MessageHandler = (msg: TelegramMessage) => void;
 export type CallbackHandler = (query: TelegramCallbackQuery) => void;
 export type ReactionHandler = (reaction: TelegramMessageReaction) => void;
 
+export const RETRY_AFTER_CEILING_MS = 300_000;
+
+export function computePollBackoffMs(message: string, attempt: number, baseMs: number, capMs: number): number {
+  const retryMatch = message.match(/retry after (\d+)/i);
+  if (retryMatch) {
+    const honored = Math.max(1, parseInt(retryMatch[1], 10)) * 1000;
+    return Math.min(RETRY_AFTER_CEILING_MS, honored);
+  }
+  return Math.min(capMs, baseMs * 2 ** (attempt - 1));
+}
+
 /**
  * Telegram polling loop. Replaces the Telegram portion of fast-checker.sh.
  * Polls getUpdates every 1 second and routes messages/callbacks to handlers.
@@ -34,6 +45,10 @@ export class TelegramPoller {
   private callbackHandlers: CallbackHandler[] = [];
   private reactionHandlers: ReactionHandler[] = [];
   private pollInterval: number;
+  private consecutiveErrors = 0;
+  private readonly backoffCapMs = 30_000;
+  /** The currently active long-poll, cancelled by an explicit stop(). */
+  private abortController: AbortController | null = null;
   /**
    * Why the poll loop last exited. Read by AgentManager's poller-supervisor
    * (#459 supervision-gap fix) to decide whether to restart:
@@ -115,9 +130,12 @@ export class TelegramPoller {
   async start(): Promise<void> {
     this.running = true;
     this.lastExitReason = '';
+    this.consecutiveErrors = 0;
     while (this.running) {
       try {
         await this.pollOnce();
+        this.consecutiveErrors = 0;
+        await sleep(this.pollInterval);
       } catch (err) {
         if (!this.running) {
           this.lastExitReason = 'stopped-externally';
@@ -133,10 +151,12 @@ export class TelegramPoller {
           this.running = false;
           return;
         }
-        // Other errors are transient — log and continue polling.
-        console.error('[telegram-poller] Poll error:', err);
+        this.consecutiveErrors++;
+        const base = computePollBackoffMs(msg, this.consecutiveErrors, this.pollInterval, this.backoffCapMs);
+        const delay = base + Math.random() * this.pollInterval;
+        console.error(`[telegram-poller] Poll error (retry in ${Math.round(delay)}ms, attempt ${this.consecutiveErrors}):`, err);
+        await sleep(delay);
       }
-      await sleep(this.pollInterval);
     }
   }
 
@@ -147,6 +167,9 @@ export class TelegramPoller {
   stop(): void {
     this.running = false;
     this.lastExitReason = 'stopped-externally';
+    // An explicit stop owns the request lifetime. Cancel the pending long-poll
+    // promptly instead of retaining network work after this poller has stopped.
+    this.abortController?.abort();
     // Release the offset-file claim so a later poller can re-bind the same
     // stateDir+suffix (e.g. after a reconnect or agent restart) without
     // tripping the collision guard.
@@ -165,8 +188,10 @@ export class TelegramPoller {
    */
   async pollOnce(): Promise<void> {
     let result;
+    const controller = new AbortController();
+    this.abortController = controller;
     try {
-      result = await this.api.getUpdates(this.offset, 1);
+      result = await this.api.getUpdates(this.offset, 1, controller.signal);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes('Conflict') || msg.includes('terminated by other getUpdates')) {
@@ -182,6 +207,8 @@ export class TelegramPoller {
         return;
       }
       throw err;
+    } finally {
+      if (this.abortController === controller) this.abortController = null;
     }
     if (!result?.result?.length) return;
 

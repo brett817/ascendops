@@ -55,18 +55,16 @@ describe('comms-lint-config loader', () => {
     const defaults = getDefaultCommsLintRules();
 
     // Counts per group (the §4.6 contract).
-    expect(resolved.banned).toHaveLength(10);
+    expect(resolved.banned).toHaveLength(9);
     expect(resolved.passive).toHaveLength(2);
     expect(resolved.telegram).toHaveLength(5);
-    // Roster-driven: with no roster passed, there is NO agent-name rule — the
-    // framework never ships a hardcoded agent roster (config-drive 2026-07-14).
-    expect(resolved.agentName).toBeNull();
+    expect(resolved.agentName).not.toBeNull();
 
     // ids match the defaults exactly.
     expect(ids(resolved.banned)).toEqual(ids(defaults.banned));
     expect(ids(resolved.passive)).toEqual(ids(defaults.passive));
     expect(ids(resolved.telegram)).toEqual(ids(defaults.telegram));
-    expect(defaults.agentName).toBeNull();
+    expect(resolved.agentName?.id).toBe('agent-name:default');
 
     // Pattern sources + flags match the defaults byte-for-byte.
     const assertSameRegex = (a: RegExp, b: RegExp) => {
@@ -78,6 +76,7 @@ describe('comms-lint-config loader', () => {
     resolved.telegram.forEach((r, i) => assertSameRegex(r.pattern, defaults.telegram[i].pattern));
     assertSameRegex(resolved.activeContext, defaults.activeContext);
     assertSameRegex(resolved.nextSignalContext, defaults.nextSignalContext);
+    assertSameRegex(resolved.agentName!.pattern, defaults.agentName!.pattern);
 
     // Explicit em-dash flag check: NO flags (not blanket-`i`).
     const emDash = resolved.telegram.find((r) => r.id === 'telegram:em-dash')!;
@@ -85,9 +84,10 @@ describe('comms-lint-config loader', () => {
     expect(emDash.pattern.flags).toBe('');
 
     // Spot-check a banned source + the `i` flag on a normal rule.
-    const holding = resolved.banned.find((r) => r.id === 'banned:holding')!;
-    expect(holding.pattern.source).toBe('\\bholding\\b');
-    expect(holding.pattern.flags).toBe('i');
+    expect(ids(resolved.banned)).not.toContain('banned:holding');
+    const waitingOn = resolved.banned.find((r) => r.id === 'banned:waiting-on')!;
+    expect(waitingOn.pattern.source).toBe('\\bwaiting[- ]on[- ]\\w+\\b');
+    expect(waitingOn.pattern.flags).toBe('i');
   });
 
   // Case 2: Missing config files → defaults (fail open).
@@ -132,17 +132,17 @@ describe('comms-lint-config loader', () => {
     expect(added.suggest).toBe("say 'the new portal' instead");
     expect(added.pattern.test('this is project bluebird')).toBe(true);
     // banned group untouched.
-    expect(resolved.banned).toHaveLength(10);
+    expect(resolved.banned).toHaveLength(9);
   });
 
   // Case 5: `allow` removes a default rule by id.
   it('removes a default rule by id via allow', () => {
-    writeOrgContext(tmp, 'acme', { banned: { allow: ['banned:holding'] } });
+    writeOrgContext(tmp, 'acme', { banned: { allow: ['banned:parked'] } });
     const resolved = resolveCommsLintRules({ org: 'acme', frameworkRoot: tmp });
-    expect(resolved.banned).toHaveLength(9);
-    expect(ids(resolved.banned)).not.toContain('banned:holding');
+    expect(resolved.banned).toHaveLength(8);
+    expect(ids(resolved.banned)).not.toContain('banned:parked');
     // others intact.
-    expect(ids(resolved.banned)).toContain('banned:parked');
+    expect(ids(resolved.banned)).toContain('banned:waiting-on');
   });
 
   // Case 6: `replace` discards all defaults for a group and uses only provided rules.
@@ -170,27 +170,27 @@ describe('comms-lint-config loader', () => {
         add: [{ id: 'banned:orgword', pattern: '\\borgword\\b', reason: 'org-specific' }],
       },
     });
-    const agentDir = join(tmp, 'orgs', 'acme', 'agents', 'dane');
+    const agentDir = join(tmp, 'orgs', 'acme', 'agents', 'rex');
     writeAgentConfig(agentDir, { banned: { allow: ['banned:orgword'] } });
 
     const resolved = resolveCommsLintRules({ org: 'acme', agentDir, frameworkRoot: tmp });
     expect(ids(resolved.banned)).not.toContain('banned:orgword');
-    expect(resolved.banned).toHaveLength(10); // back to default count
+    expect(resolved.banned).toHaveLength(9); // back to default count
   });
 
   it('agent layer re-bans an org-allowlisted phrase via add', () => {
-    // Org allowlists the default holding; agent re-adds a holding ban.
-    writeOrgContext(tmp, 'acme', { banned: { allow: ['banned:holding'] } });
-    const agentDir = join(tmp, 'orgs', 'acme', 'agents', 'dane');
+    // Org allowlists the default parked rule; agent re-adds a parked ban.
+    writeOrgContext(tmp, 'acme', { banned: { allow: ['banned:parked'] } });
+    const agentDir = join(tmp, 'orgs', 'acme', 'agents', 'rex');
     writeAgentConfig(agentDir, {
-      banned: { add: [{ id: 'banned:holding-reban', pattern: '\\bholding\\b', reason: 're-ban' }] },
+      banned: { add: [{ id: 'banned:parked-reban', pattern: '\\bparked\\b', reason: 're-ban' }] },
     });
 
     const resolved = resolveCommsLintRules({ org: 'acme', agentDir, frameworkRoot: tmp });
-    expect(ids(resolved.banned)).not.toContain('banned:holding'); // org removed default
-    expect(ids(resolved.banned)).toContain('banned:holding-reban'); // agent re-banned
-    const reban = resolved.banned.find((r) => r.id === 'banned:holding-reban')!;
-    expect(reban.pattern.test('holding')).toBe(true);
+    expect(ids(resolved.banned)).not.toContain('banned:parked'); // org removed default
+    expect(ids(resolved.banned)).toContain('banned:parked-reban'); // agent re-banned
+    const reban = resolved.banned.find((r) => r.id === 'banned:parked-reban')!;
+    expect(reban.pattern.test('parked')).toBe(true);
   });
 
   // Case 8: Invalid regex in a spec → that single rule dropped, others survive, no throw.
@@ -221,6 +221,54 @@ describe('comms-lint-config loader', () => {
     expect(resolved.telegram).toHaveLength(5);
   });
 
+  it('strips sticky y from every sampled flag combination at config load', () => {
+    writeOrgContext(tmp, 'acme', {
+      passive: {
+        add: [
+          { id: 'passive:sticky-y', pattern: '\\bqueued\\b', flags: 'y', reason: 'sticky' },
+          { id: 'passive:sticky-iy', pattern: '\\bqueued\\b', flags: 'iy', reason: 'sticky' },
+          { id: 'passive:sticky-gy', pattern: '\\bqueued\\b', flags: 'gy', reason: 'sticky' },
+        ],
+      },
+    });
+    const resolved = resolveCommsLintRules({ org: 'acme', frameworkRoot: tmp });
+    expect(resolved.passive.find((r) => r.id === 'passive:sticky-y')?.pattern.flags).toBe('');
+    expect(resolved.passive.find((r) => r.id === 'passive:sticky-iy')?.pattern.flags).toBe('i');
+    expect(resolved.passive.find((r) => r.id === 'passive:sticky-gy')?.pattern.flags).toBe('g');
+    expect(resolved.passive).toHaveLength(5);
+  });
+
+  it('continues to accept i, g, and gi flags unchanged', () => {
+    writeOrgContext(tmp, 'acme', {
+      passive: {
+        add: [
+          { id: 'passive:flag-i', pattern: '\\balpha\\b', flags: 'i', reason: 'control' },
+          { id: 'passive:flag-g', pattern: '\\bbeta\\b', flags: 'g', reason: 'control' },
+          { id: 'passive:flag-gi', pattern: '\\bgamma\\b', flags: 'gi', reason: 'control' },
+        ],
+      },
+    });
+    const resolved = resolveCommsLintRules({ org: 'acme', frameworkRoot: tmp });
+    expect(resolved.passive.find((r) => r.id === 'passive:flag-i')?.pattern.flags).toBe('i');
+    expect(resolved.passive.find((r) => r.id === 'passive:flag-g')?.pattern.flags).toBe('g');
+    expect(resolved.passive.find((r) => r.id === 'passive:flag-gi')?.pattern.flags).toBe('gi');
+  });
+
+  it('still rejects duplicate flags before sticky normalization', () => {
+    writeOrgContext(tmp, 'acme', {
+      passive: {
+        add: [
+          { id: 'passive:duplicate-y', pattern: '\\bdelta\\b', flags: 'yy', reason: 'invalid' },
+          { id: 'passive:duplicate-i', pattern: '\\bepsilon\\b', flags: 'ii', reason: 'invalid' },
+        ],
+      },
+    });
+    const resolved = resolveCommsLintRules({ org: 'acme', frameworkRoot: tmp });
+    expect(ids(resolved.passive)).not.toContain('passive:duplicate-y');
+    expect(ids(resolved.passive)).not.toContain('passive:duplicate-i');
+    expect(resolved.passive).toHaveLength(2);
+  });
+
   // Case 10: Over-length pattern (>1000 chars) → dropped.
   it('drops a rule whose pattern exceeds the length cap', () => {
     const huge = 'a'.repeat(1001);
@@ -229,7 +277,7 @@ describe('comms-lint-config loader', () => {
     });
     const resolved = resolveCommsLintRules({ org: 'acme', frameworkRoot: tmp });
     expect(ids(resolved.banned)).not.toContain('banned:huge');
-    expect(resolved.banned).toHaveLength(10);
+    expect(resolved.banned).toHaveLength(9);
   });
 
   it('also drops a rule whose id fails the id charset check', () => {
@@ -237,7 +285,7 @@ describe('comms-lint-config loader', () => {
       banned: { add: [{ id: 'Bad ID!', pattern: '\\bx\\b', reason: 'bad id' }] },
     });
     const resolved = resolveCommsLintRules({ org: 'acme', frameworkRoot: tmp });
-    expect(resolved.banned).toHaveLength(10);
+    expect(resolved.banned).toHaveLength(9);
   });
 
   // Case 11: add_active_context extends the active-context regex; bad extension keeps default.
@@ -289,7 +337,7 @@ describe('comms-lint-config loader', () => {
   it('F1: empty replace array retains the default banned group', () => {
     writeOrgContext(tmp, 'acme', { banned: { replace: [] } });
     const resolved = resolveCommsLintRules({ org: 'acme', frameworkRoot: tmp });
-    expect(resolved.banned).toHaveLength(10);
+    expect(resolved.banned).toHaveLength(9);
     expect(ids(resolved.banned)).toEqual(ids(getDefaultCommsLintRules().banned));
   });
 
@@ -304,29 +352,15 @@ describe('comms-lint-config loader', () => {
       },
     });
     const resolved = resolveCommsLintRules({ org: 'acme', frameworkRoot: tmp });
-    expect(resolved.banned).toHaveLength(10);
+    expect(resolved.banned).toHaveLength(9);
     expect(ids(resolved.banned)).toEqual(ids(getDefaultCommsLintRules().banned));
   });
 
-  it('F1: empty replace on a roster-built agentName retains it (not null)', () => {
+  it('F1: empty replace on agentName retains the default agent-name rule (not null)', () => {
     writeOrgContext(tmp, 'acme', { agentName: { replace: [] } });
-    const resolved = resolveCommsLintRules({ org: 'acme', frameworkRoot: tmp, roster: ['maple', 'oak'] });
+    const resolved = resolveCommsLintRules({ org: 'acme', frameworkRoot: tmp });
     expect(resolved.agentName).not.toBeNull();
     expect(resolved.agentName!.id).toBe('agent-name:default');
-  });
-
-  it('roster-driven: agentName is built from the configured roster, never hardcoded', () => {
-    // No roster -> no agent-name rule (does not ship any org's names).
-    expect(resolveCommsLintRules({}).agentName).toBeNull();
-    // A configured roster -> a rule matching exactly those names.
-    const resolved = resolveCommsLintRules({ roster: ['maple', 'oak-2'] });
-    expect(resolved.agentName).not.toBeNull();
-    expect(resolved.agentName!.id).toBe('agent-name:default');
-    expect(resolved.agentName!.pattern.test('handing to maple now')).toBe(true);
-    expect(resolved.agentName!.pattern.test('the oak-2 agent')).toBe(true);
-    // Our live names are NOT hardcoded — not in this roster, so not matched.
-    expect(resolved.agentName!.pattern.test('ask dane about it')).toBe(false);
-    expect(resolved.agentName!.pattern.test('collie shipped it')).toBe(false);
   });
 
   it('F1 control: a single valid replace spec still replaces the whole group', () => {
