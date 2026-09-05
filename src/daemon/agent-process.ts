@@ -27,9 +27,15 @@ import {
   findGitRoot,
   recordFailure,
   markHealthy,
+  shouldRollback,
+  performRollback,
+  isWatchdogRollbackEnabled,
+  watchdogRollbackFloorRef,
+  watchdogRollbackMaxResets,
   readRecoveryNote,
   deleteRecoveryNote,
   MIN_HEALTHY_SECONDS,
+  type RollbackPreflightContext,
 } from './watchdog.js';
 type LogFn = (msg: string) => void;
 // BUG-032 established that this exact question -- has the child actually
