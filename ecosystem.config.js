@@ -22,6 +22,9 @@ module.exports = {
         CTX_FRAMEWORK_ROOT: frameworkRoot,
         CTX_PROJECT_ROOT: process.env.CTX_PROJECT_ROOT || frameworkRoot,
         CTX_ORG: process.env.CTX_ORG || "homelife-pm-bc",
+        // Required by the Telegram message handler (buildRecentHistory ->
+        // requireAdminUsername). Without it every inbound message throws.
+        ADMIN_USERNAME: process.env.ADMIN_USERNAME || "brett",
       },
       max_restarts: 50,
       restart_delay: 15000,
